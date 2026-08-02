@@ -91,8 +91,14 @@ def _get_classifier():
     return _classifier
 
 
-def _serialize_run(run_row: dict, results: list[dict]) -> dict:
-    return {
+def _serialize_run(
+    run_row: dict,
+    results: list[dict],
+    *,
+    pagination: dict | None = None,
+    taxonomy: dict | None = None,
+) -> dict:
+    payload = {
         "run_id": run_row["id"],
         "query": run_row["query"],
         "rank": run_row["rank"],
@@ -107,6 +113,11 @@ def _serialize_run(run_row: dict, results: list[dict]) -> dict:
         "plantae_yellow": PLANTAE_YELLOW,
         "results": results,
     }
+    if pagination is not None:
+        payload["pagination"] = pagination
+    if taxonomy is not None:
+        payload["taxonomy"] = taxonomy
+    return payload
 
 
 def _run_and_store(*, query: str, n_samples: int, top_k: int,
@@ -251,7 +262,11 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
 
 
 @app.get("/api/results")
-async def get_results(run: int | None = Query(default=None)) -> dict:
+async def get_results(
+    run: int | None = Query(default=None),
+    page: int = Query(default=0, ge=0),
+    page_size: int = Query(default=60, ge=1, le=300),
+) -> dict:
     with _results_lock:
         # Serve from the in-process cache if we have it.
         target_id: int | None = None
@@ -265,7 +280,20 @@ async def get_results(run: int | None = Query(default=None)) -> dict:
             target_id = run
         cached = _results_cache.get(target_id)
         if cached is not None:
-            return cached
+            # Cached payload has the full results list — slice in memory.
+            all_results = cached.get("results", [])
+            total = len(all_results)
+            start = page * page_size
+            end = start + page_size
+            payload = dict(cached)
+            payload["results"] = all_results[start:end]
+            payload["pagination"] = {
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": (total + page_size - 1) // page_size if total else 0,
+            }
+            return payload
 
     # Cache miss → build from SQLite.
     with storage.connect(DB_PATH) as conn:
@@ -275,9 +303,29 @@ async def get_results(run: int | None = Query(default=None)) -> dict:
                 status_code=404, detail=f"run {target_id} not found"
             )
         results = storage.get_run_results(conn, run_id=target_id)
-        payload = _serialize_run(run_row, results)
+        taxonomy = storage.get_run_taxonomy_summary(
+            conn, run_id=target_id, rank_name=run_row["rank"]
+        )
+        total = len(results)
+        start = page * page_size
+        end = start + page_size
+        page_results = results[start:end]
+        payload = _serialize_run(
+            run_row,
+            page_results,
+            pagination={
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": (total + page_size - 1) // page_size if total else 0,
+            },
+            taxonomy=taxonomy,
+        )
     with _results_lock:
-        _results_cache[target_id] = payload
+        # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
+        full_payload = dict(payload)
+        full_payload["results"] = results
+        _results_cache[target_id] = full_payload
     return payload
 
 
@@ -394,6 +442,14 @@ PAGE = """<!doctype html>
   .log-tail pre { margin:0; padding: 8px 24px; background:#0a0a0a; color:#bcb; font: 11px/1.4 ui-monospace, monospace; max-height: 160px; overflow:auto; white-space: pre; }
   .log-tail .log-toggle { padding: 6px 24px; font-size: 12px; color:#888; cursor: pointer; user-select: none; }
   .log-tail .log-toggle:hover { color:#ad9; }
+  /* Pagination bar */
+  .pagination-bar { display:flex; align-items:center; justify-content:center; gap:4px; padding: 10px 24px; flex-wrap: wrap; background:#1a1a1a; border-bottom: 1px solid #2a2a2a; font: 12px ui-monospace, monospace; }
+  .pagination-bar button { background:#222; color:#eee; border:1px solid #333; padding: 4px 10px; border-radius:4px; cursor:pointer; font: inherit; min-width: 32px; }
+  .pagination-bar button:hover:not(:disabled) { background:#333; border-color:#555; }
+  .pagination-bar button:disabled { opacity:0.4; cursor: not-allowed; }
+  .pagination-bar button.current { background:#2c4; color:#fff; border-color:#4c6; }
+  .pagination-bar .ellipsis { color:#888; padding: 0 4px; }
+  .pagination-bar .summary { color:#888; margin-right: 12px; }
   /* Near-duplicate panel */
   .near-dup { padding: 0 12px 12px; border-top: 1px dashed #333; margin-top: 4px; }
   .near-dup-toggle { background:transparent; border:0; color:#9cf; padding: 8px 0 4px; cursor:pointer; font: 12px ui-monospace, monospace; text-align: left; }
@@ -453,6 +509,7 @@ PAGE = """<!doctype html>
 <div class="toolbar" id="legend-bar" style="border-top:0; padding-top:0; font-size: 12px;">
   <span id="plantae-legend" style="color:#888"></span>
 </div>
+<div class="pagination-bar" id="pagination-bar"></div>
 <main id="root">
   <div class="empty" id="loading-msg">Loading from <span id="server-url"></span>…</div>
 </main>
@@ -548,7 +605,7 @@ async function loadClusterBar() {
           const v = el.getAttribute('data-cluster');
           currentGroupFilter = v === '' ? null : Number(v);
           loadClusterBar();
-          if (picker.value) renderCurrent();
+          if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
         });
       });
     } catch (e) {
@@ -556,7 +613,8 @@ async function loadClusterBar() {
     }
     return;
   }
-  // Taxonomy mode — compute from the current results, scoped to the run.
+  // Taxonomy mode — counts come from the server-side summary, which
+  // aggregates the entire run (not just the current pagination slice).
   const runId = picker.value;
   if (!runId) {
     pillsContainer.innerHTML = '<span style="color:#888">(no run loaded)</span>';
@@ -564,25 +622,18 @@ async function loadClusterBar() {
   }
   let data;
   try {
-    data = await safeFetch(`/api/results?run_id=${runId}`);
+    // Use page=0 to fetch the first page; the taxonomy summary field
+    // is full-run regardless of the page slice.
+    data = await safeFetch(`/api/results?run_id=${runId}&page=0&page_size=1`);
   } catch (e) {
     pillsContainer.innerHTML = '<span style="color:#888">results unavailable</span>';
     return;
   }
-  // Count occurrences of each species/genus/family among this run's results.
-  const counts = new Map();
-  for (const r of (data.results || [])) {
-    const top = (r.top_predictions || [])[0];
-    if (!top) continue;
-    const key = top[currentGroupBy];
-    if (!key) continue;
-    counts.set(key, (counts.get(key) || 0) + 1);
-  }
-  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const entries = (data.taxonomy && data.taxonomy[currentGroupBy]) || [];
   const pills = [
     `<span class="cluster-pill${currentGroupFilter === null ? ' on' : ''}" data-cluster="">all</span>`
   ];
-  for (const [name, n] of sorted) {
+  for (const {name, n} of entries) {
     const esc = escapeHtml(name);
     pills.push(
       `<span class="cluster-pill${currentGroupFilter === name ? ' on' : ''}" data-cluster="${esc}">` +
@@ -595,7 +646,7 @@ async function loadClusterBar() {
       const v = el.getAttribute('data-cluster');
       currentGroupFilter = v === '' ? null : v;
       loadClusterBar();
-      renderCurrent();
+      if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
     });
   });
 }
@@ -617,6 +668,71 @@ function renderPlantaeLegend(data) {
     `<span class="plantae yellow">≥ ${y}</span>` +
     `<span class="plantae red">&lt; ${y}</span>` +
     ` (BioCLIP kingdom-rank confidence)`;
+}
+
+// Numbered pagination bar: « first ‹ prev  1 2 ... 50  next › last »
+// With ellipsis for runs that span many pages so the bar stays compact.
+function renderPagination(p) {
+  const bar = document.getElementById('pagination-bar');
+  if (!bar) return;
+  if (!p || !p.total) {
+    bar.innerHTML = '';
+    return;
+  }
+  const cur = p.page;
+  const total = p.total_pages;
+  const pageSize = p.page_size;
+  const totalItems = p.total;
+  if (total <= 1) {
+    bar.innerHTML = `<span class="summary">${totalItems} photo${totalItems === 1 ? '' : 's'}</span>`;
+    return;
+  }
+
+  // Choose which page numbers to render. Always show first, last, current
+  // and one on each side of current. Collapse the rest into ellipsis.
+  const want = new Set([0, total - 1, cur, cur - 1, cur + 1]);
+  const pages = [];
+  for (let i = 0; i < total; i++) {
+    if (want.has(i)) pages.push(i);
+    else if (i > 0 && i < total - 1 && (want.has(i - 1) || want.has(i + 1))) {
+      pages.push(-1); // ellipsis marker
+    }
+  }
+  // de-dup adjacent ellipsis
+  const compact = [];
+  for (const x of pages) {
+    if (x === -1 && compact.length && compact[compact.length - 1] === -1) continue;
+    compact.push(x);
+  }
+
+  const btn = (label, target, opts = {}) => {
+    const cls = opts.current ? ' class="current"' : '';
+    const disabled = opts.disabled ? ' disabled' : '';
+    return `<button${cls}${disabled} data-page="${target}">${escapeHtml(label)}</button>`;
+  };
+
+  const parts = [];
+  parts.push(`<span class="summary">${totalItems} photos, page ${cur + 1}/${total}</span>`);
+  parts.push(btn('« first', 0, {disabled: cur === 0}));
+  parts.push(btn('‹ prev', cur - 1, {disabled: cur === 0}));
+  for (const x of compact) {
+    if (x === -1) {
+      parts.push(`<span class="ellipsis">…</span>`);
+    } else {
+      parts.push(btn(String(x + 1), x, {current: x === cur}));
+    }
+  }
+  parts.push(btn('next ›', cur + 1, {disabled: cur >= total - 1}));
+  parts.push(btn('last »', total - 1, {disabled: cur >= total - 1}));
+
+  bar.innerHTML = parts.join('');
+  bar.querySelectorAll('button[data-page]').forEach(el => {
+    el.addEventListener('click', () => {
+      const target = Number(el.getAttribute('data-page'));
+      if (target === currentPage) return;
+      loadResults(picker.value, {page: target, refreshPills: false});
+    });
+  });
 }
 
 function render(data) {
@@ -757,13 +873,23 @@ function render(data) {
   }).join('');
 }
 
-async function loadResults(runId) {
-  const url = runId != null ? `/api/results?run=${runId}` : '/api/results';
+let currentPage = 0;
+let currentPageSize = 60;
+
+async function loadResults(runId, opts = {}) {
+  const page = opts.page ?? currentPage;
+  const pageSize = opts.pageSize ?? currentPageSize;
+  currentPage = page;
+  currentPageSize = pageSize;
+  const runParam = runId != null ? `run=${runId}` : '';
+  const url = `/api/results?${runParam}&page=${page}&page_size=${pageSize}`.replace(/\?$/, '');
   try {
     const data = await safeFetch(url);
     lastResults = data;
     render(data);
-    loadClusterBar();  // refresh taxonomy pills to match the new results
+    renderPagination(data.pagination);
+    // Pills only need to be re-built when the run itself changes.
+    if (opts.refreshPills !== false) loadClusterBar();
   } catch (e) {
     showError('Could not load results.', `${url} — ${e.message}`);
   }
@@ -974,12 +1100,15 @@ if (groupBySel) {
     currentGroupFilter = null;  // reset filter when switching grouping
     try { localStorage.setItem('groupBy', currentGroupBy); } catch (_) {}
     loadClusterBar();
-    renderCurrent();
+    if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
   });
 }
 
 // Re-render the last-loaded results without re-fetching — used by group-by
-// changes and pill clicks.
+// Last fetched /api/results payload, used by the filter pill handlers to
+// re-render the current page without an extra round-trip when filter-only
+// changes happen (e.g. clicking a cluster pill while staying on the same
+// page).
 let lastResults = null;
 function renderCurrent() {
   if (lastResults) render(lastResults);

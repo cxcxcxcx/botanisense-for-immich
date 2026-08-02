@@ -914,3 +914,62 @@ def get_run_results(conn: sqlite3.Connection, *, run_id: int) -> list[dict]:
             bucket["taxon_scores"] = scores.get(aid, {})
 
     return [by_asset[aid] for aid in order]
+
+
+def get_run_taxonomy_summary(
+    conn: sqlite3.Connection, *, run_id: int, rank_name: str | None = None
+) -> dict[str, list[dict]]:
+    """Aggregate per-asset taxonomy labels across an entire run.
+
+    Returns {rank: [{name, n}, ...]} where rank is "species" / "genus" /
+    "family". Counts reflect unique assets (one row per (asset, position 0)
+    prediction). Used by the UI to render pill counts that don't change
+    with the current pagination slice.
+
+    `rank_name` is the run's primary rank (e.g. "species") — we filter
+    predictions to that rank so genus/family values come from the SAME
+    predictions used by get_run_results, not from a different BioCLIP
+    rank.
+    """
+    run = get_run(conn, run_id)
+    if run is None:
+        return {"species": [], "genus": [], "family": []}
+    pred_rank = rank_name or run["rank"]
+
+    rows = conn.execute(
+        """
+        SELECT p.species, p.genus, p.family, COUNT(*) AS n
+        FROM search_results sr
+        JOIN assets a ON a.asset_id = sr.asset_id
+        JOIN predictions p
+          ON p.asset_id = a.asset_id AND p.rank = ? AND p.position = 0
+        WHERE sr.run_id = ?
+        GROUP BY p.species, p.genus, p.family
+        """,
+        (pred_rank, run_id),
+    ).fetchall()
+
+    # Pivot the rows into per-rank buckets. A row contributes to all three
+    # ranks (species/genus/family) — the same asset has all three labels.
+    species: dict[str, int] = {}
+    genus: dict[str, int] = {}
+    family: dict[str, int] = {}
+    for r in rows:
+        if r["species"]:
+            species[r["species"]] = species.get(r["species"], 0) + r["n"]
+        if r["genus"]:
+            genus[r["genus"]] = genus.get(r["genus"], 0) + r["n"]
+        if r["family"]:
+            family[r["family"]] = family.get(r["family"], 0) + r["n"]
+
+    def sorted_dict(d: dict[str, int]) -> list[dict]:
+        return [
+            {"name": k, "n": v}
+            for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+    return {
+        "species": sorted_dict(species),
+        "genus": sorted_dict(genus),
+        "family": sorted_dict(family),
+    }
