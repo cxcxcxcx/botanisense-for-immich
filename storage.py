@@ -1046,7 +1046,7 @@ def get_all_results(
     # Kingdom-rank taxon scores (Plantae / Fungi) for the page's assets.
     score_rows = conn.execute(
         f"""
-        SELECT asset_id, kingdom, score
+        SELECT asset_id, taxon_name, score
         FROM taxon_scores
         WHERE rank = 'kingdom' AND asset_id IN ({placeholders})
         """,
@@ -1054,7 +1054,7 @@ def get_all_results(
     ).fetchall()
     taxon_by_asset: dict[str, dict[str, float]] = {}
     for s in score_rows:
-        taxon_by_asset.setdefault(s["asset_id"], {})[s["kingdom"]] = float(s["score"])
+        taxon_by_asset.setdefault(s["asset_id"], {})[s["taxon_name"]] = float(s["score"])
 
     buckets: list[dict] = []
     for r in rows:
