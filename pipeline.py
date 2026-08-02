@@ -350,18 +350,19 @@ def _read_predictions_for(
 # BioCLIP work on photos Immich returned that aren't plants.
 PLANT_BATCH_SIZE = 32            # decision batch size (2× DEFAULT_BATCH_SIZE)
 PLANT_PAGE_SIZE = 500            # Immich page size
-PLANT_MIN_PROB = 0.60            # Plantae > this counts as "is a plant"
-PLANT_BATCH_MAJORITY = 0.30      # 30% of the batch must be plantae to continue
+PLANT_MIN_PROB = 0.60            # Plantae or Fungi > this counts as a candidate
+PLANT_BATCH_MAJORITY = 0.30      # 30% of the batch must be candidates to continue
 
 
-def _score_batch_for_plantae(
+def _score_batch_for_kingdoms(
     clf,
     paths: list[str],
-) -> dict[str, float]:
+) -> dict[str, dict[str, float]]:
     """Run BioCLIP kingdom-rank predict on `paths` and return
-    {file_path: Plantae_score}. For files where Plantae is not in the
-    top-K, score is 0.0. Cached scores should be checked before calling
-    this; we don't cache here because the caller (discover_plantae_assets)
+    {file_path: {kingdom: score}} for Plantae and Fungi. Other kingdoms
+    (Animalia, etc.) are skipped — discovery only cares about plants and
+    mushrooms. Cached scores should be checked before calling this; we
+    don't cache here because the caller (discover_plantae_assets)
     persists the rows after we get them back."""
     if not paths:
         return {}
@@ -371,14 +372,18 @@ def _score_batch_for_plantae(
     import sys as _sys
     _Rank = _sys.modules[__name__].Rank
     raw = clf.predict(images=paths, rank=_Rank.KINGDOM, k=5)
-    out: dict[str, float] = {}
+    # Build {path: {Plantae: x, Fungi: y}} so the discovery loop can
+    # decide on Plantae OR Fungi candidates in one pass.
+    out: dict[str, dict[str, float]] = {}
     for row in raw:
-        if row.get("kingdom") != "Plantae":
+        kingdom = row.get("kingdom")
+        if kingdom not in ("Plantae", "Fungi"):
             continue
         f = row["file_name"]
         score = float(row["score"])
-        if score > out.get(f, 0.0):
-            out[f] = score
+        d = out.setdefault(f, {})
+        if score > d.get(kingdom, 0.0):
+            d[kingdom] = score
     return out
 
 
@@ -394,7 +399,7 @@ def discover_plantae_assets(
     thumb_dir: Path,
     decision_batch_size: int = PLANT_BATCH_SIZE,
 ) -> list[ImmichAsset]:
-    """Stream-search Immich and return assets up to the plantae boundary.
+    """Stream-search Immich and return assets up to the plant/fungi boundary.
 
     Algorithm:
       1. Fetch pages of PLANT_PAGE_SIZE from Immich (size=500, page=1, 2…).
@@ -402,14 +407,15 @@ def discover_plantae_assets(
          `decision_batch_size` (caller passes 2× the inference batch so each
          decision step is a whole number of GPU chunks).
       3. For each batch, ensure thumbs exist (download if needed) and score
-         every asset's Plantae confidence — cache hit reads the stored row,
-         cache miss runs BioCLIP kingdom-rank predict on the batch and
-         persists the result.
-      4. If >= PLANT_BATCH_MAJORITY of the batch are Plantae > PLANT_MIN_PROB,
-         include the plantae assets and continue to the next batch.
+         each asset's Plantae + Fungi confidence — cache hit reads the
+         stored row, cache miss runs BioCLIP kingdom-rank predict on the
+         batch and persists the result.
+      4. If >= PLANT_BATCH_MAJORITY of the batch have
+         max(Plantae, Fungi) > PLANT_MIN_PROB, include those assets and
+         continue to the next batch.
       5. If < PLANT_BATCH_MAJORITY, include EVERY asset from this batch
-         (plantae and non-plantae) so the user can review the boundary
-         with their Plantae scores visible, then return.
+         (plants, mushrooms, and everything else) so the user can review
+         the boundary with their kingdom scores visible, then return.
 
     Hard cap at n_samples. Status updates are pushed to the shared state
     so the UI can show progress.
@@ -452,7 +458,10 @@ def discover_plantae_assets(
             batch_idx = batch_start // batch_size + 1
 
             # Gather cache hits and download preds in one pass.
-            plantae_by_path: dict[str, float] = {}
+            # plantae_by_path: {path: {"Plantae": p, "Fungi": f}} — max of
+            # the two is used downstream to decide if a photo counts as a
+            # "candidate" (plant OR mushroom).
+            plantae_by_path: dict[str, dict[str, float]] = {}
             to_predict_paths: list[str] = []
             to_predict_assets: list[ImmichAsset] = []
             for asset in batch:
@@ -479,9 +488,11 @@ def discover_plantae_assets(
                     cached = storage.fetch_taxon_scores(
                         conn, asset_ids=[asset.id], rank="kingdom"
                     )
-                    plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = (
-                        cached.get(asset.id, {}).get("Plantae", 0.0)
-                    )
+                    d = cached.get(asset.id, {})
+                    plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
+                        "Plantae": float(d.get("Plantae") or 0.0),
+                        "Fungi": float(d.get("Fungi") or 0.0),
+                    }
                 else:
                     p = thumb_dir / f"{asset.id}.jpg"
                     if not p.exists():
@@ -495,36 +506,41 @@ def discover_plantae_assets(
 
             # Run BioCLIP kingdom-rank on the misses. Persist each row.
             if to_predict_paths:
-                scores = _score_batch_for_plantae(clf, to_predict_paths)
+                scores = _score_batch_for_kingdoms(clf, to_predict_paths)
                 for asset, p in zip(to_predict_assets, to_predict_paths):
-                    all_scores: dict[str, float] = {}
-                    # Re-run a fuller predict per asset is wasteful; just
-                    # record Plantae we have. The full kingdom loop later
-                    # will fill in the rest.
-                    plantae = scores.get(p, 0.0)
-                    if plantae > 0:
-                        all_scores["Plantae"] = plantae
-                    if all_scores:
+                    kingdom_scores = scores.get(p, {})
+                    plantae = kingdom_scores.get("Plantae", 0.0)
+                    fungi = kingdom_scores.get("Fungi", 0.0)
+                    # Persist whichever kingdoms came back above 0; the full
+                    # kingdom loop later will fill in the rest.
+                    persist = {
+                        k: v for k, v in (("Plantae", plantae), ("Fungi", fungi)) if v > 0
+                    }
+                    if persist:
                         storage.upsert_taxon_scores(
                             conn,
                             asset_id=asset.id,
                             rank="kingdom",
-                            scores=all_scores,
+                            scores=persist,
                         )
-                    plantae_by_path[p] = plantae
+                    plantae_by_path[p] = kingdom_scores
 
-            # Build ordered list of (asset, plantae) for the batch.
+            # Build ordered list of (asset, max_kingdom_score) for the batch.
+            # A photo counts as a candidate if EITHER kingdom exceeds the
+            # threshold — so both plants AND mushrooms enter the run.
             scored: list[tuple[ImmichAsset, float]] = []
             for asset in batch:
                 p = str(thumb_dir / f"{asset.id}.jpg")
-                scored.append((asset, plantae_by_path.get(p, 0.0)))
+                d = plantae_by_path.get(p, {})
+                max_score = max(d.get("Plantae", 0.0), d.get("Fungi", 0.0))
+                scored.append((asset, max_score))
 
             n_plant = sum(1 for _, s in scored if s > PLANT_MIN_PROB)
             majority = n_plant / len(scored) if scored else 0.0
             threshold_pct = int(PLANT_BATCH_MAJORITY * 100)
 
             if majority >= PLANT_BATCH_MAJORITY:
-                # Continue: include plantae in this batch.
+                # Continue: include plants-or-fungi in this batch.
                 n_added = 0
                 for asset, s in scored:
                     if asset.id in seen_ids:
@@ -535,14 +551,14 @@ def discover_plantae_assets(
                         n_added += 1
                 _log.info(
                     f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
-                    f"{n_plant} of {len(scored)} are plants (>= {threshold_pct}%) "
+                    f"{n_plant} of {len(scored)} are plants-or-fungi (>= {threshold_pct}%) "
                     f"-> keep going, added {n_added} (run={len(accepted)})"
                 )
             else:
-                # Boundary batch: < PLANT_BATCH_MAJORITY plantae. Include
-                # EVERY asset from this batch — plantae and non-plantae
-                # alike — so the user can review the entire batch in
-                # Immich search order, with their Plantae scores visible
+                # Boundary batch: < PLANT_BATCH_MAJORITY candidates. Include
+                # EVERY asset from this batch — plantae, fungi, and anything
+                # else alike — so the user can review the entire batch in
+                # Immich search order, with their Plantae/Fungi scores visible
                 # via the per-asset badge. Then stop searching.
                 n_added = 0
                 for asset, s in scored:
@@ -797,7 +813,7 @@ def run_pipeline(
                 _stage_end("species")
 
             # ---- Clustering: re-fit across all embedded assets ----
-            _log.info("[cluster] re-fitting k-means on all embedded assets")
+            _log.info("[cluster] re-clustering with HDBSCAN on all embedded assets")
             _stage_begin("cluster")
             cluster_t0 = time.monotonic()
             asset_to_cluster, n_clusters = _clusters.compute_clusters(conn)

@@ -434,7 +434,14 @@ PAGE = """<!doctype html>
   <pre id="log-pre" style="display:none"></pre>
 </div>
 <div class="toolbar" id="clusters-bar">
-  <span style="color:#888">clusters:</span>
+  <span style="color:#888">group by:</span>
+  <select id="group-by">
+    <option value="species">species</option>
+    <option value="genus">genus</option>
+    <option value="family">family</option>
+    <option value="cluster">cluster (HDBSCAN)</option>
+  </select>
+  <span id="cluster-pills" style="margin-left:12px"></span>
   <label class="sort-mode">sort:
     <select id="sort-mode">
       <option value="rank">search rank</option>
@@ -473,7 +480,8 @@ const paramBatch = document.getElementById('param-batch');
 // are obvious instead of mysterious "Loading…" forever.
 document.getElementById('server-url').textContent = location.origin;
 
-let currentClusterFilter = null;  // null = all
+let currentGroupBy = (typeof localStorage !== 'undefined' && localStorage.getItem('groupBy')) || 'species';
+let currentGroupFilter = null;  // null = all; otherwise cluster_id (number) or taxon name (string)
 let currentSortMode = (typeof localStorage !== 'undefined' && localStorage.getItem('sortMode')) || 'rank';
 let lastLogCount = 0;             // for /api/logs polling delta
 
@@ -517,31 +525,79 @@ async function loadRuns(selectId) {
   }
 }
 
+// Compute taxonomy pill data from the current run's results, OR fall back
+// to /api/clusters when grouping by cluster (HDBSCAN labels are global).
 async function loadClusterBar() {
-  try {
-    const data = await safeFetch('/api/clusters');
-    const pills = [
-      `<span class="cluster-pill${currentClusterFilter === null ? ' on' : ''}" data-cluster="">all</span>`
-    ];
-    for (const c of data.clusters) {
-      pills.push(
-        `<span class="cluster-pill${currentClusterFilter === c.cluster_id ? ' on' : ''}" data-cluster="${c.cluster_id}">` +
-        `cluster ${c.cluster_id} (${c.n})</span>`
-      );
-    }
-    clustersBar.innerHTML = pills.join('');
-    clustersBar.querySelectorAll('.cluster-pill').forEach(el => {
-      el.addEventListener('click', () => {
-        const v = el.getAttribute('data-cluster');
-        currentClusterFilter = v === '' ? null : Number(v);
-        loadClusterBar();
-        if (picker.value) loadResults(picker.value);
+  const pillsContainer = document.getElementById('cluster-pills');
+  if (currentGroupBy === 'cluster') {
+    try {
+      const data = await safeFetch('/api/clusters');
+      const pills = [
+        `<span class="cluster-pill${currentGroupFilter === null ? ' on' : ''}" data-cluster="">all</span>`
+      ];
+      for (const c of data.clusters) {
+        const cid = Number(c.cluster_id);
+        pills.push(
+          `<span class="cluster-pill${currentGroupFilter === cid ? ' on' : ''}" data-cluster="${cid}">` +
+          `cluster ${cid} (${c.n})</span>`
+        );
+      }
+      pillsContainer.innerHTML = pills.join('');
+      pillsContainer.querySelectorAll('.cluster-pill').forEach(el => {
+        el.addEventListener('click', () => {
+          const v = el.getAttribute('data-cluster');
+          currentGroupFilter = v === '' ? null : Number(v);
+          loadClusterBar();
+          if (picker.value) renderCurrent();
+        });
       });
-    });
-  } catch (e) {
-    // Non-fatal — clusters are decorative.
-    console.warn('clusters endpoint failed:', e);
+    } catch (e) {
+      pillsContainer.innerHTML = '<span style="color:#888">cluster data unavailable</span>';
+    }
+    return;
   }
+  // Taxonomy mode — compute from the current results, scoped to the run.
+  const runId = picker.value;
+  if (!runId) {
+    pillsContainer.innerHTML = '<span style="color:#888">(no run loaded)</span>';
+    return;
+  }
+  let data;
+  try {
+    data = await safeFetch(`/api/results?run_id=${runId}`);
+  } catch (e) {
+    pillsContainer.innerHTML = '<span style="color:#888">results unavailable</span>';
+    return;
+  }
+  // Count occurrences of each species/genus/family among this run's results.
+  const counts = new Map();
+  for (const r of (data.results || [])) {
+    const top = (r.top_predictions || [])[0];
+    if (!top) continue;
+    const key = top[currentGroupBy];
+    if (!key) continue;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const sorted = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const pills = [
+    `<span class="cluster-pill${currentGroupFilter === null ? ' on' : ''}" data-cluster="">all</span>`
+  ];
+  for (const [name, n] of sorted) {
+    const esc = escapeHtml(name);
+    pills.push(
+      `<span class="cluster-pill${currentGroupFilter === name ? ' on' : ''}" data-cluster="${esc}">` +
+      `${esc} (${n})</span>`
+    );
+  }
+  pillsContainer.innerHTML = pills.join('');
+  pillsContainer.querySelectorAll('.cluster-pill').forEach(el => {
+    el.addEventListener('click', () => {
+      const v = el.getAttribute('data-cluster');
+      currentGroupFilter = v === '' ? null : v;
+      loadClusterBar();
+      renderCurrent();
+    });
+  });
 }
 
 function plantaeClass(score, green, yellow) {
@@ -577,8 +633,16 @@ function render(data) {
   const yellow = data.plantae_yellow ?? 0.35;
 
   let rows = data.results;
-  if (currentClusterFilter !== null) {
-    rows = rows.filter(r => r.cluster_id === currentClusterFilter);
+  if (currentGroupFilter !== null) {
+    if (currentGroupBy === 'cluster') {
+      rows = rows.filter(r => r.cluster_id === currentGroupFilter);
+    } else {
+      // taxonomy: match the chosen species/genus/family against top-1
+      rows = rows.filter(r => {
+        const top = (r.top_predictions || [])[0];
+        return top && top[currentGroupBy] === currentGroupFilter;
+      });
+    }
   }
 
   // Sort by current mode (after cluster filter). Search-rank is the
@@ -697,7 +761,9 @@ async function loadResults(runId) {
   const url = runId != null ? `/api/results?run=${runId}` : '/api/results';
   try {
     const data = await safeFetch(url);
+    lastResults = data;
     render(data);
+    loadClusterBar();  // refresh taxonomy pills to match the new results
   } catch (e) {
     showError('Could not load results.', `${url} — ${e.message}`);
   }
@@ -899,6 +965,24 @@ if (sortModeSel) {
     // Re-render the latest data with the new sort.
     loadResults(picker.value || null);
   });
+}
+const groupBySel = document.getElementById('group-by');
+if (groupBySel) {
+  groupBySel.value = currentGroupBy;
+  groupBySel.addEventListener('change', () => {
+    currentGroupBy = groupBySel.value;
+    currentGroupFilter = null;  // reset filter when switching grouping
+    try { localStorage.setItem('groupBy', currentGroupBy); } catch (_) {}
+    loadClusterBar();
+    renderCurrent();
+  });
+}
+
+// Re-render the last-loaded results without re-fetching — used by group-by
+// changes and pill clicks.
+let lastResults = null;
+function renderCurrent() {
+  if (lastResults) render(lastResults);
 }
 
 // Near-dup handlers: delegated on the grid so we don't have to rebind
