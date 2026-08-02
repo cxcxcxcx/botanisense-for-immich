@@ -393,6 +393,11 @@ def discover_plantae_assets(
 
     set_state(stage="search", query=query, n_requested=n_samples)
 
+    _log.info(
+        f"[search] streaming Immich smart-search for query={query!r}, "
+        f"target={n_samples} photos"
+    )
+
     while len(accepted) < n_samples:
         try:
             payload = client.search_text(query, size=page_size, page=page)
@@ -407,13 +412,15 @@ def discover_plantae_assets(
                 f"[search] no more results from Immich after page {page - 1}"
             )
             break
+        n_batches = (len(items) + batch_size - 1) // batch_size
         _log.info(
-            f"[search] page {page}: {len(items)} items, "
-            f"accepted so far: {len(accepted)}"
+            f"[search] page {page} from Immich: got {len(items)} photos to score "
+            f"(target={n_samples}, run so far={len(accepted)})"
         )
 
         for batch_start in range(0, len(items), batch_size):
             batch = items[batch_start : batch_start + batch_size]
+            batch_idx = batch_start // batch_size + 1
 
             # Gather cache hits and download preds in one pass.
             plantae_by_path: dict[str, float] = {}
@@ -485,20 +492,22 @@ def discover_plantae_assets(
 
             n_plant = sum(1 for _, s in scored if s > PLANT_MIN_PROB)
             majority = n_plant / len(scored) if scored else 0.0
+            threshold_pct = int(PLANT_BATCH_MAJORITY * 100)
 
             if majority >= PLANT_BATCH_MAJORITY:
                 # Continue: include plantae in this batch.
+                n_added = 0
                 for asset, s in scored:
                     if asset.id in seen_ids:
                         continue
                     if s > PLANT_MIN_PROB:
                         accepted.append(asset)
                         seen_ids.add(asset.id)
+                        n_added += 1
                 _log.info(
-                    f"[search] page {page} batch "
-                    f"{batch_start // batch_size + 1}: "
-                    f"{n_plant}/{len(scored)} plantae (>= {int(PLANT_BATCH_MAJORITY*100)}%) "
-                    f"-> continue (accepted={len(accepted)})"
+                    f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
+                    f"{n_plant} of {len(scored)} are plants (>= {threshold_pct}%) "
+                    f"-> keep going, added {n_added} (run={len(accepted)})"
                 )
             else:
                 # Boundary batch: < PLANT_BATCH_MAJORITY plantae. Include
@@ -514,23 +523,31 @@ def discover_plantae_assets(
                     seen_ids.add(asset.id)
                     n_added += 1
                 _log.info(
-                    f"[search] boundary hit: page {page} batch "
-                    f"{batch_start // batch_size + 1}: "
-                    f"{n_plant}/{len(scored)} plantae "
-                    f"(< {int(PLANT_BATCH_MAJORITY*100)}%); "
-                    f"added all {n_added} from this batch, "
-                    f"stopping at {len(accepted)} assets"
+                    f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
+                    f"only {n_plant} of {len(scored)} are plants "
+                    f"(< {threshold_pct}%) -> boundary, adding all {n_added} "
+                    f"(run={len(accepted)}, stopping search)"
                 )
                 return accepted
 
             if len(accepted) >= n_samples:
+                _log.info(
+                    f"[search] reached target of {n_samples}, stopping"
+                )
                 return accepted[:n_samples]
 
         page += 1
         if page > 50:  # safety net
-            _log.warning("[search] hit 50-page safety cap, stopping")
+            _log.warning(
+                f"[search] hit 50-page safety cap, stopping "
+                f"(Immich search isn't ending — try a more specific query)"
+            )
             break
 
+    _log.info(
+        f"[search] done streaming: returning {len(accepted)} photos "
+        f"(target was {n_samples})"
+    )
     return accepted[:n_samples]
 
 
