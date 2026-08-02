@@ -1,0 +1,18 @@
+[project]
+name = "immich-bioclip"
+version = "0.1.0"
+description = "Search Immich by text and run BioCLIP predictions on the results"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.27",
+    "Pillow>=10.0",
+    "pybioclip>=0.2",
+    "python-dotenv>=1.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "scikit-learn>=1.7.2",
+    "ultralytics>=8.4.113",
+]
+
+[tool.uv]
+package = false

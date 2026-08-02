@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Runtime data — SQLite DB, persistent thumb cache, downloaded files.
+data/
+weights/
+yolov8s-world.pt
+lock_wal.db
+
+# Secrets / local config
+.env
+
+# Editor / tooling
+.claude/
+.vscode/
+.idea/
+.DS_Store
