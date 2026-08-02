@@ -973,3 +973,141 @@ def get_run_taxonomy_summary(
         "genus": sorted_dict(genus),
         "family": sorted_dict(family),
     }
+
+
+def get_all_results(
+    conn: sqlite3.Connection, *,
+    page: int = 0,
+    page_size: int = 60,
+) -> tuple[list[dict], int]:
+    """Return (page_of_buckets, total) for every asset with predictions.
+
+    The "all assets" view replaces the per-run view: an asset is included
+    if it has any row in `predictions`, regardless of which runs it
+    appeared in. Deduplication is automatic since we key by asset_id.
+
+    Sort order: cluster_id ASC, then original_file_name ASC. Stable and
+    gives the UI a meaningful default (all of cluster 0, then cluster 1,
+    ...) without depending on per-run rank_position.
+    """
+    total = conn.execute(
+        "SELECT COUNT(*) FROM assets WHERE asset_id IN ("
+        "  SELECT DISTINCT asset_id FROM predictions"
+        ")"
+    ).fetchone()[0]
+    if total == 0:
+        return [], 0
+
+    # Single JOIN. We pull rank-agnostic fields here and let the caller
+    # fetch top-K predictions separately for the page's assets only —
+    # cheaper than fetching all predictions for all assets.
+    rows = conn.execute(
+        """
+        SELECT a.asset_id, a.original_file_name, a.original_url,
+               a.thumbnail_url, a.cluster_id
+        FROM assets a
+        WHERE a.asset_id IN (SELECT DISTINCT asset_id FROM predictions)
+        ORDER BY a.cluster_id ASC, a.original_file_name ASC
+        LIMIT ? OFFSET ?
+        """,
+        (page_size, page * page_size),
+    ).fetchall()
+
+    if not rows:
+        return [], total
+
+    asset_ids = [r["asset_id"] for r in rows]
+    placeholders = ",".join("?" for _ in asset_ids)
+
+    # Fetch predictions for this page only (top-K per asset).
+    pred_rows = conn.execute(
+        f"""
+        SELECT asset_id, position, species, common_name, score,
+               kingdom, family, genus
+        FROM predictions
+        WHERE asset_id IN ({placeholders})
+        ORDER BY asset_id ASC, position ASC
+        """,
+        asset_ids,
+    ).fetchall()
+
+    preds_by_asset: dict[str, list[dict]] = {}
+    for p in pred_rows:
+        preds_by_asset.setdefault(p["asset_id"], []).append({
+            "position": p["position"],
+            "species": p["species"],
+            "common_name": p["common_name"],
+            "score": p["score"],
+            "kingdom": p["kingdom"],
+            "family": p["family"],
+            "genus": p["genus"],
+        })
+
+    # Kingdom-rank taxon scores (Plantae / Fungi) for the page's assets.
+    score_rows = conn.execute(
+        f"""
+        SELECT asset_id, kingdom, score
+        FROM taxon_scores
+        WHERE rank = 'kingdom' AND asset_id IN ({placeholders})
+        """,
+        asset_ids,
+    ).fetchall()
+    taxon_by_asset: dict[str, dict[str, float]] = {}
+    for s in score_rows:
+        taxon_by_asset.setdefault(s["asset_id"], {})[s["kingdom"]] = float(s["score"])
+
+    buckets: list[dict] = []
+    for r in rows:
+        aid = r["asset_id"]
+        buckets.append({
+            "asset_id": aid,
+            "rank": None,  # rank is a per-run concept; null in global view
+            "original_file_name": r["original_file_name"],
+            "original_url": r["original_url"],
+            "thumbnail_url": r["thumbnail_url"],
+            "cluster_id": r["cluster_id"],
+            "top_predictions": preds_by_asset.get(aid, []),
+            "taxon_scores": taxon_by_asset.get(aid, {}),
+        })
+
+    return buckets, total
+
+
+def get_global_taxonomy_summary(
+    conn: sqlite3.Connection,
+) -> dict[str, list[dict]]:
+    """Aggregate species/genus/family counts across ALL assets that have
+    predictions. Database-wide — does NOT depend on any run. Used by the
+    pills in the global view so counts match the photos in the grid.
+    """
+    rows = conn.execute(
+        """
+        SELECT p.species, p.genus, p.family, COUNT(*) AS n
+        FROM predictions p
+        WHERE p.position = 0
+        GROUP BY p.species, p.genus, p.family
+        """,
+    ).fetchall()
+
+    species: dict[str, int] = {}
+    genus: dict[str, int] = {}
+    family: dict[str, int] = {}
+    for r in rows:
+        if r["species"]:
+            species[r["species"]] = species.get(r["species"], 0) + r["n"]
+        if r["genus"]:
+            genus[r["genus"]] = genus.get(r["genus"], 0) + r["n"]
+        if r["family"]:
+            family[r["family"]] = family.get(r["family"], 0) + r["n"]
+
+    def sorted_dict(d: dict[str, int]) -> list[dict]:
+        return [
+            {"name": k, "n": v}
+            for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+        ]
+
+    return {
+        "species": sorted_dict(species),
+        "genus": sorted_dict(genus),
+        "family": sorted_dict(family),
+    }

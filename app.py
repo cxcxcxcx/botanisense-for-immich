@@ -1,7 +1,7 @@
 """FastAPI web UI for the Immich × BioCLIP demo.
 
 Routes:
-  GET  /                  HTML page with run picker + image grid + params form
+  GET  /                  HTML page with image grid + params form (no run picker)
   GET  /api/results       JSON of the latest run (or ?run=<id>)
   GET  /api/runs          list of recent runs (newest first)
   GET  /api/clusters      cluster summary (cluster_id → # of images)
@@ -51,6 +51,7 @@ DB_PATH = os.environ.get("DB_PATH", "data/state.db")
 # clearly-plant images; non-plants usually <0.30).
 PLANTAE_GREEN = float(os.environ.get("PLANTAE_GREEN", "0.60"))
 PLANTAE_YELLOW = float(os.environ.get("PLANTAE_YELLOW", "0.35"))
+N_CLUSTERS_DEFAULT = int(os.environ.get("N_CLUSTERS", "0"))  # 0 = unknown
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
 # When RUN_ON_STARTUP=1, the lifespan runs the pipeline once before
@@ -118,6 +119,25 @@ def _serialize_run(
     if taxonomy is not None:
         payload["taxonomy"] = taxonomy
     return payload
+
+
+def _serialize_global(
+    results: list[dict],
+    *,
+    pagination: dict,
+    taxonomy: dict,
+) -> dict:
+    """Serialize the global (no-run) results payload. run_id/query/etc.
+    are not relevant — the data is the union of all runs."""
+    return {
+        "scope": "all",
+        "n_clusters": N_CLUSTERS_DEFAULT,
+        "plantae_green": PLANTAE_GREEN,
+        "plantae_yellow": PLANTAE_YELLOW,
+        "results": results,
+        "pagination": pagination,
+        "taxonomy": taxonomy,
+    }
 
 
 def _run_and_store(*, query: str, n_samples: int, top_k: int,
@@ -263,24 +283,17 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
 
 @app.get("/api/results")
 async def get_results(
-    run: int | None = Query(default=None),
     page: int = Query(default=0, ge=0),
     page_size: int = Query(default=60, ge=1, le=300),
 ) -> dict:
+    """Return a paginated slice of every indexed asset. The `run` param
+    was dropped — the view is now global so the cluster / taxonomy pills
+    (which count across the whole DB) stay consistent with the grid."""
+    cache_key = "all"
+
     with _results_lock:
-        # Serve from the in-process cache if we have it.
-        target_id: int | None = None
-        if run is None:
-            with storage.connect(DB_PATH) as conn:
-                latest = storage.latest_run(conn)
-            if latest is None:
-                return {"error": "no runs yet — try Refresh"}
-            target_id = latest["id"]
-        else:
-            target_id = run
-        cached = _results_cache.get(target_id)
+        cached = _results_cache.get(cache_key)
         if cached is not None:
-            # Cached payload has the full results list — slice in memory.
             all_results = cached.get("results", [])
             total = len(all_results)
             start = page * page_size
@@ -297,21 +310,16 @@ async def get_results(
 
     # Cache miss → build from SQLite.
     with storage.connect(DB_PATH) as conn:
-        run_row = storage.get_run(conn, target_id)
-        if run_row is None:
-            raise HTTPException(
-                status_code=404, detail=f"run {target_id} not found"
-            )
-        results = storage.get_run_results(conn, run_id=target_id)
-        taxonomy = storage.get_run_taxonomy_summary(
-            conn, run_id=target_id, rank_name=run_row["rank"]
+        results, total = storage.get_all_results(
+            conn, page=0, page_size=10_000_000  # fetch all, slice in memory
         )
-        total = len(results)
+        taxonomy = storage.get_global_taxonomy_summary(conn)
+        if total == 0:
+            return {"error": "no assets indexed yet — try Run", "results": []}
         start = page * page_size
         end = start + page_size
         page_results = results[start:end]
-        payload = _serialize_run(
-            run_row,
+        payload = _serialize_global(
             page_results,
             pagination={
                 "page": page,
@@ -325,7 +333,7 @@ async def get_results(
         # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
         full_payload = dict(payload)
         full_payload["results"] = results
-        _results_cache[target_id] = full_payload
+        _results_cache[cache_key] = full_payload
     return payload
 
 
@@ -466,7 +474,6 @@ PAGE = """<!doctype html>
 <body>
 <header>
   <h1>Immich × BioCLIP</h1>
-  <select id="run-picker" title="Run"></select>
   <span class="grow"></span>
   <span class="meta" id="run-info"></span>
   <button id="refresh">Refresh</button>
@@ -516,7 +523,6 @@ PAGE = """<!doctype html>
 
 <script>
 const root = document.getElementById('root');
-const picker = document.getElementById('run-picker');
 const info = document.getElementById('run-info');
 const refreshBtn = document.getElementById('refresh');
 const runBtn = document.getElementById('run-btn');
@@ -559,30 +565,7 @@ function showError(msg, detail) {
   }</div>`;
 }
 
-function fmtRunLabel(r) {
-  const date = r.started_at || '';
-  return `#${r.id} — ${r.query}  (new=${r.n_new}, cached=${r.n_cached})  ${date}`;
-}
-
-async function loadRuns(selectId) {
-  try {
-    const data = await safeFetch('/api/runs');
-    picker.innerHTML = data.runs.map(rn =>
-      `<option value="${rn.id}">${escapeHtml(fmtRunLabel(rn))}</option>`
-    ).join('');
-    if (selectId != null) {
-      picker.value = String(selectId);
-    } else if (data.runs.length) {
-      picker.value = String(data.runs[0].id);
-    }
-    return data.runs;
-  } catch (e) {
-    showError('Could not reach the server.', `${location.origin}/api/runs — ${e.message}`);
-    return [];
-  }
-}
-
-// Compute taxonomy pill data from the current run's results, OR fall back
+// Compute taxonomy pill data from the current results, OR fall back
 // to /api/clusters when grouping by cluster (HDBSCAN labels are global).
 async function loadClusterBar() {
   const pillsContainer = document.getElementById('cluster-pills');
@@ -605,7 +588,7 @@ async function loadClusterBar() {
           const v = el.getAttribute('data-cluster');
           currentGroupFilter = v === '' ? null : Number(v);
           loadClusterBar();
-          if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
+          loadResults({page: 0, refreshPills: false});
         });
       });
     } catch (e) {
@@ -614,17 +597,11 @@ async function loadClusterBar() {
     return;
   }
   // Taxonomy mode — counts come from the server-side summary, which
-  // aggregates the entire run (not just the current pagination slice).
-  const runId = picker.value;
-  if (!runId) {
-    pillsContainer.innerHTML = '<span style="color:#888">(no run loaded)</span>';
-    return;
-  }
+  // aggregates the entire database (so the count matches the photos
+  // visible in the grid).
   let data;
   try {
-    // Use page=0 to fetch the first page; the taxonomy summary field
-    // is full-run regardless of the page slice.
-    data = await safeFetch(`/api/results?run_id=${runId}&page=0&page_size=1`);
+    data = await safeFetch('/api/results?page=0&page_size=1');
   } catch (e) {
     pillsContainer.innerHTML = '<span style="color:#888">results unavailable</span>';
     return;
@@ -646,7 +623,7 @@ async function loadClusterBar() {
       const v = el.getAttribute('data-cluster');
       currentGroupFilter = v === '' ? null : v;
       loadClusterBar();
-      if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
+      loadResults({page: 0, refreshPills: false});
     });
   });
 }
@@ -730,7 +707,7 @@ function renderPagination(p) {
     el.addEventListener('click', () => {
       const target = Number(el.getAttribute('data-page'));
       if (target === currentPage) return;
-      loadResults(picker.value, {page: target, refreshPills: false});
+      loadResults({page: target, refreshPills: false});
     });
   });
 }
@@ -742,8 +719,8 @@ function render(data) {
     return;
   }
   info.textContent =
-    `query=${data.query}  ·  rank=${data.rank || '?'}  ·  k=${data.top_k || '?'}  ·  ` +
-    `new=${data.n_new}  cached=${data.n_cached}  ·  clusters=${data.n_clusters || 0}`;
+    `scope=${data.scope || 'run'}  ·  clusters=${data.n_clusters || 0}  ·  ` +
+    `page ${data.pagination.page + 1}/${data.pagination.total_pages}`;
   renderPlantaeLegend(data);
   const green = data.plantae_green ?? 0.60;
   const yellow = data.plantae_yellow ?? 0.35;
@@ -876,19 +853,17 @@ function render(data) {
 let currentPage = 0;
 let currentPageSize = 60;
 
-async function loadResults(runId, opts = {}) {
+async function loadResults(opts = {}) {
   const page = opts.page ?? currentPage;
   const pageSize = opts.pageSize ?? currentPageSize;
   currentPage = page;
   currentPageSize = pageSize;
-  const runParam = runId != null ? `run=${runId}` : '';
-  const url = `/api/results?${runParam}&page=${page}&page_size=${pageSize}`.replace(/\?$/, '');
+  const url = `/api/results?page=${page}&page_size=${pageSize}`;
   try {
     const data = await safeFetch(url);
     lastResults = data;
     render(data);
     renderPagination(data.pagination);
-    // Pills only need to be re-built when the run itself changes.
     if (opts.refreshPills !== false) loadClusterBar();
   } catch (e) {
     showError('Could not load results.', `${url} — ${e.message}`);
@@ -1050,9 +1025,7 @@ async function runWithParams() {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(params),
     });
-    await loadRuns(data.run_id);
-    await loadClusterBar();
-    await loadResults(data.run_id);
+    await loadResults();
   } catch (e) {
     showError('Run failed.', e.message);
   } finally {
@@ -1068,9 +1041,7 @@ async function refresh() {
   root.innerHTML = '<div class="empty">Running pipeline…</div>';
   try {
     const data = await safeFetch('/api/refresh');
-    await loadRuns(data.run_id);
-    await loadClusterBar();
-    await loadResults(data.run_id);
+    await loadResults();
   } catch (e) {
     showError('Refresh failed.', e.message);
   } finally {
@@ -1079,7 +1050,6 @@ async function refresh() {
   }
 }
 
-picker.addEventListener('change', () => loadResults(picker.value));
 refreshBtn.addEventListener('click', refresh);
 runBtn.addEventListener('click', runWithParams);
 const sortModeSel = document.getElementById('sort-mode');
@@ -1089,7 +1059,7 @@ if (sortModeSel) {
     currentSortMode = sortModeSel.value;
     try { localStorage.setItem('sortMode', currentSortMode); } catch (_) {}
     // Re-render the latest data with the new sort.
-    loadResults(picker.value || null);
+    loadResults({refreshPills: false});
   });
 }
 const groupBySel = document.getElementById('group-by');
@@ -1100,7 +1070,7 @@ if (groupBySel) {
     currentGroupFilter = null;  // reset filter when switching grouping
     try { localStorage.setItem('groupBy', currentGroupBy); } catch (_) {}
     loadClusterBar();
-    if (picker.value) loadResults(picker.value, {page: 0, refreshPills: false});
+    loadResults({page: 0, refreshPills: false});
   });
 }
 
@@ -1148,18 +1118,12 @@ document.addEventListener('click', (e) => {
 });
 
 (async () => {
-  await loadRuns();
   await loadClusterBar();
   await pollStatus();
-  if (picker.value) await loadResults(picker.value);
+  await loadResults();
 })();
 setInterval(pollStatus, 1000);
 setInterval(pollLogs, 2000);
-setInterval(async () => {
-  const prev = picker.value;
-  await loadRuns();
-  if (prev) picker.value = prev;
-}, 30000);
 </script>
 </body>
 </html>
