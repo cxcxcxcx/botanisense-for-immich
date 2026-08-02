@@ -383,6 +383,13 @@ PAGE = """<!doctype html>
   .status-panel .error { color:#f88; }
   .status-panel .progress { background:#222; height:6px; border-radius:3px; margin-top:6px; overflow:hidden; }
   .status-panel .progress > div { background:#6ad; height:100%; transition: width 0.4s ease; }
+  /* Time-per-stage stacked bar. Each slice width = (stage_sec / total_sec) * 100% */
+  .stage-time-bar { display:flex; height:6px; border-radius:3px; margin-top:4px; overflow:hidden; background:#222; }
+  .stage-time-bar .slice { height:100%; transition: width 0.4s ease; }
+  .stage-time-legend { display:flex; flex-wrap:wrap; gap:8px 12px; margin-top:4px; font-size:10px; color:#888; }
+  .stage-time-legend .swatch { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; vertical-align:middle; }
+  .stage-time-legend .stage-name { color:#aaa; }
+  .stage-time-legend .stage-sec { color:#777; margin-left:3px; }
   .log-tail { padding: 0 0 12px; border-bottom: 1px solid #2a2a2a; }
   .log-tail pre { margin:0; padding: 8px 24px; background:#0a0a0a; color:#bcb; font: 11px/1.4 ui-monospace, monospace; max-height: 160px; overflow:auto; white-space: pre; }
   .log-tail .log-toggle { padding: 6px 24px; font-size: 12px; color:#888; cursor: pointer; user-select: none; }
@@ -419,6 +426,8 @@ PAGE = """<!doctype html>
 <div class="status-panel" id="status-panel">
   <span class="idle" id="status-text">idle</span>
   <div class="progress"><div id="status-bar" style="width:0%"></div></div>
+  <div id="stage-time-bar" class="stage-time-bar" style="display:none"></div>
+  <div id="stage-time-legend" class="stage-time-legend"></div>
 </div>
 <div class="log-tail">
   <div class="log-toggle" id="log-toggle">▸ logs (click to expand)</div>
@@ -451,6 +460,8 @@ const clustersBar = document.getElementById('clusters-bar');
 const statusPanel = document.getElementById('status-panel');
 const statusText = document.getElementById('status-text');
 const statusBar = document.getElementById('status-bar');
+const stageTimeBar = document.getElementById('stage-time-bar');
+const stageTimeLegend = document.getElementById('stage-time-legend');
 const logToggle = document.getElementById('log-toggle');
 const logPre = document.getElementById('log-pre');
 const paramQuery = document.getElementById('param-query');
@@ -720,23 +731,76 @@ function renderStatus(s) {
     statusText.textContent = `[${stage}] chunk ${ci}/${ct}${rate}${eta}${q}`;
     refreshBtn.disabled = true;
     runBtn.disabled = true;
+    renderStageTimes(s);  // live: include the stage currently being timed
   } else if (s.status === 'done') {
     statusPanel.classList.add('done');
     statusText.textContent = `done  run #${s.current_run_id ?? '?'}  ` +
       `(${s.n_new} new, ${s.n_cached} cached)`;
     refreshBtn.disabled = false;
     runBtn.disabled = false;
+    renderStageTimes(s);  // final: show all accumulated stages
   } else if (s.status === 'error') {
     statusPanel.classList.add('error');
     statusText.textContent = `error: ${s.last_error || 'unknown'}`;
     refreshBtn.disabled = false;
     runBtn.disabled = false;
+    renderStageTimes(s);
   } else {
     statusPanel.classList.add('idle');
     statusText.textContent = 'idle';
     refreshBtn.disabled = false;
     runBtn.disabled = false;
+    stageTimeBar.style.display = 'none';
+    stageTimeLegend.innerHTML = '';
   }
+}
+
+// Per-stage timing bar — each stage = colored slice, width = pct of total.
+const STAGE_COLORS = {
+  search: '#4a9eff',       // blue
+  species: '#50c878',      // green
+  cluster: '#f5a623',      // orange
+  kingdom: '#9b59b6',      // purple
+  yolo: '#e74c3c',         // red
+  'bbox-bioclip': '#1abc9c', // teal
+};
+function renderStageTimes(s) {
+  const times = s.stage_times || {};
+  if (!Object.keys(times).length) {
+    stageTimeBar.style.display = 'none';
+    stageTimeLegend.innerHTML = '';
+    return;
+  }
+  // While running, project the current stage's elapsed-so-far into the
+  // bar so the slice is visibly growing in real time. We compute it from
+  // (now - stage_t0) but only if the server's stage_t0 matches stage_times.
+  const live = Object.assign({}, times);
+  if (s.status === 'running' && s.stage && s.stage_t0) {
+    const elapsed = (Date.now() / 1000) - s.stage_t0;
+    if (elapsed > 0) live[s.stage] = (live[s.stage] || 0) + elapsed;
+  }
+  const total = Object.values(live).reduce((a, b) => a + b, 0) || 1;
+  stageTimeBar.innerHTML = '';
+  stageTimeLegend.innerHTML = '';
+  let first = true;
+  for (const [name, sec] of Object.entries(live)) {
+    const pct = (sec / total) * 100;
+    const color = STAGE_COLORS[name] || '#777';
+    const slice = document.createElement('div');
+    slice.className = 'slice';
+    slice.style.background = color;
+    slice.style.width = `${pct}%`;
+    slice.title = `${name}: ${fmtDuration(sec)}`;
+    stageTimeBar.appendChild(slice);
+    const item = document.createElement('span');
+    item.innerHTML = `<span class="swatch" style="background:${color}"></span>` +
+      `<span class="stage-name">${name}</span>` +
+      `<span class="stage-sec">${fmtDuration(sec)}</span>`;
+    if (!first) item.style.marginLeft = '0';
+    first = false;
+    stageTimeLegend.appendChild(item);
+  }
+  stageTimeBar.style.display = 'flex';
 }
 
 async function pollStatus() {

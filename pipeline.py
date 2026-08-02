@@ -105,6 +105,8 @@ _state: dict = {
     "started_at": None,
     "finished_at": None,
     "last_error": None,
+    "stage_times": {},
+    "stage_t0": None,
 }
 
 # File log path — set by app.py on startup so the log lives next to the DB.
@@ -142,8 +144,35 @@ def reset_state() -> None:
                 "started_at": time.time(),
                 "finished_at": None,
                 "last_error": None,
+                # Per-stage elapsed seconds, accumulated across the run.
+                # Each stage pushes its own value via _stage_end(name).
+                "stage_times": {},
+                "stage_t0": None,
             }
         )
+
+
+def _stage_begin(name: str) -> None:
+    """Mark the start of `name` for the per-stage timing bar."""
+    with _state_lock:
+        _state["stage"] = name
+        # wall-clock seconds so the JS UI can subtract from Date.now()/1000
+        # to project the running slice's elapsed time live.
+        _state["stage_t0"] = time.time()
+
+
+def _stage_end(name: str) -> None:
+    """Accumulate elapsed seconds into _state['stage_times'][name]."""
+    with _state_lock:
+        t0 = _state.get("stage_t0")
+        if t0 is not None:
+            elapsed = time.time() - t0
+            times = _state.get("stage_times")
+            if times is None:
+                times = {}
+                _state["stage_times"] = times
+            times[name] = times.get(name, 0.0) + elapsed
+            _state["stage_t0"] = None
 
 
 def finish_state(*, run_id: int, n_new: int, n_cached: int,
@@ -593,7 +622,8 @@ def run_pipeline(
     kingdom_rank = _Rank.KINGDOM
 
     reset_state()
-    set_state(query=query, n_requested=n_samples, stage="search")
+    set_state(query=query, n_requested=n_samples)
+    _stage_begin("search")
 
     client = ImmichClient(base_url=base_url, api_key=api_key)
     try:
@@ -636,6 +666,7 @@ def run_pipeline(
                 thumb_dir=thumb_dir,
                 decision_batch_size=decision_batch_size,
             )
+            _stage_end("search")
 
             needs_bioclip: list[tuple[ImmichAsset, Path | None]] = []
             needs_yolo: list[tuple[ImmichAsset, Path | None]] = []
@@ -681,6 +712,7 @@ def run_pipeline(
             species_total_chunks = (len(needs_bioclip) + batch_size - 1) // batch_size
 
             if needs_bioclip:
+                _stage_begin("species")
                 species_t0 = time.monotonic()
                 _log.info(
                     f"[species] starting  {len(needs_bioclip)} assets, "
@@ -762,9 +794,11 @@ def run_pipeline(
                     f"[species] done  {len(needs_bioclip)} assets in "
                     f"{_fmt_eta(time.monotonic() - species_t0)}"
                 )
+                _stage_end("species")
 
             # ---- Clustering: re-fit across all embedded assets ----
             _log.info("[cluster] re-fitting k-means on all embedded assets")
+            _stage_begin("cluster")
             cluster_t0 = time.monotonic()
             asset_to_cluster, n_clusters = _clusters.compute_clusters(conn)
             storage.set_cluster_ids(conn, asset_to_cluster=asset_to_cluster)
@@ -772,6 +806,7 @@ def run_pipeline(
                 f"[cluster] done  n_clusters={n_clusters}  "
                 f"elapsed={_fmt_eta(time.monotonic() - cluster_t0)}"
             )
+            _stage_end("cluster")
 
             # ---- Kingdom-level classification ----
             # A dedicated predict() at Rank.KINGDOM, k=KINGDOM_TOP_K so we
@@ -804,6 +839,7 @@ def run_pipeline(
             kingdom_total_chunks = (
                 (len(kingdom_assets) + batch_size - 1) // batch_size
             )
+            _stage_begin("kingdom")
             kingdom_t0 = time.monotonic()
             if kingdom_assets:
                 _log.info(
@@ -871,6 +907,7 @@ def run_pipeline(
                     f"[kingdom] done  {len(kingdom_assets)} assets in "
                     f"{_fmt_eta(time.monotonic() - kingdom_t0)}"
                 )
+            _stage_end("kingdom")
             del kingdom_assets, kingdom_paths
 
             # ---- YOLO-World: detect on uncached assets (chunked) ----
@@ -880,6 +917,7 @@ def run_pipeline(
             # off from here.
             yolo_total_chunks = (len(needs_yolo) + batch_size - 1) // batch_size
             yolo_t0 = time.monotonic()
+            _stage_begin("yolo")
             if needs_yolo:
                 _log.info(
                     f"[yolo] starting  {len(needs_yolo)} assets, "
@@ -952,6 +990,7 @@ def run_pipeline(
                     f"[yolo] done  {len(needs_yolo)} assets in "
                     f"{_fmt_eta(time.monotonic() - yolo_t0)}"
                 )
+            _stage_end("yolo")
 
             # ---- Bbox BioCLIP: re-classify each crop ----
             # Iterates over EVERY detection across the run (not just the
@@ -989,6 +1028,7 @@ def run_pipeline(
                 (len(all_bbox_targets) + batch_size - 1) // batch_size
             )
             bbox_t0 = time.monotonic()
+            _stage_begin("bbox-bioclip")
             if all_bbox_targets:
                 _log.info(
                     f"[bbox-bioclip] starting  {len(all_bbox_targets)} detections, "
@@ -1078,6 +1118,7 @@ def run_pipeline(
                     f"[bbox-bioclip] done  {len(all_bbox_targets)} detections "
                     f"in {_fmt_eta(time.monotonic() - bbox_t0)}"
                 )
+            _stage_end("bbox-bioclip")
             del all_bbox_targets
 
             # Load per-asset taxon scores for the run's display.
@@ -1126,6 +1167,17 @@ def run_pipeline(
                 conn, run_id=run_id, n_new=n_new, n_cached=n_cached
             )
             conn.commit()
+
+            # Per-stage timing summary for the log + UI timing bar.
+            times = get_state().get("stage_times", {})
+            total = sum(times.values()) or 0.0
+            parts = "  ".join(
+                f"{name}={_fmt_eta(t)}" for name, t in times.items()
+            )
+            _log.info(
+                f"[run] done  run={run_id}  total={_fmt_eta(total)}  "
+                f"{parts}"
+            )
 
             set_state(stage="done", chunk_idx=0, chunk_total=0, eta_seconds=0.0)
             finish_state(
