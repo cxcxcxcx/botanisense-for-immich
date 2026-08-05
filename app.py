@@ -190,9 +190,14 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
         "plantae_green": PLANTAE_GREEN,
         "plantae_yellow": PLANTAE_YELLOW,
     }
-    # Drop the cache entry for this run so the next GET rebuilds it.
+    # Drop cache entries: the global "all" view (the run may have added
+    # new photos) and any per-run entry (kept for backwards compat with
+    # the old /api/results?run=... path). Also invalidate the near-dup
+    # cache — new embeddings change which photos are near-duplicates.
     with _results_lock:
+        _results_cache.pop("all", None)
         _results_cache.pop(out.run_id, None)
+    storage.invalidate_global_near_dup_cache()
     return payload
 
 
@@ -404,6 +409,8 @@ PAGE = """<!doctype html>
   .img-wrap .bbox text { fill: #5f5; font: 11px/1 ui-monospace, monospace; paint-order: stroke; stroke: #000; stroke-width: 3; }
   .img-wrap .cluster-tag { position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.6); color:#cfb; font:11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; }
   .img-wrap .rank-tag { position:absolute; top:6px; right:6px; background:#1a1a1a; color:#fff; font:11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.4); }
+  .img-wrap .dup-badge { position:absolute; top:6px; left:6px; background:#a35; color:#fff; font:bold 11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.4); cursor:pointer; }
+  .img-wrap .dup-badge:hover { background:#c46; }
   .toolbar select { background:#1a1a1a; color:#eee; border:1px solid #333; padding:2px 6px; border-radius:4px; font-size:12px; }
   .toolbar label.sort-mode { color:#888; font-size:12px; margin-left:8px; }
   .meta-card { padding: 10px 12px; font-size: 13px; }
@@ -820,6 +827,7 @@ function render(data) {
           <img src="/thumb/${encodeURIComponent(r.asset_id)}" alt="${escapeHtml(r.original_file_name)}" loading="lazy" decoding="async" data-primary-asset="${escapeHtml(r.asset_id)}">
           ${r.cluster_id !== null && r.cluster_id !== undefined ? `<span class="cluster-tag">cluster ${r.cluster_id}</span>` : ''}
           ${r.rank !== undefined && r.rank !== null ? `<span class="rank-tag" title="Immich smart-search rank (0-based)">#${r.rank + 1}</span>` : ''}
+          ${(r.near_dups && r.near_dups.length) ? `<span class="dup-badge" title="${r.near_dups.length} similar photo${r.near_dups.length > 1 ? 's' : ''} (cosine ≥ 0.97)">${r.near_dups.length}×</span>` : ''}
           ${bboxSvg ? `<svg class="bbox" viewBox="0 0 100 100" preserveAspectRatio="none">${bboxSvg}</svg>` : ''}
         </div>
         <div class="meta-card">

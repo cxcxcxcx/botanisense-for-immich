@@ -676,7 +676,7 @@ def latest_run(conn: sqlite3.Connection) -> dict | None:
 # 0.99 is a strict threshold tuned for BioCLIP-2 768-d L2-normalized
 # vectors: identical-looking JPEGs round to ≥0.99 even when the bytes
 # differ slightly (re-encoding, EXIF, etc.).
-NEAR_DUP_THRESHOLD = 0.99
+NEAR_DUP_THRESHOLD = 0.97  # cosine: 0.99 = exact dup, 0.97 ≈ same plant/slightly different angle
 
 
 def compute_near_dup_groups(
@@ -746,6 +746,46 @@ def compute_near_dup_groups(
             out[aid] = [other for other in group if other != aid]
     return out
 
+
+
+# Module-level cache for the global near-dup map. Computed once across
+# every embedded asset (~10k matmul O(N²) dot products). Invalidate by
+# calling invalidate_global_near_dup_cache() after a pipeline run.
+_GLOBAL_NEAR_DUP_CACHE: dict[str, list[str]] | None = None
+
+
+def invalidate_global_near_dup_cache() -> None:
+    global _GLOBAL_NEAR_DUP_CACHE
+    _GLOBAL_NEAR_DUP_CACHE = None
+
+
+def get_global_near_dup_groups(
+    conn: sqlite3.Connection,
+    *,
+    threshold: float = NEAR_DUP_THRESHOLD,
+) -> dict[str, list[str]]:
+    """Compute (and cache) the corpus-wide near-dup map.
+
+    Returns {asset_id: [sibling_asset_ids]} for every embedded asset.
+    An asset never seen by compute_near_dup_groups gets an empty list
+    (via the union-find result). This is the data the per-page results
+    slice from.
+    """
+    global _GLOBAL_NEAR_DUP_CACHE
+    if _GLOBAL_NEAR_DUP_CACHE is not None:
+        return _GLOBAL_NEAR_DUP_CACHE
+
+    # Build the corpus: every asset with an embedding.
+    rows = conn.execute("SELECT asset_id FROM embeddings").fetchall()
+    if not rows:
+        _GLOBAL_NEAR_DUP_CACHE = {}
+        return _GLOBAL_NEAR_DUP_CACHE
+
+    asset_ids = [r["asset_id"] for r in rows]
+    _GLOBAL_NEAR_DUP_CACHE = compute_near_dup_groups(
+        conn, asset_ids=asset_ids, threshold=threshold
+    )
+    return _GLOBAL_NEAR_DUP_CACHE
 
 
 # ---------- search_results ----------------------------------------------
@@ -986,9 +1026,9 @@ def get_all_results(
     if it has any row in `predictions`, regardless of which runs it
     appeared in. Deduplication is automatic since we key by asset_id.
 
-    Sort order: cluster_id ASC, then original_file_name ASC. Stable and
-    gives the UI a meaningful default (all of cluster 0, then cluster 1,
-    ...) without depending on per-run rank_position.
+    Sort order: each asset's `rank_position` from its MOST RECENT run
+    (so the user sees photos in the order Immich last returned them),
+    then cluster_id, then filename for ties / assets never in a run.
     """
     total = conn.execute(
         "SELECT COUNT(*) FROM assets WHERE asset_id IN ("
@@ -998,16 +1038,25 @@ def get_all_results(
     if total == 0:
         return [], 0
 
-    # Single JOIN. We pull rank-agnostic fields here and let the caller
-    # fetch top-K predictions separately for the page's assets only —
-    # cheaper than fetching all predictions for all assets.
+    # Pull assets with each one's rank_position from its most recent run.
+    # The correlated subquery runs once per asset; SQLite caches it via
+    # the index on search_results(asset_id). With 10k assets this is
+    # measured in milliseconds.
     rows = conn.execute(
         """
         SELECT a.asset_id, a.original_file_name, a.original_url,
-               a.thumbnail_url, a.cluster_id
+               a.thumbnail_url, a.cluster_id,
+               (SELECT sr.rank_position
+                  FROM search_results sr
+                  WHERE sr.asset_id = a.asset_id
+                  ORDER BY sr.run_id DESC
+                  LIMIT 1) AS latest_rank
         FROM assets a
         WHERE a.asset_id IN (SELECT DISTINCT asset_id FROM predictions)
-        ORDER BY a.cluster_id ASC, a.original_file_name ASC
+        ORDER BY latest_rank IS NULL ASC,
+                 latest_rank ASC,
+                 a.cluster_id ASC,
+                 a.original_file_name ASC
         LIMIT ? OFFSET ?
         """,
         (page_size, page * page_size),
@@ -1056,18 +1105,37 @@ def get_all_results(
     for s in score_rows:
         taxon_by_asset.setdefault(s["asset_id"], {})[s["taxon_name"]] = float(s["score"])
 
+    # Near-duplicate groups across the entire corpus. Computed once
+    # (cached) and sliced for this page's assets.
+    near_dup_map = get_global_near_dup_groups(conn)
+    # Pre-resolve filename + thumbnail for every sibling so the UI doesn't
+    # need to do per-card lookups.
+    sib_meta: dict[str, tuple[str, str]] = {}
+    for r in rows:
+        sib_meta[r["asset_id"]] = (r["original_file_name"], r["thumbnail_url"])
+
     buckets: list[dict] = []
     for r in rows:
         aid = r["asset_id"]
+        siblings = near_dup_map.get(aid, [])
+        near_dups = []
+        for sib in siblings:
+            fn, thumb = sib_meta.get(sib, ("", ""))
+            near_dups.append({
+                "asset_id": sib,
+                "original_file_name": fn,
+                "thumbnail_url": thumb,
+            })
         buckets.append({
             "asset_id": aid,
-            "rank": None,  # rank is a per-run concept; null in global view
+            "rank": r["latest_rank"],  # Immich rank from most recent run
             "original_file_name": r["original_file_name"],
             "original_url": r["original_url"],
             "thumbnail_url": r["thumbnail_url"],
             "cluster_id": r["cluster_id"],
             "top_predictions": preds_by_asset.get(aid, []),
             "taxon_scores": taxon_by_asset.get(aid, {}),
+            "near_dups": near_dups,
         })
 
     return buckets, total
