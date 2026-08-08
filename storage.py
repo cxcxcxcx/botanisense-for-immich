@@ -1260,11 +1260,10 @@ def get_all_results(
     if total == 0:
         return [], 0
 
-    # Pull assets with each one's rank_position from its most recent run.
-    # The correlated subquery runs once per asset; SQLite caches it via
-    # the index on search_results(asset_id). With 10k assets this is
-    # measured in milliseconds.
-    rows = conn.execute(
+    # Fetch ALL matching assets (no LIMIT/OFFSET) so we can apply
+    # near-dup dedup BEFORE pagination. Pagination is done in Python
+    # below on the deduped set.
+    all_filtered = conn.execute(
         f"""
         SELECT a.asset_id, a.original_file_name, a.original_url,
                a.thumbnail_url, a.cluster_id,
@@ -1279,14 +1278,51 @@ def get_all_results(
                  latest_rank ASC,
                  a.cluster_id ASC,
                  a.original_file_name ASC
-        LIMIT ? OFFSET ?
         """,
-        (*params, page_size, page * page_size),
+        params,
     ).fetchall()
 
-    if not rows:
-        return [], total
+    if not all_filtered:
+        return [], 0
 
+    # Near-dup dedup: pick ONE representative per group of cosine>=0.97
+    # siblings within this filtered set. Hidden members are excluded
+    # from total + the page slice. Group detection is scoped to the
+    # filtered set so a photo filtered OUT by cluster_id/species doesn't
+    # "hide" a representative that IS in the filter.
+    near_dup_map = get_global_near_dup_groups(conn)
+    rank_lookup = {r["asset_id"]: r["latest_rank"] for r in all_filtered}
+    fn_lookup = {r["asset_id"]: r["original_file_name"] for r in all_filtered}
+    filtered_ids = set(rank_lookup.keys())
+    seen: set[str] = set()
+    hidden: set[str] = set()
+    for aid in filtered_ids:
+        if aid in seen:
+            continue
+        siblings = near_dup_map.get(aid, [])
+        if not siblings:
+            seen.add(aid)
+            continue
+        group = {aid, *siblings} & filtered_ids
+        seen.update(group)
+        if len(group) < 2:
+            continue  # no real group in the filter
+        # Pick the lowest-rank member, tiebreak by filename. None ranks
+        # sort last so a never-seen-by-Immich photo doesn't win ties.
+        rep = min(group, key=lambda a: (
+            rank_lookup[a] if rank_lookup[a] is not None else 1_000_000,
+            fn_lookup[a],
+        ))
+        for m in group:
+            if m != rep:
+                hidden.add(m)
+
+    # Apply dedup before pagination
+    deduped_rows = [r for r in all_filtered if r["asset_id"] not in hidden]
+    total = len(deduped_rows)
+    start = page * page_size
+    end = start + page_size
+    rows = deduped_rows[start:end]
     asset_ids = [r["asset_id"] for r in rows]
     placeholders = ",".join("?" for _ in asset_ids)
 
@@ -1327,27 +1363,28 @@ def get_all_results(
     for s in score_rows:
         taxon_by_asset.setdefault(s["asset_id"], {})[s["taxon_name"]] = float(s["score"])
 
-    # Near-duplicate groups across the entire corpus. Computed once
-    # (cached) and sliced for this page's assets.
-    near_dup_map = get_global_near_dup_groups(conn)
-    # Pre-resolve filename + thumbnail for every sibling so the UI doesn't
-    # need to do per-card lookups.
+    # Build sibling meta for every asset that passed the SQL filter
+    # (so we can populate near_dups with hidden siblings too).
     sib_meta: dict[str, tuple[str, str]] = {}
-    for r in rows:
+    for r in all_filtered:
         sib_meta[r["asset_id"]] = (r["original_file_name"], r["thumbnail_url"])
 
     buckets: list[dict] = []
-    for r in rows:
+    for r in rows:  # page slice = representatives only
         aid = r["asset_id"]
         siblings = near_dup_map.get(aid, [])
         near_dups = []
         for sib in siblings:
-            fn, thumb = sib_meta.get(sib, ("", ""))
-            near_dups.append({
-                "asset_id": sib,
-                "original_file_name": fn,
-                "thumbnail_url": thumb,
-            })
+            # Only show siblings that passed the SQL filter AND were
+            # dedup-hidden. Siblings filtered out by cluster/species
+            # are skipped (they're not in sib_meta anyway).
+            if sib in hidden and sib in sib_meta:
+                fn, thumb = sib_meta[sib]
+                near_dups.append({
+                    "asset_id": sib,
+                    "original_file_name": fn,
+                    "thumbnail_url": thumb,
+                })
         buckets.append({
             "asset_id": aid,
             "rank": r["latest_rank"],  # Immich rank from most recent run
