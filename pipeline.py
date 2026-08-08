@@ -37,7 +37,7 @@ from immich_client import ImmichAsset, ImmichClient
 # `pipeline.TreeOfLifeClassifier`, `pipeline.clusters`, `pipeline.yolo`,
 # `pipeline.Rank` to work for both test patches (mock.patch.object) and
 # the deferred body of run_pipeline().
-_LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo")
+_LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo", "knn")
 
 
 def __getattr__(name: str):  # PEP 562
@@ -57,6 +57,10 @@ def __getattr__(name: str):  # PEP 562
         import yolo as _yolo
         globals()["yolo"] = _yolo
         return _yolo
+    if name == "knn":
+        import knn as _knn
+        globals()["knn"] = _knn
+        return _knn
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -594,6 +598,100 @@ def discover_plantae_assets(
         f"(target was {n_samples})"
     )
     return accepted[:n_samples]
+
+
+def run_knn_reclassify(
+    conn,
+    *,
+    asset_ids: list[str],
+    index_dir: Path,
+    k: int = 10,
+) -> dict:
+    """KNN reclassify a list of assets using a pre-built FAISS index.
+
+    Reuses the cached BioCLIP image embeddings stored in the
+    `embeddings` table — does NOT re-embed photos. Skips any asset that
+    already has a `knn_predictions` row for (version, k).
+
+    Returns a stats dict {"requested", "cached", "scanned", "index_version"}.
+    Logs to stderr and to the file log via the existing `_log` so the
+    UI's tail picks it up.
+    """
+    import sys as _sys
+    _self = _sys.modules[__name__]
+    _knn = _self.knn
+
+    index_dir = Path(index_dir)
+    version_path = index_dir / "INDEX_VERSION.txt"
+    if not version_path.exists():
+        raise FileNotFoundError(
+            f"INDEX_VERSION.txt missing in {index_dir} — did you build "
+            f"the index with knn.build_faiss_index(...) first?"
+        )
+    # Read the version tag (first non-empty line).
+    version_tag = next(
+        (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
+        "unknown",
+    )
+
+    if not asset_ids:
+        return {
+            "requested": 0, "cached": 0, "scanned": 0,
+            "index_version": version_tag,
+        }
+
+    # Filter: only assets that have an embedding AND don't already have
+    # a KNN row for this (version, k). The DB-side check keeps the
+    # "already classified" count accurate per call.
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"""
+        SELECT e.asset_id, e.vector
+        FROM embeddings e
+        WHERE e.asset_id IN ({placeholders})
+          AND NOT EXISTS (
+            SELECT 1 FROM knn_predictions kp
+            WHERE kp.asset_id = e.asset_id
+              AND kp.index_version = ?
+              AND kp.k = ?
+          )
+        """,
+        [*asset_ids, version_tag, k],
+    ).fetchall()
+
+    if not rows:
+        return {
+            "requested": len(asset_ids), "cached": len(asset_ids),
+            "scanned": 0, "index_version": version_tag,
+        }
+
+    ids = [r["asset_id"] for r in rows]
+    mat = np.stack([np.frombuffer(r["vector"], dtype="<f4").copy() for r in rows])
+    _log.info(
+        f"[knn] classifying {len(ids)} assets  k={k}  "
+        f"index={version_tag}"
+    )
+
+    results = _knn.classify_via_knn(
+        query_embeddings=mat, index_dir=index_dir, k=k
+    )
+
+    for aid, r in zip(ids, results):
+        storage.replace_knn_predictions(
+            conn,
+            asset_id=aid,
+            index_version=version_tag,
+            k=k,
+            rows=[r],
+        )
+    conn.commit()
+
+    return {
+        "requested": len(asset_ids),
+        "cached": len(asset_ids) - len(ids),
+        "scanned": len(ids),
+        "index_version": version_tag,
+    }
 
 
 def run_pipeline(

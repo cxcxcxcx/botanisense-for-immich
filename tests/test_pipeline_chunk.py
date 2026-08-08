@@ -197,7 +197,87 @@ def test_incremental_re_run_is_pure_cache():
         assert second.n_cached == 5, second
 
 
-if __name__ == "__main__":
-    test_chunked_pipeline_writes_predictions_for_every_asset()
-    test_incremental_re_run_is_pure_cache()
-    print("ok")
+def test_knn_reclassify_writes_row_and_cache_hits():
+    """End-to-end smoke: build a tiny synthetic FAISS index, insert a
+    fake asset + embedding, run_knn_reclassify, assert the row is
+    persisted and that a second call is fully cached."""
+    import tempfile, os
+    from pathlib import Path
+    import numpy as np
+    import storage, knn
+    from pipeline import run_knn_reclassify
+
+    with tempfile.TemporaryDirectory() as d:
+        dbp = os.path.join(d, "t.db")
+        idx_dir = Path(d) / "idx"
+        storage.init_db(dbp)
+
+        # Build a tiny 5-row index by hand so we don't depend on HF. Use the
+# production EMB_DIM=768 so the test catches dimension-mismatch bugs.
+        # All 5 reference rows share the SAME species label so a self-
+# query (asset embedding == reference row 0) returns that species
+# unanimously — the score ends up ~1.0 from the weighted vote.
+        idx_dir.mkdir()
+        dim = 768
+        rng = np.random.default_rng(42)
+        vecs = rng.normal(size=(5, dim)).astype("f4")
+        vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+        faiss_idx = faiss_mod.IndexFlatIP(dim)
+        faiss_idx.add(vecs)
+        faiss_mod.write_index(faiss_idx, str(idx_dir / "tol200m_bioclip2.faiss"))
+        # Labels aligned with the FAISS row order.
+        import pyarrow as pa, pyarrow.parquet as pq
+        labels = pa.Table.from_pylist([
+            {"uuid": f"u{i}", "kingdom": "Animalia", "phylum": None, "class": None,
+             "order": None, "family": None, "genus": None, "species": "sp-shared",
+             "scientific_name": None, "common_name": "shared-species",
+             "identifier": None, "source_dataset": None}
+            for i in range(5)
+        ])
+        pq.write_table(labels, str(idx_dir / "labels.parquet"))
+        (idx_dir / "INDEX_VERSION.txt").write_text("synthetic-v1\nn_rows=5\n")
+
+        # Insert one asset whose embedding = the first reference vector
+        # (so the KNN should find itself as top-1 with sim=1.0).
+        with storage.connect(dbp) as conn:
+            storage.upsert_asset(conn, asset_id="a1",
+                                 original_file_name="x.jpg",
+                                 original_url="u", thumbnail_url="t")
+            storage.upsert_embedding(conn, asset_id="a1", vector=vecs[0].astype("<f4"))
+            conn.commit()
+
+        # 1st call — should classify.
+        with storage.connect(dbp) as conn:
+            stats = run_knn_reclassify(conn, asset_ids=["a1"], index_dir=idx_dir, k=3)
+            assert stats["scanned"] == 1 and stats["cached"] == 0
+            assert storage.knn_predictions_have_asset(
+                conn, asset_id="a1", index_version="synthetic-v1", k=3
+            )
+            fetched = storage.fetch_knn_predictions(
+                conn, asset_ids=["a1"], index_version="synthetic-v1", k=3
+            )
+            assert fetched["a1"]["top_species"] == "sp-shared"
+            # Score is the weighted vote mass for the top species as a
+            # fraction of total vote mass. With all neighbors sharing
+            # one species label, the consensus is unanimous.
+            assert fetched["a1"]["score"] > 0.95
+            assert len(fetched["a1"]["neighbors"]) == 3
+
+        # 2nd call — should be entirely cache-hit.
+        with storage.connect(dbp) as conn:
+            stats2 = run_knn_reclassify(conn, asset_ids=["a1"], index_dir=idx_dir, k=3)
+            assert stats2["scanned"] == 0 and stats2["cached"] == 1
+
+        # enrich_with_knn attaches the row to a result bucket.
+        with storage.connect(dbp) as conn:
+            buckets = [{"asset_id": "a1"}]
+            storage.enrich_with_knn(conn, buckets)
+            assert "knn" in buckets[0]
+            assert buckets[0]["knn"]["top_species"] == "sp-shared"
+
+
+# Local import so the test file works without pytest.
+try:
+    import faiss as faiss_mod
+except ImportError:
+    faiss_mod = None  # noqa: F841 — only used by the KNN test

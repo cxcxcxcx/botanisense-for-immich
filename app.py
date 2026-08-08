@@ -58,6 +58,16 @@ PORT = int(os.environ.get("PORT", "8765"))
 # serving. Default is off — the server starts in browse-only mode and
 # the user (or a follow-up curl /api/run) triggers a refresh.
 RUN_ON_STARTUP = os.environ.get("RUN_ON_STARTUP", "0") == "1"
+# KNN reclassification — separate from the zero-shot pipeline. Set
+# KNN_INVENTORY_DIR to the directory holding tol200m_bioclip2.faiss +
+# labels.parquet + INDEX_VERSION.txt. Leave it unset / pointing at a
+# non-existent dir to disable the KNN UI gracefully.
+KNN_INVENTORY_DIR = Path(
+    os.environ.get(
+        "KNN_INVENTORY_DIR", "/media/4T_Ext/bioclip_inventory/index"
+    )
+)
+KNN_K = int(os.environ.get("KNN_K", "10"))
 
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY missing in .env / environment")
@@ -90,6 +100,64 @@ def _get_classifier():
                 from bioclip.predict import TreeOfLifeClassifier
                 _classifier = TreeOfLifeClassifier()
     return _classifier
+
+
+# Lazy KNN index loader. Mirrors the _get_classifier() singleton pattern
+# but caches (faiss_index, labels_table, version_meta). Loading is the
+# expensive step (~700 MB index + 250 MB labels parquet mmap'd); after
+# the first call it's reused for every /api/reclassify request.
+_knn_index = None
+_knn_labels = None
+_knn_meta: dict | None = None
+
+
+def _get_knn_index():
+    """Return (faiss_index, labels_table, meta) or None if the inventory
+    isn't built yet. Cached for the lifetime of the process."""
+    global _knn_index, _knn_labels, _knn_meta
+    if _knn_index is not None:
+        return _knn_index, _knn_labels, _knn_meta
+    if not (KNN_INVENTORY_DIR / "tol200m_bioclip2.faiss").exists():
+        return None
+    with _lock:
+        if _knn_index is None:
+            import knn  # local module
+            from knn import _load_index as _knn_load
+            _knn_index, _knn_labels, _knn_meta = _knn_load(KNN_INVENTORY_DIR)
+    return _knn_index, _knn_labels, _knn_meta
+
+
+def _knn_status_dict() -> dict:
+    """Compact status payload for /api/knn-status. Cheap when the index
+    is already loaded (no FAISS work). When the index isn't built, we
+    still return a dict so the UI can render an informative empty state."""
+    out: dict = {
+        "inventory_dir": str(KNN_INVENTORY_DIR),
+        "index_built": False,
+        "version": None,
+        "n_rows": 0,
+        "dim": 0,
+        "by_kingdom": {},
+        "k_default": KNN_K,
+        "cached_assets": 0,
+    }
+    loaded = _get_knn_index()
+    if loaded is None:
+        return out
+    idx, _lbl, meta = loaded
+    out["index_built"] = True
+    out["version"] = meta.get("version")
+    out["n_rows"] = int(idx.ntotal)
+    out["dim"] = int(idx.d)
+    try:
+        with storage.connect(DB_PATH) as conn:
+            rows = storage.list_knn_versions(conn)
+        total = sum(r["n"] for r in rows)
+        out["cached_assets"] = int(total)
+        out["cached_versions"] = rows
+    except Exception:
+        pass
+    return out
 
 
 def _serialize_run(
@@ -290,11 +358,25 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
 async def get_results(
     page: int = Query(default=0, ge=0),
     page_size: int = Query(default=60, ge=1, le=300),
+    cluster_id: int | None = Query(default=None),
+    species: str | None = Query(default=None),
+    genus: str | None = Query(default=None),
+    family: str | None = Query(default=None),
 ) -> dict:
     """Return a paginated slice of every indexed asset. The `run` param
     was dropped — the view is now global so the cluster / taxonomy pills
-    (which count across the whole DB) stay consistent with the grid."""
-    cache_key = "all"
+    (which count across the whole DB) stay consistent with the grid.
+
+    Optional filters narrow both the page slice AND the total count:
+    - cluster_id: matches assets.cluster_id exactly
+    - species/genus/family: matches predictions.position=0 (rank='species')
+      label of the same value
+    """
+    has_filter = any(v is not None for v in (cluster_id, species, genus, family))
+    cache_key = (
+        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}"
+        if has_filter else "all"
+    )
 
     with _results_lock:
         cached = _results_cache.get(cache_key)
@@ -316,11 +398,17 @@ async def get_results(
     # Cache miss → build from SQLite.
     with storage.connect(DB_PATH) as conn:
         results, total = storage.get_all_results(
-            conn, page=0, page_size=10_000_000  # fetch all, slice in memory
+            conn,
+            page=0,
+            page_size=10_000_000,  # fetch all matching, slice in memory
+            cluster_id=cluster_id,
+            species=species,
+            genus=genus,
+            family=family,
         )
         taxonomy = storage.get_global_taxonomy_summary(conn)
         if total == 0:
-            return {"error": "no assets indexed yet — try Run", "results": []}
+            return {"error": "no assets match this filter", "results": []}
         start = page * page_size
         end = start + page_size
         page_results = results[start:end]
@@ -357,6 +445,66 @@ async def run_endpoint(params: RunParams) -> dict:
         top_k=params.top_k if params.top_k is not None else TOP_K,
         batch_size=params.batch_size if params.batch_size is not None else BATCH_SIZE,
     )
+
+
+class ReclassifyParams(BaseModel):
+    asset_ids: list[str]
+    k: int | None = None  # default: server KNN_K
+
+
+@app.get("/api/knn-status")
+async def knn_status() -> dict:
+    """Cheap: returns whether the FAISS index is loaded + cache stats.
+    UI polls this once on page load to render the KNN status pill."""
+    return _knn_status_dict()
+
+
+@app.post("/api/reclassify")
+async def reclassify(params: ReclassifyParams) -> dict:
+    """KNN reclassify the given asset_ids. Skips any asset already
+    cached for (version, k). Returns the new rows so the UI can refresh
+    inline without another /api/results fetch."""
+    k = params.k or KNN_K
+    if _get_knn_index() is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"KNN index not built — missing {KNN_INVENTORY_DIR}/"
+                f"tol200m_bioclip2.faiss. Build it with `python -m knn "
+                f"--parquet-glob ... --index-dir ... --tag ...`."
+            ),
+        )
+    from pipeline import run_knn_reclassify
+    # Run in a worker thread because FAISS .search + parquet take() can
+    # take a few seconds for large batches. We share the DB so we don't
+    # need an additional lock — sqlite is in WAL mode and single-writer.
+    stats = await asyncio.to_thread(
+        run_knn_reclassify_sync, params.asset_ids, k
+    )
+    # Pull the freshly-written rows for the response so the UI can
+    # render them without another fetch.
+    with storage.connect(DB_PATH) as conn:
+        fresh = storage.fetch_knn_predictions(
+            conn,
+            asset_ids=params.asset_ids,
+            index_version=stats["index_version"],
+            k=k,
+        )
+    # Invalidate the per-page cache so the next /api/results reflects
+    # the new KNN rows.
+    with _results_lock:
+        _results_cache.pop("all", None)
+    return {"stats": stats, "results": fresh}
+
+
+def run_knn_reclassify_sync(asset_ids: list[str], k: int) -> dict:
+    """Synchronous wrapper used by the /api/reclassify endpoint so it
+    can be offloaded to a worker thread via asyncio.to_thread()."""
+    from pipeline import run_knn_reclassify
+    with storage.connect(DB_PATH) as conn:
+        return run_knn_reclassify(
+            conn, asset_ids=asset_ids, index_dir=KNN_INVENTORY_DIR, k=k,
+        )
 
 
 @app.get("/thumb/{asset_id}")
@@ -457,6 +605,17 @@ PAGE = """<!doctype html>
   .log-tail pre { margin:0; padding: 8px 24px; background:#0a0a0a; color:#bcb; font: 11px/1.4 ui-monospace, monospace; max-height: 160px; overflow:auto; white-space: pre; }
   .log-tail .log-toggle { padding: 6px 24px; font-size: 12px; color:#888; cursor: pointer; user-select: none; }
   .log-tail .log-toggle:hover { color:#ad9; }
+  /* KNN status pill in the header. */
+  .knn-pill { font: 11px ui-monospace, monospace; padding: 3px 10px; border-radius: 10px; background:#222; color:#888; border:1px solid #333; }
+  .knn-pill.ready { background:#1c2; color:#cfb; border-color:#2c4; }
+  .knn-pill.unavailable { background:#3a1a1a; color:#f88; border-color:#5a2; }
+  /* KNN block on each card. */
+  .knn-block { padding: 0 12px 12px; border-top: 1px dashed #333; margin-top: 4px; }
+  .knn-header { font-size: 11px; color:#9cf; margin-bottom: 2px; font-family: ui-monospace, monospace; display:flex; justify-content:space-between; align-items:center; }
+  .knn-empty { font-size: 11px; color:#888; padding: 4px 0; }
+  .reclassify-btn { background:#234; color:#eee; border:1px solid #456; padding: 3px 8px; border-radius:4px; font-size: 11px; cursor:pointer; font-family: ui-monospace, monospace; }
+  .reclassify-btn:hover:not(:disabled) { background:#345; }
+  .reclassify-btn:disabled { opacity: 0.5; cursor: progress; }
   /* Pagination bar */
   .pagination-bar { display:flex; align-items:center; justify-content:center; gap:4px; padding: 10px 24px; flex-wrap: wrap; background:#1a1a1a; border-bottom: 1px solid #2a2a2a; font: 12px ui-monospace, monospace; }
   .pagination-bar button { background:#222; color:#eee; border:1px solid #333; padding: 4px 10px; border-radius:4px; cursor:pointer; font: inherit; min-width: 32px; }
@@ -482,6 +641,7 @@ PAGE = """<!doctype html>
 <header>
   <h1>Immich × BioCLIP</h1>
   <span class="grow"></span>
+  <span class="knn-pill" id="knn-pill" title="KNN inventory status">KNN: ?</span>
   <span class="meta" id="run-info"></span>
   <button id="refresh">Refresh</button>
 </header>
@@ -522,6 +682,8 @@ PAGE = """<!doctype html>
 </div>
 <div class="toolbar" id="legend-bar" style="border-top:0; padding-top:0; font-size: 12px;">
   <span id="plantae-legend" style="color:#888"></span>
+  <span class="grow"></span>
+  <button class="reclassify-btn" id="reclassify-visible-btn" title="KNN-reclassify every asset visible on this page">Reclassify visible with KNN</button>
 </div>
 <div class="pagination-bar" id="pagination-bar"></div>
 <main id="root">
@@ -595,7 +757,7 @@ async function loadClusterBar() {
           const v = el.getAttribute('data-cluster');
           currentGroupFilter = v === '' ? null : Number(v);
           loadClusterBar();
-          loadResults({page: 0, refreshPills: false});
+          loadResults({page: 0, refreshPills: false, filter: {cluster_id: currentGroupFilter}});
         });
       });
     } catch (e) {
@@ -630,7 +792,14 @@ async function loadClusterBar() {
       const v = el.getAttribute('data-cluster');
       currentGroupFilter = v === '' ? null : v;
       loadClusterBar();
-      loadResults({page: 0, refreshPills: false});
+      // Build a filter object for the chosen taxonomy dimension. Only
+      // one of species/genus/family is active at a time (the group_by
+      // selector enforces that).
+      const filter = {};
+      if (currentGroupFilter !== null) {
+        filter[currentGroupBy] = currentGroupFilter;
+      }
+      loadResults({page: 0, refreshPills: false, filter});
     });
   });
 }
@@ -732,22 +901,13 @@ function render(data) {
   const green = data.plantae_green ?? 0.60;
   const yellow = data.plantae_yellow ?? 0.35;
 
+  // Filter is applied SERVER-SIDE now (cluster_id / species / genus /
+  // family passed in /api/results URL). data.results already contains
+  // only matching assets, so no client-side filter needed here.
   let rows = data.results;
-  if (currentGroupFilter !== null) {
-    if (currentGroupBy === 'cluster') {
-      rows = rows.filter(r => r.cluster_id === currentGroupFilter);
-    } else {
-      // taxonomy: match the chosen species/genus/family against top-1
-      rows = rows.filter(r => {
-        const top = (r.top_predictions || [])[0];
-        return top && top[currentGroupBy] === currentGroupFilter;
-      });
-    }
-  }
 
-  // Sort by current mode (after cluster filter). Search-rank is the
-  // identity transform — Immich already returned the assets in the
-  // desired order; get_run_results preserves it through the SQL join.
+  // Sort by current mode. Search-rank is the identity transform — the
+  // server already returns assets in (most-recent Immich rank ASC) order.
   if (currentSortMode === 'plantae') {
     rows = rows.slice().sort((a, b) =>
       (b.taxon_scores && b.taxon_scores.Plantae != null ? b.taxon_scores.Plantae : -1) -
@@ -853,9 +1013,42 @@ function render(data) {
         <div class="preds">${preds}</div>
         ${detBlocks ? `<div class="dets">${detBlocks}</div>` : ''}
         ${nearDupPanel}
+        ${renderKnnBlock(r)}
       </div>
     `;
   }).join('');
+}
+
+// KNN block: a collapsible panel under each card showing the top-1
+// consensus species + top-K neighbors, plus a reclassify button when
+// no row is cached yet. `render()` calls this for every card so the
+// block is present in the DOM whether or not KNN results are cached.
+function renderKnnBlock(r) {
+  const knn = r.knn;
+  if (knn && knn.top_species) {
+    const sp = escapeHtml(knn.top_species || '');
+    const cn = escapeHtml(knn.common_name || '');
+    const sc = ((knn.score || 0) * 100).toFixed(1);
+    const nbrs = (knn.neighbors || []).slice(0, 3).map(n =>
+      `<div class="pred"><div class="sp">${escapeHtml(n.species)}<div class="cn">${escapeHtml(n.common_name || '')}</div></div><div class="sc">${(n.sim * 100).toFixed(1)}%</div></div>`
+    ).join('');
+    return `
+      <div class="knn-block">
+        <div class="knn-header">
+          <span>KNN top-1: ${sp}${cn ? ' (' + cn + ')' : ''} · ${sc}%</span>
+          <span style="color:#888">${escapeHtml(knn.kingdom || '')}${knn.family ? ' · ' + escapeHtml(knn.family) : ''}</span>
+        </div>
+        ${nbrs}
+        <button class="reclassify-btn" data-aid="${escapeHtml(r.asset_id)}" data-action="reclassify" style="margin-top:6px">Re-run KNN</button>
+      </div>
+    `;
+  }
+  return `
+    <div class="knn-block">
+      <div class="knn-empty">No KNN result yet.</div>
+      <button class="reclassify-btn" data-aid="${escapeHtml(r.asset_id)}" data-action="reclassify" style="margin-top:4px">Reclassify with KNN</button>
+    </div>
+  `;
 }
 
 let currentPage = 0;
@@ -866,7 +1059,19 @@ async function loadResults(opts = {}) {
   const pageSize = opts.pageSize ?? currentPageSize;
   currentPage = page;
   currentPageSize = pageSize;
-  const url = `/api/results?page=${page}&page_size=${pageSize}`;
+  // If a filter is passed, reset to page 0 (results are different now)
+  // and use opts.filter directly. Otherwise use the current global filter.
+  const filter = opts.filter !== undefined ? opts.filter : currentFilter;
+  if (opts.filter !== undefined) currentFilter = filter;
+  const params = new URLSearchParams({
+    page: String(page),
+    page_size: String(pageSize),
+  });
+  if (filter.cluster_id != null) params.set('cluster_id', String(filter.cluster_id));
+  if (filter.species) params.set('species', filter.species);
+  if (filter.genus) params.set('genus', filter.genus);
+  if (filter.family) params.set('family', filter.family);
+  const url = `/api/results?${params}`;
   try {
     const data = await safeFetch(url);
     lastResults = data;
@@ -877,6 +1082,9 @@ async function loadResults(opts = {}) {
     showError('Could not load results.', `${url} — ${e.message}`);
   }
 }
+
+// Track the active server-side filter so paginating keeps the filter on.
+let currentFilter = {};
 
 function fmtDuration(s) {
   if (!s || s <= 0) return '';
@@ -1075,10 +1283,11 @@ if (groupBySel) {
   groupBySel.value = currentGroupBy;
   groupBySel.addEventListener('change', () => {
     currentGroupBy = groupBySel.value;
-    currentGroupFilter = null;  // reset filter when switching grouping
+    currentGroupFilter = null;
+    currentFilter = {};
     try { localStorage.setItem('groupBy', currentGroupBy); } catch (_) {}
     loadClusterBar();
-    loadResults({page: 0, refreshPills: false});
+    loadResults({page: 0, refreshPills: false, filter: {}});
   });
 }
 
@@ -1122,10 +1331,94 @@ document.addEventListener('click', (e) => {
     // Mark active in the panel.
     card.querySelectorAll('.near-dup-pick').forEach(b => b.classList.remove('active'));
     pick.classList.add('active');
+    return;
+  }
+  // KNN reclassify handler — delegated so cards rendered after the
+  // first bind still work. Disables the button + shows a spinner
+  // label while the request is in flight.
+  const rc = e.target.closest('[data-action="reclassify"]');
+  if (rc) {
+    const aid = rc.getAttribute('data-aid');
+    if (!aid || rc.disabled) return;
+    rc.disabled = true;
+    const prev = rc.textContent;
+    rc.textContent = 'Running…';
+    reclassifyOne(aid, rc, prev);
   }
 });
 
+async function reclassifyOne(aid, btn, prevLabel) {
+  try {
+    const data = await safeFetch('/api/reclassify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({asset_ids: [aid]}),
+    });
+    const knn = (data.results || {})[aid];
+    if (knn) {
+      // Patch the cached payload + re-render so the KNN block fills in.
+      if (lastResults && Array.isArray(lastResults.results)) {
+        const row = lastResults.results.find(r => r.asset_id === aid);
+        if (row) row.knn = knn;
+      }
+      renderCurrent();
+    }
+  } catch (e) {
+    showError('KNN reclassify failed.', e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = prevLabel || 'Reclassify with KNN';
+  }
+}
+
+async function reclassifyVisible() {
+  if (!lastResults || !Array.isArray(lastResults.results) || !lastResults.results.length) {
+    showError('Nothing to reclassify.', 'Load a page of results first.');
+    return;
+  }
+  const btn = document.getElementById('reclassify-visible-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Running KNN…'; }
+  const ids = lastResults.results.map(r => r.asset_id);
+  try {
+    const data = await safeFetch('/api/reclassify', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({asset_ids: ids}),
+    });
+    // Refetch /api/results so KNN blocks populate cleanly. (Cheap —
+    // cache hit after the invalidate in /api/reclassify.)
+    await loadResults({refreshPills: false});
+  } catch (e) {
+    showError('KNN reclassify failed.', e.message);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Reclassify visible with KNN'; }
+  }
+}
+const reclassifyVisibleBtn = document.getElementById('reclassify-visible-btn');
+if (reclassifyVisibleBtn) reclassifyVisibleBtn.addEventListener('click', reclassifyVisible);
+
+// KNN status pill — poll once on load + after reclassify actions.
+async function refreshKnnPill() {
+  const pill = document.getElementById('knn-pill');
+  if (!pill) return;
+  let s;
+  try { s = await safeFetch('/api/knn-status'); }
+  catch (e) { pill.textContent = 'KNN: error'; pill.className = 'knn-pill unavailable'; return; }
+  if (!s.index_built) {
+    pill.textContent = 'KNN: not built';
+    pill.className = 'knn-pill unavailable';
+    pill.title = `No FAISS index at ${s.inventory_dir}. Build with \`python -m knn --parquet-glob ... --index-dir ${s.inventory_dir} --tag ...\`.`;
+    return;
+  }
+  const cached = s.cached_assets || 0;
+  const nRows = s.n_rows ? `${(s.n_rows / 1e6).toFixed(0)}M` : '?';
+  pill.textContent = `KNN: ${s.version || '?'} (${nRows} ref, ${cached} cached)`;
+  pill.className = 'knn-pill ready';
+  pill.title = `Inventory: ${s.inventory_dir}\nVersion: ${s.version}\nReference rows: ${s.n_rows}\nCached assets: ${cached}\nDefault k: ${s.k_default}`;
+}
+
 (async () => {
+  await refreshKnnPill();
   await loadClusterBar();
   await pollStatus();
   await loadResults();

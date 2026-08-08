@@ -147,6 +147,28 @@ CREATE TABLE IF NOT EXISTS search_results (
 );
 CREATE INDEX IF NOT EXISTS idx_search_results_run
   ON search_results(run_id, rank_position);
+
+-- KNN reclassification results from a labeled reference inventory
+-- (currently TreeOfLife-200M-Embeddings via knn.py). Stored SEPARATELY
+-- from the zero-shot `predictions` so a re-run of the regular pipeline
+-- never invalidates these rows. Cache key is (asset_id, index_version, k)
+-- so a new inventory build (or a different K) gets its own row.
+CREATE TABLE IF NOT EXISTS knn_predictions (
+  asset_id      TEXT NOT NULL REFERENCES assets(asset_id) ON DELETE CASCADE,
+  index_version TEXT NOT NULL,
+  k             INTEGER NOT NULL,
+  computed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  top_species   TEXT NOT NULL,
+  common_name   TEXT NOT NULL DEFAULT '',
+  score         REAL NOT NULL,
+  kingdom       TEXT NOT NULL DEFAULT '',
+  family        TEXT NOT NULL DEFAULT '',
+  genus         TEXT NOT NULL DEFAULT '',
+  neighbors     TEXT NOT NULL,
+  PRIMARY KEY (asset_id, index_version, k)
+);
+CREATE INDEX IF NOT EXISTS idx_knn_asset ON knn_predictions(asset_id);
+CREATE INDEX IF NOT EXISTS idx_knn_version ON knn_predictions(index_version);
 """
 
 
@@ -668,6 +690,172 @@ def latest_run(conn: sqlite3.Connection) -> dict | None:
     return rows[0] if rows else None
 
 
+# ---------- knn_predictions ---------------------------------------------
+
+
+def replace_knn_predictions(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+    index_version: str,
+    k: int,
+    rows: Iterable[dict],
+) -> None:
+    """Delete any cached KNN rows for (asset, version, k) and insert the
+    new ones. Caller passes a list with exactly one dict (the KNN result
+    for this asset) — same shape regardless of K (top-1 consensus is
+    stored as the row; the full neighbor list is in `neighbors` JSON).
+    """
+    conn.execute(
+        "DELETE FROM knn_predictions WHERE asset_id=? AND index_version=? AND k=?",
+        (asset_id, index_version, k),
+    )
+    for r in rows:
+        # `neighbors` is a list of {uuid, species, common_name, sim} dicts;
+        # serialize once for the JSON column.
+        import json as _json
+        neighbors_json = r.get("neighbors_json")
+        if neighbors_json is None:
+            neighbors_json = _json.dumps(r.get("neighbors", []))
+        conn.execute(
+            """
+            INSERT INTO knn_predictions
+              (asset_id, index_version, k, top_species, common_name,
+               score, kingdom, family, genus, neighbors)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                asset_id,
+                index_version,
+                k,
+                r.get("top_species") or "",
+                r.get("common_name") or "",
+                float(r.get("score", 0.0)),
+                r.get("kingdom") or "",
+                r.get("family") or "",
+                r.get("genus") or "",
+                neighbors_json,
+            ),
+        )
+
+
+def fetch_knn_predictions(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[str],
+    index_version: str,
+    k: int,
+) -> dict[str, dict]:
+    """Bulk fetch KNN results for a list of asset_ids. Returns
+    {asset_id: {top_species, common_name, score, kingdom, family,
+                genus, neighbors, computed_at}}. Missing rows are
+    omitted from the result dict (caller should default-handle).
+    """
+    if not asset_ids:
+        return {}
+    import json as _json
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"""
+        SELECT asset_id, top_species, common_name, score, kingdom,
+               family, genus, neighbors, computed_at
+        FROM knn_predictions
+        WHERE index_version=? AND k=? AND asset_id IN ({placeholders})
+        """,
+        [index_version, k, *asset_ids],
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        try:
+            neighbors = _json.loads(r["neighbors"])
+        except Exception:
+            neighbors = []
+        out[r["asset_id"]] = {
+            "top_species": r["top_species"] or None,
+            "common_name": r["common_name"] or "",
+            "score": float(r["score"]),
+            "kingdom": r["kingdom"] or "",
+            "family": r["family"] or "",
+            "genus": r["genus"] or "",
+            "neighbors": neighbors,
+            "computed_at": r["computed_at"],
+        }
+    return out
+
+
+def knn_predictions_have_asset(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+    index_version: str,
+    k: int,
+) -> bool:
+    """Cache check: is there already a KNN row for (asset, version, k)?"""
+    row = conn.execute(
+        """
+        SELECT 1 FROM knn_predictions
+        WHERE asset_id=? AND index_version=? AND k=? LIMIT 1
+        """,
+        (asset_id, index_version, k),
+    ).fetchone()
+    return row is not None
+
+
+def list_knn_versions(conn: sqlite3.Connection) -> list[dict]:
+    """Distinct (index_version, k) pairs in the cache, with row counts.
+    Used by /api/knn-status to surface what's available."""
+    rows = conn.execute(
+        """
+        SELECT index_version, k, COUNT(*) AS n,
+               MIN(computed_at) AS first_at,
+               MAX(computed_at) AS last_at
+        FROM knn_predictions
+        GROUP BY index_version, k
+        ORDER BY last_at DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def enrich_with_knn(
+    conn: sqlite3.Connection,
+    buckets: list[dict],
+    *,
+    index_version: str | None = None,
+    k: int | None = None,
+) -> None:
+    """Attach a `knn` field to each bucket in-place if a KNN row exists
+    for (asset, version, k). If `index_version` / `k` are None, the
+    most-populated pair is auto-detected from the knn_predictions table
+    (cheap — one GROUP BY query). Missing rows are left with no `knn`
+    key, which the UI renders as the "Reclassify with KNN" empty state."""
+    if not buckets:
+        return
+    if index_version is None or k is None:
+        row = conn.execute(
+            """
+            SELECT index_version, k, COUNT(*) AS n
+            FROM knn_predictions
+            GROUP BY index_version, k
+            ORDER BY n DESC, MAX(computed_at) DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return
+        if index_version is None:
+            index_version = row["index_version"]
+        if k is None:
+            k = row["k"]
+    asset_ids = [b["asset_id"] for b in buckets]
+    rows = fetch_knn_predictions(
+        conn, asset_ids=asset_ids, index_version=index_version, k=k
+    )
+    for b in buckets:
+        if b["asset_id"] in rows:
+            b["knn"] = rows[b["asset_id"]]
+
+
 # ---------- near-dup groups ---------------------------------------------
 
 
@@ -953,6 +1141,9 @@ def get_run_results(conn: sqlite3.Connection, *, run_id: int) -> list[dict]:
         for aid, bucket in by_asset.items():
             bucket["taxon_scores"] = scores.get(aid, {})
 
+    # Attach cached KNN results (if any). enrich_with_knn mutates in place.
+    enrich_with_knn(conn, list(by_asset.values()))
+
     return [by_asset[aid] for aid in order]
 
 
@@ -1019,6 +1210,10 @@ def get_all_results(
     conn: sqlite3.Connection, *,
     page: int = 0,
     page_size: int = 60,
+    cluster_id: int | None = None,
+    species: str | None = None,
+    genus: str | None = None,
+    family: str | None = None,
 ) -> tuple[list[dict], int]:
     """Return (page_of_buckets, total) for every asset with predictions.
 
@@ -1029,12 +1224,39 @@ def get_all_results(
     Sort order: each asset's `rank_position` from its MOST RECENT run
     (so the user sees photos in the order Immich last returned them),
     then cluster_id, then filename for ties / assets never in a run.
+
+    Optional filters narrow both the page slice and the `total` count:
+    - cluster_id: assets.cluster_id == cluster_id
+    - species/genus/family: predictions.position=0 (rank='species') has
+      matching label. These are applied via JOIN so the filter is on the
+      same prediction row used by the taxonomy pills.
     """
-    total = conn.execute(
-        "SELECT COUNT(*) FROM assets WHERE asset_id IN ("
-        "  SELECT DISTINCT asset_id FROM predictions"
-        ")"
-    ).fetchone()[0]
+    # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
+    # need an INNER JOIN on predictions (position=0); the cluster_id
+    # filter is a plain WHERE on assets.
+    joins = ""
+    where = ["a.asset_id IN (SELECT DISTINCT asset_id FROM predictions)"]
+    params: list = []
+    if cluster_id is not None:
+        where.append("a.cluster_id = ?")
+        params.append(cluster_id)
+    if species is not None:
+        joins += " JOIN predictions p_species ON p_species.asset_id = a.asset_id AND p_species.rank = 'species' AND p_species.position = 0"
+        where.append("p_species.species = ?")
+        params.append(species)
+    if genus is not None:
+        joins += " JOIN predictions p_genus ON p_genus.asset_id = a.asset_id AND p_genus.rank = 'species' AND p_genus.position = 0"
+        where.append("p_genus.genus = ?")
+        params.append(genus)
+    if family is not None:
+        joins += " JOIN predictions p_family ON p_family.asset_id = a.asset_id AND p_family.rank = 'species' AND p_family.position = 0"
+        where.append("p_family.family = ?")
+        params.append(family)
+
+    where_sql = " AND ".join(where)
+
+    count_sql = f"SELECT COUNT(*) FROM assets a {joins} WHERE {where_sql}"
+    total = conn.execute(count_sql, params).fetchone()[0]
     if total == 0:
         return [], 0
 
@@ -1043,7 +1265,7 @@ def get_all_results(
     # the index on search_results(asset_id). With 10k assets this is
     # measured in milliseconds.
     rows = conn.execute(
-        """
+        f"""
         SELECT a.asset_id, a.original_file_name, a.original_url,
                a.thumbnail_url, a.cluster_id,
                (SELECT sr.rank_position
@@ -1051,15 +1273,15 @@ def get_all_results(
                   WHERE sr.asset_id = a.asset_id
                   ORDER BY sr.run_id DESC
                   LIMIT 1) AS latest_rank
-        FROM assets a
-        WHERE a.asset_id IN (SELECT DISTINCT asset_id FROM predictions)
+        FROM assets a {joins}
+        WHERE {where_sql}
         ORDER BY latest_rank IS NULL ASC,
                  latest_rank ASC,
                  a.cluster_id ASC,
                  a.original_file_name ASC
         LIMIT ? OFFSET ?
         """,
-        (page_size, page * page_size),
+        (*params, page_size, page * page_size),
     ).fetchall()
 
     if not rows:
@@ -1137,6 +1359,10 @@ def get_all_results(
             "taxon_scores": taxon_by_asset.get(aid, {}),
             "near_dups": near_dups,
         })
+
+    # Attach cached KNN results (if any) so the UI can render the KNN
+    # block without a separate fetch. Auto-detects (version, k).
+    enrich_with_knn(conn, buckets)
 
     return buckets, total
 

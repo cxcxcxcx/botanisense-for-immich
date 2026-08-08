@@ -47,6 +47,34 @@ def main() -> int:
         default=None,
         help="Print results for a past run id instead of running the pipeline.",
     )
+    ap.add_argument(
+        "--reclassify-knn",
+        action="store_true",
+        help="After the regular pipeline, KNN-reclassify each asset in the "
+             "run that has an embedding. Uses the cached BioCLIP image vector "
+             "(no re-embed). Requires --inventory-dir.",
+    )
+    ap.add_argument(
+        "--reclassify-all-knn",
+        action="store_true",
+        help="Skip Immich search entirely; KNN-reclassify every asset in the "
+             "DB that has an embedding. Useful for one-shot reclassification "
+             "after building a new index.",
+    )
+    ap.add_argument(
+        "--knn-k",
+        type=int,
+        default=int(os.environ.get("KNN_K", "10")),
+        help="K for the KNN vote (default 10).",
+    )
+    ap.add_argument(
+        "--inventory-dir",
+        default=os.environ.get(
+            "KNN_INVENTORY_DIR", "/media/4T_Ext/bioclip_inventory/index"
+        ),
+        help="Directory containing tol200m_bioclip2.faiss + labels.parquet "
+             "+ INDEX_VERSION.txt.",
+    )
     args = ap.parse_args()
 
     if args.run is not None:
@@ -65,6 +93,42 @@ def main() -> int:
             started_at=run_row["started_at"],
             finished_at=run_row["finished_at"],
             dicts=results,
+        )
+        return 0
+
+    if args.reclassify_all_knn:
+        # Skip Immich search entirely. Useful for one-shot reclassification
+        # after building a new index. Just KNN every asset with an embedding.
+        storage.init_db(args.db)
+        from pipeline import run_knn_reclassify
+        with storage.connect(args.db) as conn:
+            ids = [
+                r["asset_id"]
+                for r in conn.execute(
+                    "SELECT DISTINCT asset_id FROM embeddings"
+                ).fetchall()
+            ]
+        if not ids:
+            print(
+                f"[reclassify-all-knn] no assets with embeddings in {args.db}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"[reclassify-all-knn] KNN over {len(ids)} assets  "
+            f"k={args.knn_k}  inventory={args.inventory_dir}"
+        )
+        with storage.connect(args.db) as conn:
+            stats = run_knn_reclassify(
+                conn,
+                asset_ids=ids,
+                index_dir=__import__("pathlib").Path(args.inventory_dir),
+                k=args.knn_k,
+            )
+        print(
+            f"[reclassify-all-knn] done  "
+            f"requested={stats['requested']}  cached={stats['cached']}  "
+            f"scanned={stats['scanned']}  version={stats['index_version']}"
         )
         return 0
 
@@ -97,6 +161,31 @@ def main() -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         raise
+
+    # Optional KNN reclassify step. Runs after the regular pipeline so
+    # we know every asset in the run has at least its cached BioCLIP
+    # embedding (zero-shot predictions may be cached too).
+    if args.reclassify_knn:
+        from pathlib import Path as _Path
+        from pipeline import run_knn_reclassify
+        run_assets = [r.asset_id for r in out.results]
+        if run_assets:
+            print(
+                f"[reclassify-knn] KNN over {len(run_assets)} assets  "
+                f"k={args.knn_k}  inventory={args.inventory_dir}"
+            )
+            with storage.connect(args.db) as conn:
+                stats = run_knn_reclassify(
+                    conn,
+                    asset_ids=run_assets,
+                    index_dir=_Path(args.inventory_dir),
+                    k=args.knn_k,
+                )
+            print(
+                f"[reclassify-knn] done  "
+                f"requested={stats['requested']}  cached={stats['cached']}  "
+                f"scanned={stats['scanned']}  version={stats['index_version']}"
+            )
 
     _print_results(
         run_id=out.run_id,
