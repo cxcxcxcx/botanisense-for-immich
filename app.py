@@ -261,11 +261,14 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
     # Drop cache entries: the global "all" view (the run may have added
     # new photos) and any per-run entry (kept for backwards compat with
     # the old /api/results?run=... path). Also invalidate the near-dup
-    # cache — new embeddings change which photos are near-duplicates.
+    # cache — new embeddings change which photos are near-duplicates —
+    # and the cluster-names cache — HDBSCAN may reassign cluster_ids.
     with _results_lock:
         _results_cache.pop("all", None)
         _results_cache.pop(out.run_id, None)
     storage.invalidate_global_near_dup_cache()
+    with storage.connect(DB_PATH) as conn:
+        storage.invalidate_cluster_names(conn)
     return payload
 
 
@@ -337,7 +340,29 @@ async def list_runs() -> dict:
 @app.get("/api/clusters")
 async def clusters_endpoint() -> dict:
     with storage.connect(DB_PATH) as conn:
-        return {"clusters": storage.cluster_summary(conn)}
+        rows = storage.cluster_summary(conn)
+        # Augment each cluster with a human-readable name computed from
+        # its top-1 prediction distribution (see storage.compute_cluster_names).
+        # ensure_cluster_names() lazily computes & caches the names on
+        # the first call, then reuses them until invalidate_cluster_names().
+        names = storage.ensure_cluster_names(conn)
+        for r in rows:
+            cid = r["cluster_id"]
+            info = names.get(cid, {})
+            r["name"] = info.get("name", "")
+            r["top_species"] = info.get("top_species", [])[:2]
+            r["top_genus"] = info.get("top_genus", [])[:2]
+        return {"clusters": rows}
+
+
+@app.post("/api/clusters/recompute")
+async def recompute_cluster_names() -> dict:
+    """Force-recompute every cluster's name from scratch. Useful after a
+    big run when the asset→cluster mapping shifted."""
+    with storage.connect(DB_PATH) as conn:
+        names = storage.compute_cluster_names(conn)
+        storage.save_cluster_names(conn, names)
+    return {"recomputed": len(names)}
 
 
 @app.get("/api/status")
@@ -746,9 +771,24 @@ async function loadClusterBar() {
       ];
       for (const c of data.clusters) {
         const cid = Number(c.cluster_id);
+        // Prefer the human-readable name ("Saguaro", "Hydrangea & Pelargonium")
+        // computed server-side from the cluster's top-1 prediction distribution.
+        // Falls back to "cluster 173" if no name was generated (e.g. empty cluster).
+        const label = c.name
+          ? `${escapeHtml(c.name)} <small style="color:#888">(${cid}, ${c.n})</small>`
+          : `cluster ${cid} (${c.n})`;
+        const titleParts = [];
+        if (c.top_species && c.top_species.length) {
+          titleParts.push('top species: ' + c.top_species.map(s =>
+            `${s.species} (${s.count}${s.common_name ? ', ' + s.common_name : ''})`
+          ).join('; '));
+        }
+        if (c.top_genus && c.top_genus.length) {
+          titleParts.push('top genera: ' + c.top_genus.map(g => `${g.genus} (${g.count})`).join('; '));
+        }
         pills.push(
-          `<span class="cluster-pill${currentGroupFilter === cid ? ' on' : ''}" data-cluster="${cid}">` +
-          `cluster ${cid} (${c.n})</span>`
+          `<span class="cluster-pill${currentGroupFilter === cid ? ' on' : ''}" data-cluster="${cid}" title="${escapeHtml(titleParts.join('\n'))}">` +
+          `${label}</span>`
         );
       }
       pillsContainer.innerHTML = pills.join('');

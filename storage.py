@@ -169,6 +169,21 @@ CREATE TABLE IF NOT EXISTS knn_predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_knn_asset ON knn_predictions(asset_id);
 CREATE INDEX IF NOT EXISTS idx_knn_version ON knn_predictions(index_version);
+
+-- Human-readable cluster summaries, computed by compute_cluster_names()
+-- from the top-1 prediction per asset (rank='species', position=0). Stored
+-- once per cluster_id so the API can serve cluster pills ("Saguaro (17)"
+-- instead of "cluster 173 (17)") without re-aggregating on every request.
+-- Recomputed when the asset→cluster mapping shifts (after a pipeline run
+-- invalidates this table — see invalidate_cluster_names()).
+CREATE TABLE IF NOT EXISTS cluster_names (
+  cluster_id      INTEGER PRIMARY KEY,
+  name            TEXT NOT NULL,        -- human-readable label
+  n_total         INTEGER NOT NULL,     -- assets in cluster when computed
+  top_species_json TEXT NOT NULL DEFAULT '[]',  -- top-3 species + counts
+  top_genus_json  TEXT NOT NULL DEFAULT '[]',   -- top-3 genera + counts
+  computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -264,6 +279,202 @@ def cluster_summary(conn: sqlite3.Connection) -> list[dict]:
         """,
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- cluster_names ------------------------------------------------
+
+
+def compute_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
+    """Aggregate the top-1 species prediction per asset (rank='species',
+    position=0) for every cluster and produce a short human-readable label.
+
+    Returns {cluster_id: {"name", "n_total", "top_species": [...],
+                           "top_genus": [...]}}.
+
+    Heuristic (rules tried in priority order):
+      1. If a 2nd genus has ≥ 25% share (and a 3rd has ≥ 20%) → join the
+         top genera: "{g1} & {g2}" or "{g1}, {g2} & {g3}". Matches
+         "Hydrangea & Pelargonium" and "Echeveria, Agave & Aloe".
+      2. Else if the top genus has < 50% of cluster assets → "Mixed"
+         (the cluster is noise / too diverse to label).
+      3. Else if a single species covers ≥ 65% of the cluster → use its
+         common_name (fallback to species). Matches "Saguaro",
+         "Giant-rhubarb", "Camellia".
+      4. Otherwise (single genus dominant but species diverse) → use the
+         top genus name. Matches "Wisteria".
+
+    Multi-genus (rule 1) is checked BEFORE the noise threshold (rule 2)
+    so a 3-way succulent mix (Echeveria/Agave/Aloe at 0.33/0.26/0.23)
+    gets a real label rather than being lumped into "Mixed".
+
+    Only the top-1 prediction per asset is used — the bbox-cropped species
+    predictions are not considered (they're often more specific and would
+    disagree on the same photo).
+    """
+    rows = conn.execute(
+        """
+        SELECT a.cluster_id AS cid, p.species, p.common_name, p.genus
+        FROM predictions p
+        JOIN assets a ON a.asset_id = p.asset_id
+        WHERE p.rank = 'species' AND p.position = 0
+          AND a.cluster_id IS NOT NULL
+        """,
+    ).fetchall()
+
+    # Group rows by cluster for single-pass aggregation.
+    by_cluster: dict[int, list] = {}
+    for r in rows:
+        by_cluster.setdefault(r["cid"], []).append(r)
+
+    out: dict[int, dict] = {}
+    for cid, items in by_cluster.items():
+        total = len(items)
+        if total == 0:
+            continue
+
+        # Species counter — keep first-seen common_name for each species.
+        species: dict[str, dict] = {}
+        genus: dict[str, int] = {}
+        for r in items:
+            sp = r["species"]
+            if sp:
+                entry = species.setdefault(
+                    sp, {"species": sp, "common_name": r["common_name"] or "", "count": 0}
+                )
+                entry["count"] += 1
+            ge = r["genus"]
+            if ge:
+                genus[ge] = genus.get(ge, 0) + 1
+
+        sp_sorted = sorted(species.values(), key=lambda d: -d["count"])
+        ge_sorted = sorted(genus.items(), key=lambda kv: -kv[1])
+
+        g1, g1_n = ge_sorted[0] if ge_sorted else ("", 0)
+        g2, g2_n = ge_sorted[1] if len(ge_sorted) >= 2 else ("", 0)
+        g3, g3_n = ge_sorted[2] if len(ge_sorted) >= 3 else ("", 0)
+
+        g1_share = g1_n / total
+        g2_share = g2_n / total
+        g3_share = g3_n / total
+
+        top_sp = sp_sorted[0] if sp_sorted else None
+        sp_share = (top_sp["count"] / total) if top_sp else 0.0
+
+        # Rule 1: multi-genus cluster — list top-2 (or top-3 if 3rd
+        # matters). Checked BEFORE the noise threshold so a balanced
+        # 3-way mix still gets a real label.
+        if g2_share >= 0.25 and g3_share >= 0.20:
+            name = f"{g1}, {g2} & {g3}"
+        elif g2_share >= 0.25:
+            name = f"{g1} & {g2}"
+        # Rule 2: noise cluster — top genus doesn't even cover half.
+        elif g1_share < 0.50:
+            name = "Mixed"
+        # Rule 3: single species dominant — use its common_name.
+        elif sp_share >= 0.65 and top_sp:
+            cn = top_sp["common_name"]
+            name = cn if cn else top_sp["species"]
+        # Rule 4: single genus dominant — use the genus name.
+        else:
+            name = g1
+
+        out[cid] = {
+            "name": name,
+            "n_total": total,
+            "top_species": sp_sorted[:3],
+            "top_genus": [{"genus": g, "count": c} for g, c in ge_sorted[:3]],
+        }
+    return out
+
+
+def save_cluster_names(conn: sqlite3.Connection, names: dict[int, dict]) -> None:
+    """Persist the computed names to the cluster_names table.
+
+    Replaces the entire table — cluster_ids are stable across re-runs of
+    compute_cluster_names() but the cluster→asset mapping may shift, so
+    a full refresh is simpler than a diff.
+
+    Commits before returning so the next /api/clusters call sees the rows
+    (the connect() contextmanager doesn't auto-commit on close).
+    """
+    import json as _json
+    conn.execute("DELETE FROM cluster_names")
+    for cid, info in names.items():
+        conn.execute(
+            """
+            INSERT INTO cluster_names
+              (cluster_id, name, n_total, top_species_json, top_genus_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                cid,
+                info["name"],
+                int(info["n_total"]),
+                _json.dumps(info.get("top_species", [])),
+                _json.dumps(info.get("top_genus", [])),
+            ),
+        )
+    conn.commit()
+
+
+def load_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
+    """Read every cluster_names row. Empty dict if none stored yet."""
+    import json as _json
+    rows = conn.execute(
+        """
+        SELECT cluster_id, name, n_total, top_species_json, top_genus_json,
+               computed_at
+        FROM cluster_names
+        """,
+    ).fetchall()
+    out: dict[int, dict] = {}
+    for r in rows:
+        try:
+            top_sp = _json.loads(r["top_species_json"])
+        except Exception:
+            top_sp = []
+        try:
+            top_ge = _json.loads(r["top_genus_json"])
+        except Exception:
+            top_ge = []
+        out[int(r["cluster_id"])] = {
+            "name": r["name"],
+            "n_total": int(r["n_total"]),
+            "top_species": top_sp,
+            "top_genus": top_ge,
+            "computed_at": r["computed_at"],
+        }
+    return out
+
+
+def invalidate_cluster_names(conn: sqlite3.Connection) -> None:
+    """Drop cached cluster names so the next ensure_cluster_names() call
+    recomputes from scratch. Called after every pipeline run — the
+    asset→cluster mapping may have shifted even if cluster_ids are
+    numerically stable."""
+    conn.execute("DELETE FROM cluster_names")
+    conn.commit()
+
+
+def ensure_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
+    """Return the cluster_names dict, recomputing if it's missing or stale.
+
+    Stale = the current number of distinct cluster_ids in assets exceeds
+    what's in cluster_names. This catches the case where a new cluster
+    appears mid-pipeline (HDBSCAN often produces 1-2 more clusters per
+    pass) but the existing rows are still valid for the old clusters.
+    On any divergence we recompute the whole table (cheap — one SQL
+    pass over predictions).
+    """
+    cur_clusters = conn.execute(
+        "SELECT COUNT(DISTINCT cluster_id) FROM assets WHERE cluster_id IS NOT NULL"
+    ).fetchone()[0]
+    saved_clusters = conn.execute("SELECT COUNT(*) FROM cluster_names").fetchone()[0]
+    if cur_clusters > saved_clusters:
+        names = compute_cluster_names(conn)
+        save_cluster_names(conn, names)
+        return names
+    return load_cluster_names(conn)
 
 
 # ---------- embeddings ---------------------------------------------------
