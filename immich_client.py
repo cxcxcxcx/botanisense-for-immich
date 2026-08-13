@@ -165,5 +165,46 @@ class ImmichClient:
         r.raise_for_status()
         return r.content
 
+    # ---- album management -----------------------------------------------
+
+    def create_album(self, *, name: str, description: str = "") -> dict:
+        """POST /api/albums — create a new album.
+
+        Body shape (CreateAlbumDto): { albumName, description? }.
+        Returns the created album dict (includes 'id').
+        """
+        r = self._client.post(
+            "/api/albums",
+            json={"albumName": name, "description": description},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def add_assets_to_album(
+        self, *, album_id: str, asset_ids: list[str]
+    ) -> dict:
+        """PUT /api/albums/{id}/assets — bulk-add assets to an album.
+
+        Immich's body schema is { ids: [asset_uuid, ...] } (not
+        `assetIds`). Returns the updated album summary. We chunk in the
+        caller to mirror the project's _MAX_PAGE_SIZE boundary, although
+        Immich's bulk endpoint accepts very large lists.
+        """
+        r = self._client.put(
+            f"/api/albums/{album_id}/assets",
+            json={"ids": list(asset_ids)},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_album(self, album_id: str) -> dict:
+        """GET /api/albums/{id}. Raises (via raise_for_status) if the album
+        doesn't exist (404) — used by /api/album/plants to detect a stale
+        saved id after a user manually deletes the album in Immich.
+        """
+        r = self._client.get(f"/api/albums/{album_id}")
+        r.raise_for_status()
+        return r.json()
+
     def close(self) -> None:
         self._client.close()

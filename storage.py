@@ -184,6 +184,14 @@ CREATE TABLE IF NOT EXISTS cluster_names (
   top_genus_json  TEXT NOT NULL DEFAULT '[]',   -- top-3 genera + counts
   computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
+-- Idempotency for album-management features (e.g., "tag Plants album").
+-- The Plants-album button reads `plants_album_id` to know whether to reuse
+-- or create an album, so a re-run of the button doesn't create duplicates.
+CREATE TABLE IF NOT EXISTS album_meta (
+  key          TEXT PRIMARY KEY,
+  value_json   TEXT NOT NULL,
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -255,6 +263,63 @@ def all_embeddings(conn: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
         [np.frombuffer(r["vector"], dtype="<f4").copy() for r in rows]
     )
     return ids, matrix
+
+
+def find_library_neighbors(
+    conn: sqlite3.Connection, *, asset_id: str, k: int = 12
+) -> list[dict]:
+    """Top-K most-similar OTHER assets in the local library by BioCLIP
+    embedding. Returns [{asset_id, original_file_name, thumbnail_url,
+    cluster_id, similarity}, ...] sorted by similarity desc.
+
+    Vectors are L2-normalized by pybioclip, so cosine similarity equals
+    the dot product. We materialize all embeddings (small N — ~12k) and
+    use a single matrix multiply to score every candidate, then sort and
+    pull top-K. Cosine similarity is rank-equivalent to euclidean in
+    this regime, so either metric would pick the same neighbors.
+    """
+    ids, matrix = all_embeddings(conn)
+    if matrix.size == 0 or asset_id not in ids:
+        return []
+    self_idx = ids.index(asset_id)
+    # One matrix multiply gives sim to every asset at once.
+    sims = matrix @ matrix[self_idx]  # shape (N,), all in [-1, 1]
+    sims[self_idx] = -2.0  # mask self out of the top-K
+    n = len(sims)
+    if n <= 1:
+        return []
+    take = min(k, n - 1)
+    # argpartition is O(N), partial-sort just the K we want.
+    top = np.argpartition(-sims, take)[:take]
+    top = top[np.argsort(-sims[top])]
+    # Bulk-fetch metadata for the K neighbors (one IN-clause query).
+    result_ids = [ids[i] for i in top]
+    placeholders = ",".join("?" for _ in result_ids)
+    rows = conn.execute(
+        f"""
+        SELECT asset_id, original_file_name, thumbnail_url, cluster_id
+        FROM assets
+        WHERE asset_id IN ({placeholders})
+        """,
+        result_ids,
+    ).fetchall()
+    by_aid = {r["asset_id"]: dict(r) for r in rows}
+    out: list[dict] = []
+    for i in top:
+        aid = ids[i]
+        meta = by_aid.get(aid)
+        if meta is None:
+            continue
+        out.append({
+            "asset_id": aid,
+            "original_file_name": meta.get("original_file_name") or "",
+            "thumbnail_url": meta.get("thumbnail_url") or "",
+            "cluster_id": meta.get("cluster_id"),
+            "similarity": float(sims[i]),
+        })
+        if len(out) >= k:
+            break
+    return out
 
 
 def set_cluster_ids(
@@ -453,6 +518,44 @@ def invalidate_cluster_names(conn: sqlite3.Connection) -> None:
     asset→cluster mapping may have shifted even if cluster_ids are
     numerically stable."""
     conn.execute("DELETE FROM cluster_names")
+    conn.commit()
+
+
+# ---------- album_meta ---------------------------------------------------
+# Generic key/value store for album-management state (e.g., the saved
+# Plants-album id so subsequent clicks reuse the existing album instead
+# of creating a duplicate). Values are JSON-encoded dicts.
+
+
+def get_album_meta(conn: sqlite3.Connection, key: str) -> dict | None:
+    """Read a value from album_meta by key. Returns the parsed dict, or
+    None if the key isn't set yet.
+    """
+    import json as _json
+    row = conn.execute(
+        "SELECT value_json FROM album_meta WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return _json.loads(row["value_json"])
+    except Exception:
+        return None
+
+
+def set_album_meta(conn: sqlite3.Connection, key: str, value: dict) -> None:
+    """Upsert a value into album_meta. Stored as JSON."""
+    import json as _json
+    conn.execute(
+        """
+        INSERT INTO album_meta (key, value_json, updated_at)
+            VALUES (?, ?, datetime('now'))
+        ON CONFLICT(key) DO UPDATE SET
+            value_json = excluded.value_json,
+            updated_at = excluded.updated_at
+        """,
+        (key, _json.dumps(value)),
+    )
     conn.commit()
 
 
@@ -832,6 +935,22 @@ def fetch_taxon_scores(
     for r in rows:
         out[r["asset_id"]][r["taxon_name"]] = float(r["score"])
     return out
+
+
+def find_plantae_assets(conn: sqlite3.Connection, *, min_score: float) -> list[str]:
+    """Return distinct asset_ids whose Plantae kingdom-rank score is at
+    least `min_score`. Used by the Plants-album feature to drive an Immich
+    bulk-add. Mirrors the green-leg threshold on the card grid.
+    """
+    rows = conn.execute(
+        """
+        SELECT DISTINCT asset_id
+        FROM taxon_scores
+        WHERE rank = 'kingdom' AND taxon_name = 'Plantae' AND score >= ?
+        """,
+        (min_score,),
+    ).fetchall()
+    return [r["asset_id"] for r in rows]
 
 
 # ---------- runs --------------------------------------------------------

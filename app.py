@@ -21,15 +21,18 @@ import asyncio
 import os
 import threading
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import storage
+from immich_client import ImmichClient
 from pipeline import (
     attach_log_file,
     get_state,
@@ -322,6 +325,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Immich × BioCLIP", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 class RunParams(BaseModel):
@@ -455,6 +459,185 @@ async def get_results(
     return payload
 
 
+@app.get("/api/asset/{asset_id}")
+async def asset_detail(asset_id: str) -> dict:
+    """Single-asset detail for the photo modal: full top-K predictions,
+    kingdom taxon scores, YOLO detections (with bbox-BioCLIP joined),
+    and the cached KNN row (or null if no KNN has been computed).
+
+    404 if the asset isn't known to the local DB — e.g. it was deleted
+    from Immich or never made it through the pipeline.
+    """
+    with storage.connect(DB_PATH) as conn:
+        # 1. Asset row metadata.
+        asset_row = conn.execute(
+            """SELECT asset_id, original_file_name, original_url,
+                      thumbnail_url, cluster_id
+               FROM assets WHERE asset_id = ?""",
+            (asset_id,),
+        ).fetchone()
+        if asset_row is None:
+            raise HTTPException(status_code=404, detail=f"asset {asset_id} not found in DB")
+
+        meta = dict(asset_row)
+        # 2. Top-K full-image predictions (species rank).
+        top_preds = storage.fetch_predictions(conn, asset_id=asset_id, rank="species")
+        # 3. Kingdom taxon scores.
+        ts_map = storage.fetch_taxon_scores(conn, asset_ids=[asset_id], rank="kingdom")
+        taxon_scores = ts_map.get(asset_id) or {}
+        # 4. YOLO detections with bbox-BioCLIP joined (filtered by min_score).
+        detections = storage.fetch_detections(
+            conn, asset_id=asset_id, min_score=0.10, rank="species"
+        )
+        # Detections carry int id and bbox floats — JSON-friendly as-is.
+        # 4b. Top-K nearest neighbors across the whole processed library.
+        # Naive brute-force is fast enough at our scale (~12k assets × 512 dim
+        # = ~10-20ms with numpy). Returns [] if the asset has no embedding.
+        library_neighbors = storage.find_library_neighbors(conn, asset_id=asset_id, k=12)
+        # 5. KNN: pick the most-populated (index_version, k) and read the row.
+        versions = storage.list_knn_versions(conn)
+        knn_payload = None
+        if versions:
+            top_version = max(versions, key=lambda v: v.get("n", 0))
+            index_version = top_version["index_version"]
+            k = top_version["k"]
+            knn_map = storage.fetch_knn_predictions(
+                conn, asset_ids=[asset_id], index_version=index_version, k=k
+            )
+            if asset_id in knn_map:
+                knn_row = knn_map[asset_id]
+                knn_payload = {
+                    "top_species": knn_row["top_species"],
+                    "common_name": knn_row["common_name"],
+                    "score": knn_row["score"],
+                    "kingdom": knn_row["kingdom"],
+                    "family": knn_row["family"],
+                    "genus": knn_row["genus"],
+                    "neighbors": knn_row["neighbors"],
+                    "index_version": index_version,
+                    "k": k,
+                    "computed_at": knn_row["computed_at"],
+                }
+        return {
+            "asset_id": meta["asset_id"],
+            "original_file_name": meta["original_file_name"],
+            "original_url": meta["original_url"],
+            "thumbnail_url": meta["thumbnail_url"],
+            "cluster_id": meta["cluster_id"],
+            "top_predictions": top_preds,
+            "taxon_scores": taxon_scores,
+            "detections": detections,
+            "library_neighbors": library_neighbors,
+            "knn": knn_payload,
+        }
+
+
+# ---- Plants album management --------------------------------------------
+# One-click "tag all my Plantae-classified photos" — finds every asset
+# with a Plantae kingdom score ≥ the user-requested threshold (default:
+# the green-leg threshold from the UI), then bulk-adds them to an Immich
+# album. The album id is persisted in `album_meta` so re-clicks reuse
+# the existing album instead of creating a duplicate.
+
+class PlantsAlbumParams(BaseModel):
+    min_score: float | None = None     # default → PLANTAE_GREEN at call site
+    force_recreate: bool = False       # set True to drop the saved id and create
+
+
+def _immich_client() -> ImmichClient:
+    return ImmichClient(base_url=BASE_URL, api_key=API_KEY, timeout=60.0)
+
+
+@app.post("/api/album/plants")
+async def create_plants_album(params: PlantsAlbumParams) -> dict:
+    min_score = params.min_score if params.min_score is not None else PLANTAE_GREEN
+    asset_ids = []
+    with storage.connect(DB_PATH) as conn:
+        asset_ids = storage.find_plantae_assets(conn, min_score=min_score)
+        saved = storage.get_album_meta(conn, "plants_album_id") or {}
+        saved_album_id = saved.get("album_id") if not params.force_recreate else None
+        saved_count = int(saved.get("n_assets", 0)) if saved_album_id else 0
+
+    client = _immich_client()
+    try:
+        reused = False
+        album_id = saved_album_id
+        if album_id:
+            try:
+                client.get_album(album_id)
+                reused = True
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code != 404:
+                    raise
+                album_id = None  # saved id was stale, fall through to create
+
+        if not album_id:
+            album = client.create_album(
+                name="Plantae (BioCLIP)",
+                description=(
+                    f"Photos classified as Plantae by BioCLIP-2 kingdom-rank "
+                    f"(threshold ≥ {min_score:.2f})."
+                ),
+            )
+            album_id = album["id"]
+            reused = False
+
+        # Chunked bulk-add. Immich has no published per-call cap; we
+        # mirror the project's _MAX_PAGE_SIZE for consistency with the
+        # smart-search pagination. PUT each chunk.
+        chunk_size = 1000
+        added_total = 0
+        for start in range(0, len(asset_ids), chunk_size):
+            chunk = asset_ids[start:start + chunk_size]
+            client.add_assets_to_album(album_id=album_id, asset_ids=chunk)
+            added_total += len(chunk)
+    finally:
+        client.close()
+
+    # Persist for idempotency.
+    with storage.connect(DB_PATH) as conn:
+        storage.set_album_meta(
+            conn,
+            "plants_album_id",
+            {
+                "album_id": album_id,
+                "n_assets": len(asset_ids),
+                "min_score": min_score,
+                "created_at": (saved.get("created_at") if reused and saved.get("created_at") else None)
+                              or datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    return {
+        "album_id": album_id,
+        "album_url": f"{BASE_URL}/albums/{album_id}",
+        "n_assets": len(asset_ids),
+        "n_added_this_call": added_total,
+        "reused_existing": reused,
+        "min_score": min_score,
+    }
+
+
+@app.get("/api/plants-album-status")
+async def plants_album_status() -> dict:
+    """Returns the saved Plants-album id (if any), so the UI can paint a
+    "Last Plants album: <link> (N photos)" indicator on page load without
+    the user having to click the button first.
+    """
+    with storage.connect(DB_PATH) as conn:
+        saved = storage.get_album_meta(conn, "plants_album_id")
+    if not saved or not saved.get("album_id"):
+        return {"exists": False}
+    album_id = saved["album_id"]
+    return {
+        "exists": True,
+        "album_id": album_id,
+        "album_url": f"{BASE_URL}/albums/{album_id}",
+        "n_assets": int(saved.get("n_assets", 0)),
+        "min_score": float(saved.get("min_score", PLANTAE_GREEN)),
+    }
+
+
 @app.get("/api/refresh")
 async def refresh() -> dict:
     """Re-run with the env-config params (env vars at server startup)."""
@@ -559,108 +742,7 @@ PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Immich × BioCLIP</title>
-<style>
-  :root { color-scheme: light dark; }
-  body { font-family: system-ui, -apple-system, sans-serif; margin: 0; background:#111; color:#eee; }
-  header { padding: 14px 24px; border-bottom: 1px solid #333; display:flex; gap:16px; align-items:center; flex-wrap: wrap; }
-  h1 { margin:0; font-size: 18px; }
-  .meta { color:#9ad; font-family: ui-monospace, monospace; font-size: 13px; }
-  .grow { flex:1; }
-  select { background:#222; color:#eee; border:1px solid #444; padding:6px 10px; border-radius:6px; max-width: 560px; }
-  button { background:#234; color:#eee; border:1px solid #456; padding:6px 12px; border-radius:6px; cursor:pointer; }
-  button:hover { background:#345; }
-  button:disabled { opacity: 0.5; cursor: progress; }
-  .toolbar { padding: 8px 24px; border-bottom: 1px solid #222; display:flex; gap:12px; flex-wrap: wrap; align-items:center; font-size: 13px; }
-  .cluster-pill { background:#1c2; color:#cfb; padding: 3px 10px; border-radius: 12px; cursor: pointer; user-select: none; }
-  .cluster-pill.on { background:#2c4; color:#fff; }
-  main { padding: 24px; display:grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 18px; align-items: start; }
-  .card { background:#1a1a1a; border:1px solid #2a2a2a; border-radius:10px; overflow:hidden; display:flex; flex-direction:column; }
-  .img-wrap { position: relative; background:#000; }
-  .img-wrap img { width:100%; height:auto; display:block; }
-  .img-wrap svg.bbox { position:absolute; inset:0; width:100%; height:100%; pointer-events:none; }
-  .img-wrap .bbox rect { fill: none; stroke: #5f5; stroke-width: 2; vector-effect: non-scaling-stroke; }
-  .img-wrap .bbox text { fill: #5f5; font: 11px/1 ui-monospace, monospace; paint-order: stroke; stroke: #000; stroke-width: 3; }
-  .img-wrap .cluster-tag { position:absolute; top:6px; left:6px; background:rgba(0,0,0,0.6); color:#cfb; font:11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; }
-  .img-wrap .rank-tag { position:absolute; top:6px; right:6px; background:#1a1a1a; color:#fff; font:11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.4); }
-  .img-wrap .dup-badge { position:absolute; top:6px; left:6px; background:#a35; color:#fff; font:bold 11px ui-monospace, monospace; padding:2px 6px; border-radius:4px; box-shadow:0 1px 3px rgba(0,0,0,.4); cursor:pointer; }
-  .img-wrap .dup-badge:hover { background:#c46; }
-  .toolbar select { background:#1a1a1a; color:#eee; border:1px solid #333; padding:2px 6px; border-radius:4px; font-size:12px; }
-  .toolbar label.sort-mode { color:#888; font-size:12px; margin-left:8px; }
-  .meta-card { padding: 10px 12px; font-size: 13px; }
-  .meta-card .name { font-weight: 600; margin-bottom: 4px; word-break: break-all; }
-  .meta-card .urls a { color:#7ad; text-decoration:none; display:block; font-family: ui-monospace, monospace; font-size: 11px; margin-top:2px; word-break: break-all; }
-  .meta-card .urls a:hover { text-decoration: underline; }
-  .preds { padding: 0 12px 12px; }
-  .pred { display:flex; justify-content:space-between; gap:10px; padding: 4px 0; border-top:1px solid #222; font-size: 13px; }
-  .pred:first-child { border-top: 0; }
-  .pred .sp { flex:1; }
-  .pred .sc { color:#ad9; font-variant-numeric: tabular-nums; min-width: 56px; text-align:right; }
-  .pred .cn { color:#888; font-size: 11px; }
-  .badge { display:inline-block; background:#223; color:#9cf; font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-right:6px; }
-  .plantae { display:inline-block; font-size: 11px; padding: 2px 6px; border-radius: 4px; margin-right:6px; font-family: ui-monospace, monospace; }
-  .plantae.green  { background:#1a3a1a; color:#6f6; }
-  .plantae.yellow { background:#3a3a1a; color:#ff6; }
-  .plantae.red    { background:#3a1a1a; color:#f88; }
-  .dets { padding: 0 12px 12px; border-top: 1px dashed #333; margin-top: 4px; }
-  .det-block { margin-top: 8px; }
-  .det-header { font-size: 11px; color:#ad9; margin-bottom: 2px; font-family: ui-monospace, monospace; }
-  .empty { padding: 40px; text-align:center; color:#888; grid-column: 1 / -1; white-space: pre-wrap; }
-  .error { color:#f88; }
-  /* Params form, status panel, log tail */
-  .params { display:flex; gap:8px; flex-wrap: wrap; align-items:center; padding: 10px 24px; border-bottom: 1px solid #222; font-size: 13px; }
-  .params input { background:#222; color:#eee; border:1px solid #444; padding:5px 9px; border-radius:6px; font-family: ui-monospace, monospace; }
-  .params input[type=text] { min-width: 240px; }
-  .params input[type=number] { width: 90px; }
-  .params label { color:#888; }
-  .status-panel { padding: 8px 24px; border-bottom: 1px solid #2a2a2a; background:#1a1a1a; font: 12px/1.6 ui-monospace, monospace; }
-  .status-panel .idle { color:#888; }
-  .status-panel .running { color:#fc6; }
-  .status-panel .done { color:#6f6; }
-  .status-panel .error { color:#f88; }
-  .status-panel .progress { background:#222; height:6px; border-radius:3px; margin-top:6px; overflow:hidden; }
-  .status-panel .progress > div { background:#6ad; height:100%; transition: width 0.4s ease; }
-  /* Time-per-stage stacked bar. Each slice width = (stage_sec / total_sec) * 100% */
-  .stage-time-bar { display:flex; height:6px; border-radius:3px; margin-top:4px; overflow:hidden; background:#222; }
-  .stage-time-bar .slice { height:100%; transition: width 0.4s ease; }
-  .stage-time-legend { display:flex; flex-wrap:wrap; gap:8px 12px; margin-top:4px; font-size:10px; color:#888; }
-  .stage-time-legend .swatch { display:inline-block; width:8px; height:8px; border-radius:2px; margin-right:4px; vertical-align:middle; }
-  .stage-time-legend .stage-name { color:#aaa; }
-  .stage-time-legend .stage-sec { color:#777; margin-left:3px; }
-  .log-tail { padding: 0 0 12px; border-bottom: 1px solid #2a2a2a; }
-  .log-tail pre { margin:0; padding: 8px 24px; background:#0a0a0a; color:#bcb; font: 11px/1.4 ui-monospace, monospace; max-height: 160px; overflow:auto; white-space: pre; }
-  .log-tail .log-toggle { padding: 6px 24px; font-size: 12px; color:#888; cursor: pointer; user-select: none; }
-  .log-tail .log-toggle:hover { color:#ad9; }
-  /* KNN status pill in the header. */
-  .knn-pill { font: 11px ui-monospace, monospace; padding: 3px 10px; border-radius: 10px; background:#222; color:#888; border:1px solid #333; }
-  .knn-pill.ready { background:#1c2; color:#cfb; border-color:#2c4; }
-  .knn-pill.unavailable { background:#3a1a1a; color:#f88; border-color:#5a2; }
-  /* KNN block on each card. */
-  .knn-block { padding: 0 12px 12px; border-top: 1px dashed #333; margin-top: 4px; }
-  .knn-header { font-size: 11px; color:#9cf; margin-bottom: 2px; font-family: ui-monospace, monospace; display:flex; justify-content:space-between; align-items:center; }
-  .knn-empty { font-size: 11px; color:#888; padding: 4px 0; }
-  .reclassify-btn { background:#234; color:#eee; border:1px solid #456; padding: 3px 8px; border-radius:4px; font-size: 11px; cursor:pointer; font-family: ui-monospace, monospace; }
-  .reclassify-btn:hover:not(:disabled) { background:#345; }
-  .reclassify-btn:disabled { opacity: 0.5; cursor: progress; }
-  /* Pagination bar */
-  .pagination-bar { display:flex; align-items:center; justify-content:center; gap:4px; padding: 10px 24px; flex-wrap: wrap; background:#1a1a1a; border-bottom: 1px solid #2a2a2a; font: 12px ui-monospace, monospace; }
-  .pagination-bar button { background:#222; color:#eee; border:1px solid #333; padding: 4px 10px; border-radius:4px; cursor:pointer; font: inherit; min-width: 32px; }
-  .pagination-bar button:hover:not(:disabled) { background:#333; border-color:#555; }
-  .pagination-bar button:disabled { opacity:0.4; cursor: not-allowed; }
-  .pagination-bar button.current { background:#2c4; color:#fff; border-color:#4c6; }
-  .pagination-bar .ellipsis { color:#888; padding: 0 4px; }
-  .pagination-bar .summary { color:#888; margin-right: 12px; }
-  /* Near-duplicate panel */
-  .near-dup { padding: 0 12px 12px; border-top: 1px dashed #333; margin-top: 4px; }
-  .near-dup-toggle { background:transparent; border:0; color:#9cf; padding: 8px 0 4px; cursor:pointer; font: 12px ui-monospace, monospace; text-align: left; }
-  .near-dup-toggle:hover { color:#cef; }
-  .near-dup-panel { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
-  .near-dup-item { width: 110px; background:#0a0a0a; border:1px solid #222; border-radius: 6px; padding: 4px; display:flex; flex-direction:column; gap: 4px; }
-  .near-dup-item img { width: 100%; height: 90px; object-fit: cover; border-radius: 4px; }
-  .near-dup-name { font: 10px/1.3 ui-monospace, monospace; color:#aaa; max-height: 26px; overflow:hidden; word-break: break-all; }
-  .near-dup-pick { background:#234; color:#eee; border:1px solid #456; padding: 3px 0; border-radius:4px; font-size: 11px; cursor:pointer; }
-  .near-dup-pick:hover { background:#345; }
-  .near-dup-pick.active { background:#2a4; border-color:#4c6; }
-</style>
+<link rel="stylesheet" href="/static/css/app.css">
 </head>
 <body>
 <header>
@@ -696,7 +778,8 @@ PAGE = """<!doctype html>
     <option value="family">family</option>
     <option value="cluster">cluster (HDBSCAN)</option>
   </select>
-  <span id="cluster-pills" style="margin-left:12px"></span>
+  <input id="cluster-search" class="cluster-search" type="search" placeholder="search species…" autocomplete="off" style="display:none">
+  <div id="cluster-pills" class="cluster-pills"></div>
   <label class="sort-mode">sort:
     <select id="sort-mode">
       <option value="rank">search rank</option>
@@ -708,6 +791,8 @@ PAGE = """<!doctype html>
 <div class="toolbar" id="legend-bar" style="border-top:0; padding-top:0; font-size: 12px;">
   <span id="plantae-legend" style="color:#888"></span>
   <span class="grow"></span>
+  <span id="plants-album-status" style="color:#888; margin-right:12px"></span>
+  <button class="reclassify-btn" id="plants-album-btn" title="Create (or refresh) an Immich album containing every asset classified as Plantae" style="margin-right:8px">Tag as Plants album</button>
   <button class="reclassify-btn" id="reclassify-visible-btn" title="KNN-reclassify every asset visible on this page">Reclassify visible with KNN</button>
 </div>
 <div class="pagination-bar" id="pagination-bar"></div>
@@ -715,757 +800,20 @@ PAGE = """<!doctype html>
   <div class="empty" id="loading-msg">Loading from <span id="server-url"></span>…</div>
 </main>
 
-<script>
-const root = document.getElementById('root');
-const info = document.getElementById('run-info');
-const refreshBtn = document.getElementById('refresh');
-const runBtn = document.getElementById('run-btn');
-const clustersBar = document.getElementById('clusters-bar');
-const statusPanel = document.getElementById('status-panel');
-const statusText = document.getElementById('status-text');
-const statusBar = document.getElementById('status-bar');
-const stageTimeBar = document.getElementById('stage-time-bar');
-const stageTimeLegend = document.getElementById('stage-time-legend');
-const logToggle = document.getElementById('log-toggle');
-const logPre = document.getElementById('log-pre');
-const paramQuery = document.getElementById('param-query');
-const paramN = document.getElementById('param-n');
-const paramK = document.getElementById('param-k');
-const paramBatch = document.getElementById('param-batch');
-
-// Surface the server URL we're actually talking to, so connection issues
-// are obvious instead of mysterious "Loading…" forever.
-document.getElementById('server-url').textContent = location.origin;
-
-let currentGroupBy = (typeof localStorage !== 'undefined' && localStorage.getItem('groupBy')) || 'species';
-let currentGroupFilter = null;  // null = all; otherwise cluster_id (number) or taxon name (string)
-let currentSortMode = (typeof localStorage !== 'undefined' && localStorage.getItem('sortMode')) || 'rank';
-let lastLogCount = 0;             // for /api/logs polling delta
-
-function escapeHtml(s) {
-  return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-}
-
-async function safeFetch(url, opts) {
-  const r = await fetch(url, opts);
-  if (!r.ok) throw new Error(`${url} → HTTP ${r.status}`);
-  return r.json();
-}
-
-function showError(msg, detail) {
-  console.error(msg, detail);
-  root.innerHTML = `<div class="empty error">${escapeHtml(msg)}${
-    detail ? `<br><small>${escapeHtml(String(detail))}</small>` : ''
-  }</div>`;
-}
-
-// Compute taxonomy pill data from the current results, OR fall back
-// to /api/clusters when grouping by cluster (HDBSCAN labels are global).
-async function loadClusterBar() {
-  const pillsContainer = document.getElementById('cluster-pills');
-  if (currentGroupBy === 'cluster') {
-    try {
-      const data = await safeFetch('/api/clusters');
-      const pills = [
-        `<span class="cluster-pill${currentGroupFilter === null ? ' on' : ''}" data-cluster="">all</span>`
-      ];
-      for (const c of data.clusters) {
-        const cid = Number(c.cluster_id);
-        // Prefer the human-readable name ("Saguaro", "Hydrangea & Pelargonium")
-        // computed server-side from the cluster's top-1 prediction distribution.
-        // Falls back to "cluster 173" if no name was generated (e.g. empty cluster).
-        const label = c.name
-          ? `${escapeHtml(c.name)} <small style="color:#888">(${cid}, ${c.n})</small>`
-          : `cluster ${cid} (${c.n})`;
-        const titleParts = [];
-        if (c.top_species && c.top_species.length) {
-          titleParts.push('top species: ' + c.top_species.map(s =>
-            `${s.species} (${s.count}${s.common_name ? ', ' + s.common_name : ''})`
-          ).join('; '));
-        }
-        if (c.top_genus && c.top_genus.length) {
-          titleParts.push('top genera: ' + c.top_genus.map(g => `${g.genus} (${g.count})`).join('; '));
-        }
-        pills.push(
-          `<span class="cluster-pill${currentGroupFilter === cid ? ' on' : ''}" data-cluster="${cid}" title="${escapeHtml(titleParts.join('\n'))}">` +
-          `${label}</span>`
-        );
-      }
-      pillsContainer.innerHTML = pills.join('');
-      pillsContainer.querySelectorAll('.cluster-pill').forEach(el => {
-        el.addEventListener('click', () => {
-          const v = el.getAttribute('data-cluster');
-          currentGroupFilter = v === '' ? null : Number(v);
-          loadClusterBar();
-          loadResults({page: 0, refreshPills: false, filter: {cluster_id: currentGroupFilter}});
-        });
-      });
-    } catch (e) {
-      pillsContainer.innerHTML = '<span style="color:#888">cluster data unavailable</span>';
-    }
-    return;
-  }
-  // Taxonomy mode — counts come from the server-side summary, which
-  // aggregates the entire database (so the count matches the photos
-  // visible in the grid).
-  let data;
-  try {
-    data = await safeFetch('/api/results?page=0&page_size=1');
-  } catch (e) {
-    pillsContainer.innerHTML = '<span style="color:#888">results unavailable</span>';
-    return;
-  }
-  const entries = (data.taxonomy && data.taxonomy[currentGroupBy]) || [];
-  const pills = [
-    `<span class="cluster-pill${currentGroupFilter === null ? ' on' : ''}" data-cluster="">all</span>`
-  ];
-  for (const {name, n} of entries) {
-    const esc = escapeHtml(name);
-    pills.push(
-      `<span class="cluster-pill${currentGroupFilter === name ? ' on' : ''}" data-cluster="${esc}">` +
-      `${esc} (${n})</span>`
-    );
-  }
-  pillsContainer.innerHTML = pills.join('');
-  pillsContainer.querySelectorAll('.cluster-pill').forEach(el => {
-    el.addEventListener('click', () => {
-      const v = el.getAttribute('data-cluster');
-      currentGroupFilter = v === '' ? null : v;
-      loadClusterBar();
-      // Build a filter object for the chosen taxonomy dimension. Only
-      // one of species/genus/family is active at a time (the group_by
-      // selector enforces that).
-      const filter = {};
-      if (currentGroupFilter !== null) {
-        filter[currentGroupBy] = currentGroupFilter;
-      }
-      loadResults({page: 0, refreshPills: false, filter});
-    });
-  });
-}
-
-function plantaeClass(score, green, yellow) {
-  if (score == null) return 'red';
-  if (score >= green) return 'green';
-  if (score >= yellow) return 'yellow';
-  return 'red';
-}
-
-function renderPlantaeLegend(data) {
-  const legend = document.getElementById('plantae-legend');
-  const g = (data.plantae_green ?? 0.60).toFixed(2);
-  const y = (data.plantae_yellow ?? 0.35).toFixed(2);
-  legend.innerHTML =
-    `Plantae ` +
-    `<span class="plantae green">≥ ${g}</span>` +
-    `<span class="plantae yellow">≥ ${y}</span>` +
-    `<span class="plantae red">&lt; ${y}</span>` +
-    ` (BioCLIP kingdom-rank confidence)`;
-}
-
-// Numbered pagination bar: « first ‹ prev  1 2 ... 50  next › last »
-// With ellipsis for runs that span many pages so the bar stays compact.
-function renderPagination(p) {
-  const bar = document.getElementById('pagination-bar');
-  if (!bar) return;
-  if (!p || !p.total) {
-    bar.innerHTML = '';
-    return;
-  }
-  const cur = p.page;
-  const total = p.total_pages;
-  const pageSize = p.page_size;
-  const totalItems = p.total;
-  if (total <= 1) {
-    bar.innerHTML = `<span class="summary">${totalItems} photo${totalItems === 1 ? '' : 's'}</span>`;
-    return;
-  }
-
-  // Choose which page numbers to render. Always show first, last, current
-  // and one on each side of current. Collapse the rest into ellipsis.
-  const want = new Set([0, total - 1, cur, cur - 1, cur + 1]);
-  const pages = [];
-  for (let i = 0; i < total; i++) {
-    if (want.has(i)) pages.push(i);
-    else if (i > 0 && i < total - 1 && (want.has(i - 1) || want.has(i + 1))) {
-      pages.push(-1); // ellipsis marker
-    }
-  }
-  // de-dup adjacent ellipsis
-  const compact = [];
-  for (const x of pages) {
-    if (x === -1 && compact.length && compact[compact.length - 1] === -1) continue;
-    compact.push(x);
-  }
-
-  const btn = (label, target, opts = {}) => {
-    const cls = opts.current ? ' class="current"' : '';
-    const disabled = opts.disabled ? ' disabled' : '';
-    return `<button${cls}${disabled} data-page="${target}">${escapeHtml(label)}</button>`;
-  };
-
-  const parts = [];
-  parts.push(`<span class="summary">${totalItems} photos, page ${cur + 1}/${total}</span>`);
-  parts.push(btn('« first', 0, {disabled: cur === 0}));
-  parts.push(btn('‹ prev', cur - 1, {disabled: cur === 0}));
-  for (const x of compact) {
-    if (x === -1) {
-      parts.push(`<span class="ellipsis">…</span>`);
-    } else {
-      parts.push(btn(String(x + 1), x, {current: x === cur}));
-    }
-  }
-  parts.push(btn('next ›', cur + 1, {disabled: cur >= total - 1}));
-  parts.push(btn('last »', total - 1, {disabled: cur >= total - 1}));
-
-  bar.innerHTML = parts.join('');
-  bar.querySelectorAll('button[data-page]').forEach(el => {
-    el.addEventListener('click', () => {
-      const target = Number(el.getAttribute('data-page'));
-      if (target === currentPage) return;
-      loadResults({page: target, refreshPills: false});
-    });
-  });
-}
-
-function render(data) {
-  if (data.error) {
-    root.innerHTML = `<div class="empty">${escapeHtml(data.error)}</div>`;
-    info.textContent = '';
-    return;
-  }
-  info.textContent =
-    `scope=${data.scope || 'run'}  ·  clusters=${data.n_clusters || 0}  ·  ` +
-    `page ${data.pagination.page + 1}/${data.pagination.total_pages}`;
-  renderPlantaeLegend(data);
-  const green = data.plantae_green ?? 0.60;
-  const yellow = data.plantae_yellow ?? 0.35;
-
-  // Filter is applied SERVER-SIDE now (cluster_id / species / genus /
-  // family passed in /api/results URL). data.results already contains
-  // only matching assets, so no client-side filter needed here.
-  let rows = data.results;
-
-  // Sort by current mode. Search-rank is the identity transform — the
-  // server already returns assets in (most-recent Immich rank ASC) order.
-  if (currentSortMode === 'plantae') {
-    rows = rows.slice().sort((a, b) =>
-      (b.taxon_scores && b.taxon_scores.Plantae != null ? b.taxon_scores.Plantae : -1) -
-      (a.taxon_scores && a.taxon_scores.Plantae != null ? a.taxon_scores.Plantae : -1));
-  } else if (currentSortMode === 'score') {
-    rows = rows.slice().sort((a, b) =>
-      ((b.top_predictions && b.top_predictions[0] && b.top_predictions[0].score) || -1) -
-      ((a.top_predictions && a.top_predictions[0] && a.top_predictions[0].score) || -1));
-  } // 'rank' = leave as-is
-
-  if (!rows.length) {
-    root.innerHTML = '<div class="empty">No results in this view.</div>';
-    return;
-  }
-
-  root.innerHTML = rows.map(r => {
-    const preds = r.top_predictions.map(p => `
-      <div class="pred">
-        <div class="sp">${escapeHtml(p.species)}<div class="cn">${escapeHtml(p.common_name || '')}</div></div>
-        <div class="sc">${(p.score * 100).toFixed(2)}%</div>
-      </div>
-    `).join('');
-    const k = r.top_predictions[0] || {};
-    const fullTop1 = k.species || '';
-    const fullTop1Score = k.score || 0;
-    const dets = (r.detections || []).filter(d => d.score >= 0.10);
-    const bboxSvg = dets.map(d => {
-      const x = (d.x * 100).toFixed(2);
-      const y = (d.y * 100).toFixed(2);
-      const w = (d.w * 100).toFixed(2);
-      const h = (d.h * 100).toFixed(2);
-      const lbl = `${escapeHtml(d.label)} ${(d.score * 100).toFixed(0)}%`;
-      return `<rect x="${x}%" y="${y}%" width="${w}%" height="${h}%"/>` +
-             `<text x="${x}%" y="${(Math.max(0, parseFloat(y) - 0.5)).toFixed(2)}%">${lbl}</text>`;
-    }).join('');
-    // For each detection, show top-3 species BioCLIP predicted on the
-    // cropped bbox. Highlight any that beat the full-image top-1 score.
-    const detBlocks = dets.map((d, di) => {
-      const bp = (d.bbox_predictions || []).slice(0, 3);
-      if (!bp.length) return '';
-      const rowsHtml = bp.map(p => {
-        const beats = p.species === fullTop1 && p.score > fullTop1Score;
-        return `
-          <div class="pred">
-            <div class="sp">${escapeHtml(p.species)}<div class="cn">${escapeHtml(p.common_name || '')}</div></div>
-            <div class="sc">${(p.score * 100).toFixed(2)}%${beats ? ' ↑' : ''}</div>
-          </div>
-        `;
-      }).join('');
-      return `
-        <div class="det-block">
-          <div class="det-header">crop ${di + 1}: ${escapeHtml(d.label)} ${(d.score * 100).toFixed(0)}%</div>
-          ${rowsHtml}
-        </div>
-      `;
-    }).join('');
-    const nearDups = r.near_dups || [];
-    const nearDupPanel = nearDups.length ? `
-      <div class="near-dup">
-        <button class="near-dup-toggle" data-aid="${escapeHtml(r.asset_id)}">
-          ▸ ${nearDups.length} similar image${nearDups.length > 1 ? 's' : ''} (cosine ≥ 0.99)
-        </button>
-        <div class="near-dup-panel" id="ndp-${escapeHtml(r.asset_id)}" style="display:none">
-          ${nearDups.map(d => `
-            <div class="near-dup-item" data-aid="${escapeHtml(r.asset_id)}" data-other="${escapeHtml(d.asset_id)}">
-              <img src="/thumb/${encodeURIComponent(d.asset_id)}" alt="${escapeHtml(d.original_file_name || '')}" loading="lazy" decoding="async">
-              <div class="near-dup-name" title="${escapeHtml(d.original_file_name || '')}">${escapeHtml(d.original_file_name || d.asset_id)}</div>
-              <button class="near-dup-pick" title="Use this image as the primary on this card">use as primary</button>
-            </div>
-          `).join('')}
-        </div>
-      </div>
-    ` : '';
-    return `
-      <div class="card">
-        <div class="img-wrap">
-          <img src="/thumb/${encodeURIComponent(r.asset_id)}" alt="${escapeHtml(r.original_file_name)}" loading="lazy" decoding="async" data-primary-asset="${escapeHtml(r.asset_id)}">
-          ${r.cluster_id !== null && r.cluster_id !== undefined ? `<span class="cluster-tag">cluster ${r.cluster_id}</span>` : ''}
-          ${r.rank !== undefined && r.rank !== null ? `<span class="rank-tag" title="Immich smart-search rank (0-based)">#${r.rank + 1}</span>` : ''}
-          ${(r.near_dups && r.near_dups.length) ? `<span class="dup-badge" title="${r.near_dups.length} similar photo${r.near_dups.length > 1 ? 's' : ''} (cosine ≥ 0.97)">${r.near_dups.length}×</span>` : ''}
-          ${bboxSvg ? `<svg class="bbox" viewBox="0 0 100 100" preserveAspectRatio="none">${bboxSvg}</svg>` : ''}
-        </div>
-        <div class="meta-card">
-          <div class="name">${escapeHtml(r.original_file_name)}</div>
-          <div><span class="badge">${escapeHtml(k.kingdom || '?')}</span><span class="badge">${escapeHtml(k.family || '?')}</span><span class="badge">${escapeHtml(k.genus || '?')}</span>${(() => {
-            const ts = r.taxon_scores || {};
-            const plantae = ts.Plantae;
-            if (plantae == null) return '';
-            const cls = plantaeClass(plantae, green, yellow);
-            const others = Object.entries(ts)
-              .filter(([n]) => n !== 'Plantae')
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 3)
-              .map(([n, s]) => `${escapeHtml(n)}=${(s*100).toFixed(0)}`)
-              .join(' · ');
-            return `<span class="plantae ${cls}" title="BioCLIP kingdom-rank score for Plantae${others ? ' — other kingdoms: '+others : ''}">Plantae ${(plantae*100).toFixed(1)}%</span>`;
-          })()}</div>
-          <div class="urls">
-            <a href="${escapeHtml(r.original_url)}" target="_blank">original →</a>
-            <a href="${escapeHtml(r.thumbnail_url)}" target="_blank">thumb →</a>
-          </div>
-        </div>
-        <div class="preds">${preds}</div>
-        ${detBlocks ? `<div class="dets">${detBlocks}</div>` : ''}
-        ${nearDupPanel}
-        ${renderKnnBlock(r)}
-      </div>
-    `;
-  }).join('');
-}
-
-// KNN block: a collapsible panel under each card showing the top-1
-// consensus species + top-K neighbors, plus a reclassify button when
-// no row is cached yet. `render()` calls this for every card so the
-// block is present in the DOM whether or not KNN results are cached.
-function renderKnnBlock(r) {
-  const knn = r.knn;
-  if (knn && knn.top_species) {
-    const sp = escapeHtml(knn.top_species || '');
-    const cn = escapeHtml(knn.common_name || '');
-    const sc = ((knn.score || 0) * 100).toFixed(1);
-    const nbrs = (knn.neighbors || []).slice(0, 3).map(n =>
-      `<div class="pred"><div class="sp">${escapeHtml(n.species)}<div class="cn">${escapeHtml(n.common_name || '')}</div></div><div class="sc">${(n.sim * 100).toFixed(1)}%</div></div>`
-    ).join('');
-    return `
-      <div class="knn-block">
-        <div class="knn-header">
-          <span>KNN top-1: ${sp}${cn ? ' (' + cn + ')' : ''} · ${sc}%</span>
-          <span style="color:#888">${escapeHtml(knn.kingdom || '')}${knn.family ? ' · ' + escapeHtml(knn.family) : ''}</span>
-        </div>
-        ${nbrs}
-        <button class="reclassify-btn" data-aid="${escapeHtml(r.asset_id)}" data-action="reclassify" style="margin-top:6px">Re-run KNN</button>
-      </div>
-    `;
-  }
-  return `
-    <div class="knn-block">
-      <div class="knn-empty">No KNN result yet.</div>
-      <button class="reclassify-btn" data-aid="${escapeHtml(r.asset_id)}" data-action="reclassify" style="margin-top:4px">Reclassify with KNN</button>
+<!-- Photo detail modal (native <dialog>). Body populated by modal.js -->
+<dialog id="detail-dialog" class="detail-dialog">
+  <div class="modal-shell">
+    <div class="modal-header">
+      <div class="modal-title" id="modal-title">Asset detail</div>
+      <button class="modal-close" data-action="close-modal">✕</button>
     </div>
-  `;
-}
+    <div class="modal-body" id="modal-body">
+      <div class="modal-loading">Loading…</div>
+    </div>
+  </div>
+</dialog>
 
-let currentPage = 0;
-let currentPageSize = 60;
-
-async function loadResults(opts = {}) {
-  const page = opts.page ?? currentPage;
-  const pageSize = opts.pageSize ?? currentPageSize;
-  currentPage = page;
-  currentPageSize = pageSize;
-  // If a filter is passed, reset to page 0 (results are different now)
-  // and use opts.filter directly. Otherwise use the current global filter.
-  const filter = opts.filter !== undefined ? opts.filter : currentFilter;
-  if (opts.filter !== undefined) currentFilter = filter;
-  const params = new URLSearchParams({
-    page: String(page),
-    page_size: String(pageSize),
-  });
-  if (filter.cluster_id != null) params.set('cluster_id', String(filter.cluster_id));
-  if (filter.species) params.set('species', filter.species);
-  if (filter.genus) params.set('genus', filter.genus);
-  if (filter.family) params.set('family', filter.family);
-  const url = `/api/results?${params}`;
-  try {
-    const data = await safeFetch(url);
-    lastResults = data;
-    render(data);
-    renderPagination(data.pagination);
-    if (opts.refreshPills !== false) loadClusterBar();
-  } catch (e) {
-    showError('Could not load results.', `${url} — ${e.message}`);
-  }
-}
-
-// Track the active server-side filter so paginating keeps the filter on.
-let currentFilter = {};
-
-function fmtDuration(s) {
-  if (!s || s <= 0) return '';
-  if (s < 60) return `${s.toFixed(0)}s`;
-  const m = Math.floor(s / 60);
-  const r = Math.floor(s % 60);
-  if (m < 60) return `${m}m${r.toString().padStart(2, '0')}s`;
-  const h = Math.floor(m / 60);
-  return `${h}h${(m % 60).toString().padStart(2, '0')}m`;
-}
-
-function renderStatus(s) {
-  if (!s) return;
-  const pct = s.chunk_total > 0
-    ? Math.min(100, (s.chunk_idx / s.chunk_total) * 100)
-    : (s.status === 'running' ? 5 : 100);
-  statusBar.style.width = `${pct}%`;
-  statusPanel.className = 'status-panel';  // reset
-  if (s.status === 'running') {
-    statusPanel.classList.add('running');
-    const stage = s.stage || '?';
-    const ci = s.chunk_idx || 0;
-    const ct = s.chunk_total || 0;
-    const eta = s.eta_seconds ? `  eta=${fmtDuration(s.eta_seconds)}` : '';
-    const rate = s.rate ? `  ${s.rate.toFixed(1)}/s` : '';
-    const q = s.query ? `  query=${s.query}` : '';
-    statusText.textContent = `[${stage}] chunk ${ci}/${ct}${rate}${eta}${q}`;
-    refreshBtn.disabled = true;
-    runBtn.disabled = true;
-    renderStageTimes(s);  // live: include the stage currently being timed
-  } else if (s.status === 'done') {
-    statusPanel.classList.add('done');
-    statusText.textContent = `done  run #${s.current_run_id ?? '?'}  ` +
-      `(${s.n_new} new, ${s.n_cached} cached)`;
-    refreshBtn.disabled = false;
-    runBtn.disabled = false;
-    renderStageTimes(s);  // final: show all accumulated stages
-  } else if (s.status === 'error') {
-    statusPanel.classList.add('error');
-    statusText.textContent = `error: ${s.last_error || 'unknown'}`;
-    refreshBtn.disabled = false;
-    runBtn.disabled = false;
-    renderStageTimes(s);
-  } else {
-    statusPanel.classList.add('idle');
-    statusText.textContent = 'idle';
-    refreshBtn.disabled = false;
-    runBtn.disabled = false;
-    stageTimeBar.style.display = 'none';
-    stageTimeLegend.innerHTML = '';
-  }
-}
-
-// Per-stage timing bar — each stage = colored slice, width = pct of total.
-const STAGE_COLORS = {
-  search: '#4a9eff',       // blue
-  species: '#50c878',      // green
-  cluster: '#f5a623',      // orange
-  kingdom: '#9b59b6',      // purple
-  yolo: '#e74c3c',         // red
-  'bbox-bioclip': '#1abc9c', // teal
-};
-function renderStageTimes(s) {
-  const times = s.stage_times || {};
-  if (!Object.keys(times).length) {
-    stageTimeBar.style.display = 'none';
-    stageTimeLegend.innerHTML = '';
-    return;
-  }
-  // While running, project the current stage's elapsed-so-far into the
-  // bar so the slice is visibly growing in real time. We compute it from
-  // (now - stage_t0) but only if the server's stage_t0 matches stage_times.
-  const live = Object.assign({}, times);
-  if (s.status === 'running' && s.stage && s.stage_t0) {
-    const elapsed = (Date.now() / 1000) - s.stage_t0;
-    if (elapsed > 0) live[s.stage] = (live[s.stage] || 0) + elapsed;
-  }
-  const total = Object.values(live).reduce((a, b) => a + b, 0) || 1;
-  stageTimeBar.innerHTML = '';
-  stageTimeLegend.innerHTML = '';
-  let first = true;
-  for (const [name, sec] of Object.entries(live)) {
-    const pct = (sec / total) * 100;
-    const color = STAGE_COLORS[name] || '#777';
-    const slice = document.createElement('div');
-    slice.className = 'slice';
-    slice.style.background = color;
-    slice.style.width = `${pct}%`;
-    slice.title = `${name}: ${fmtDuration(sec)}`;
-    stageTimeBar.appendChild(slice);
-    const item = document.createElement('span');
-    item.innerHTML = `<span class="swatch" style="background:${color}"></span>` +
-      `<span class="stage-name">${name}</span>` +
-      `<span class="stage-sec">${fmtDuration(sec)}</span>`;
-    if (!first) item.style.marginLeft = '0';
-    first = false;
-    stageTimeLegend.appendChild(item);
-  }
-  stageTimeBar.style.display = 'flex';
-}
-
-async function pollStatus() {
-  try {
-    const s = await safeFetch('/api/status');
-    renderStatus(s);
-  } catch (e) {
-    // Transient — keep the last status visible.
-    console.warn('status poll failed:', e);
-  }
-}
-
-async function pollLogs() {
-  if (logPre.style.display === 'none') return;  // collapsed
-  try {
-    const data = await safeFetch('/api/logs?tail=200');
-    const lines = data.lines || [];
-    logPre.textContent = lines.join('\\n');
-    // Auto-scroll to bottom if user hasn't scrolled up.
-    logPre.scrollTop = logPre.scrollHeight;
-  } catch (e) {
-    console.warn('logs poll failed:', e);
-  }
-}
-
-logToggle.addEventListener('click', () => {
-  const showing = logPre.style.display !== 'none';
-  logPre.style.display = showing ? 'none' : 'block';
-  logToggle.textContent = showing ? '▸ logs (click to expand)' : '▾ logs';
-  if (!showing) pollLogs();
-});
-
-function collectParams() {
-  const params = {};
-  const q = paramQuery.value.trim();
-  const n = parseInt(paramN.value, 10);
-  const k = parseInt(paramK.value, 10);
-  const b = parseInt(paramBatch.value, 10);
-  if (q) params.query = q;
-  if (Number.isFinite(n) && n > 0) params.n_samples = n;
-  if (Number.isFinite(k) && k > 0) params.top_k = k;
-  if (Number.isFinite(b) && b > 0) params.batch_size = b;
-  return params;
-}
-
-async function runWithParams() {
-  const params = collectParams();
-  runBtn.disabled = true;
-  refreshBtn.disabled = true;
-  runBtn.textContent = 'Running…';
-  root.innerHTML = '<div class="empty">Running pipeline…</div>';
-  try {
-    const data = await safeFetch('/api/run', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify(params),
-    });
-    await loadResults();
-  } catch (e) {
-    showError('Run failed.', e.message);
-  } finally {
-    runBtn.disabled = false;
-    refreshBtn.disabled = false;
-    runBtn.textContent = 'Run';
-  }
-}
-
-async function refresh() {
-  refreshBtn.disabled = true;
-  refreshBtn.textContent = 'Refreshing…';
-  root.innerHTML = '<div class="empty">Running pipeline…</div>';
-  try {
-    const data = await safeFetch('/api/refresh');
-    await loadResults();
-  } catch (e) {
-    showError('Refresh failed.', e.message);
-  } finally {
-    refreshBtn.disabled = false;
-    refreshBtn.textContent = 'Refresh';
-  }
-}
-
-refreshBtn.addEventListener('click', refresh);
-runBtn.addEventListener('click', runWithParams);
-const sortModeSel = document.getElementById('sort-mode');
-if (sortModeSel) {
-  sortModeSel.value = currentSortMode;
-  sortModeSel.addEventListener('change', () => {
-    currentSortMode = sortModeSel.value;
-    try { localStorage.setItem('sortMode', currentSortMode); } catch (_) {}
-    // Re-render the latest data with the new sort.
-    loadResults({refreshPills: false});
-  });
-}
-const groupBySel = document.getElementById('group-by');
-if (groupBySel) {
-  groupBySel.value = currentGroupBy;
-  groupBySel.addEventListener('change', () => {
-    currentGroupBy = groupBySel.value;
-    currentGroupFilter = null;
-    currentFilter = {};
-    try { localStorage.setItem('groupBy', currentGroupBy); } catch (_) {}
-    loadClusterBar();
-    loadResults({page: 0, refreshPills: false, filter: {}});
-  });
-}
-
-// Re-render the last-loaded results without re-fetching — used by group-by
-// Last fetched /api/results payload, used by the filter pill handlers to
-// re-render the current page without an extra round-trip when filter-only
-// changes happen (e.g. clicking a cluster pill while staying on the same
-// page).
-let lastResults = null;
-function renderCurrent() {
-  if (lastResults) render(lastResults);
-}
-
-// Near-dup handlers: delegated on the grid so we don't have to rebind
-// every render. Pick-as-primary swaps the primary card's thumbnail
-// (cosmetic — we don't touch the DB or the run).
-document.addEventListener('click', (e) => {
-  const t = e.target.closest('.near-dup-toggle');
-  if (t) {
-    const aid = t.getAttribute('data-aid');
-    const panel = document.getElementById('ndp-' + aid);
-    if (!panel) return;
-    const showing = panel.style.display !== 'none';
-    panel.style.display = showing ? 'none' : 'flex';
-    t.textContent = showing
-      ? `▸ ${t.textContent.replace(/^▸ |^▾ /, '')}`
-      : `▾ ${t.textContent.replace(/^▸ |^▾ /, '')}`;
-    return;
-  }
-  const pick = e.target.closest('.near-dup-pick');
-  if (pick) {
-    const item = pick.closest('.near-dup-item');
-    const primaryAid = item.getAttribute('data-aid');
-    const otherAid = item.getAttribute('data-other');
-    const card = pick.closest('.card');
-    const img = card.querySelector('.img-wrap img');
-    const altName = item.querySelector('.near-dup-name').textContent;
-    if (img) img.src = '/thumb/' + encodeURIComponent(otherAid);
-    const nameEl = card.querySelector('.meta-card .name');
-    if (nameEl) nameEl.textContent = altName + '  (was ' + primaryAid + ')';
-    // Mark active in the panel.
-    card.querySelectorAll('.near-dup-pick').forEach(b => b.classList.remove('active'));
-    pick.classList.add('active');
-    return;
-  }
-  // KNN reclassify handler — delegated so cards rendered after the
-  // first bind still work. Disables the button + shows a spinner
-  // label while the request is in flight.
-  const rc = e.target.closest('[data-action="reclassify"]');
-  if (rc) {
-    const aid = rc.getAttribute('data-aid');
-    if (!aid || rc.disabled) return;
-    rc.disabled = true;
-    const prev = rc.textContent;
-    rc.textContent = 'Running…';
-    reclassifyOne(aid, rc, prev);
-  }
-});
-
-async function reclassifyOne(aid, btn, prevLabel) {
-  try {
-    const data = await safeFetch('/api/reclassify', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({asset_ids: [aid]}),
-    });
-    const knn = (data.results || {})[aid];
-    if (knn) {
-      // Patch the cached payload + re-render so the KNN block fills in.
-      if (lastResults && Array.isArray(lastResults.results)) {
-        const row = lastResults.results.find(r => r.asset_id === aid);
-        if (row) row.knn = knn;
-      }
-      renderCurrent();
-    }
-  } catch (e) {
-    showError('KNN reclassify failed.', e.message);
-  } finally {
-    btn.disabled = false;
-    btn.textContent = prevLabel || 'Reclassify with KNN';
-  }
-}
-
-async function reclassifyVisible() {
-  if (!lastResults || !Array.isArray(lastResults.results) || !lastResults.results.length) {
-    showError('Nothing to reclassify.', 'Load a page of results first.');
-    return;
-  }
-  const btn = document.getElementById('reclassify-visible-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Running KNN…'; }
-  const ids = lastResults.results.map(r => r.asset_id);
-  try {
-    const data = await safeFetch('/api/reclassify', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({asset_ids: ids}),
-    });
-    // Refetch /api/results so KNN blocks populate cleanly. (Cheap —
-    // cache hit after the invalidate in /api/reclassify.)
-    await loadResults({refreshPills: false});
-  } catch (e) {
-    showError('KNN reclassify failed.', e.message);
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Reclassify visible with KNN'; }
-  }
-}
-const reclassifyVisibleBtn = document.getElementById('reclassify-visible-btn');
-if (reclassifyVisibleBtn) reclassifyVisibleBtn.addEventListener('click', reclassifyVisible);
-
-// KNN status pill — poll once on load + after reclassify actions.
-async function refreshKnnPill() {
-  const pill = document.getElementById('knn-pill');
-  if (!pill) return;
-  let s;
-  try { s = await safeFetch('/api/knn-status'); }
-  catch (e) { pill.textContent = 'KNN: error'; pill.className = 'knn-pill unavailable'; return; }
-  if (!s.index_built) {
-    pill.textContent = 'KNN: not built';
-    pill.className = 'knn-pill unavailable';
-    pill.title = `No FAISS index at ${s.inventory_dir}. Build with \`python -m knn --parquet-glob ... --index-dir ${s.inventory_dir} --tag ...\`.`;
-    return;
-  }
-  const cached = s.cached_assets || 0;
-  const nRows = s.n_rows ? `${(s.n_rows / 1e6).toFixed(0)}M` : '?';
-  pill.textContent = `KNN: ${s.version || '?'} (${nRows} ref, ${cached} cached)`;
-  pill.className = 'knn-pill ready';
-  pill.title = `Inventory: ${s.inventory_dir}\nVersion: ${s.version}\nReference rows: ${s.n_rows}\nCached assets: ${cached}\nDefault k: ${s.k_default}`;
-}
-
-(async () => {
-  await refreshKnnPill();
-  await loadClusterBar();
-  await pollStatus();
-  await loadResults();
-})();
-setInterval(pollStatus, 1000);
-setInterval(pollLogs, 2000);
-</script>
+<script type="module" src="/static/js/app.js"></script>
 </body>
 </html>
 """

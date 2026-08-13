@@ -35,7 +35,7 @@ def _min_cluster_size(n: int) -> int:
     """
     if n <= 1:
         return 1
-    return max(2, min(8, max(2, n // 6)))
+    return max(2, min(5, max(2, n // 6)))
 
 
 def compute_clusters(
@@ -53,13 +53,14 @@ def compute_clusters(
     # HDBSCAN with cosine-friendly settings:
     #   metric='euclidean' is fine because vectors are L2-normalized
     #   (cosine sim = euclidean distance up to monotonic transform).
-    #   cluster_selection_method='leaf' gives finer-grained clusters that
-    #   work better for browsing 10s–1000s of items.
+    #   cluster_selection_method='eom' merges sibling leaves when the
+    #   parent branch is stable, giving species-level groupings instead
+    #   of sub-variant leaves. Switch to 'leaf' for finer-grained clusters.
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=max(1, min_cluster_size // 2),
         metric="euclidean",
-        cluster_selection_method="leaf",
+        cluster_selection_method="eom",
         core_dist_n_jobs=1,
     )
     raw_labels = clusterer.fit_predict(matrix)
