@@ -130,24 +130,22 @@ document.addEventListener('alpine:init', () => {
   Alpine.data('plantaeLegend', () => ({
     green: 0.60, yellow: 0.35,
     async refresh() {
-      // Pull the unfiltered cache to read the active thresholds.
+      // Read the active thresholds from /api/results (returns green/yellow
+      // from the server's PLANTAE_GREEN / PLANTAE_YELLOW env vars).
       try {
-        const r = await fetch('/grid?page=0&page_size=1');
+        const r = await fetch('/api/results?page=0&page_size=1');
         if (!r.ok) return;
-        const html = await r.text();
-        // Cheap parse: extract plantae_green / plantae_yellow from a known span,
-        // or just use defaults from the API by reading one results row.
-        const probe = await fetch('/api/results?page=0&page_size=1');
-        if (!probe.ok) return;
-        const j = await probe.json();
+        const j = await r.json();
         if (j.plantae_green != null) this.green = j.plantae_green;
         if (j.plantae_yellow != null) this.yellow = j.plantae_yellow;
       } catch (e) { /* keep defaults */ }
     },
     html() {
-      return `Plantae <span class="swatch" style="background:#1a3a1a"></span>≥${this.green.toFixed(2)} ` +
-             `≥<span class="swatch" style="background:#3a3a1a"></span>${this.yellow.toFixed(2)} ` +
-             `<span class="swatch" style="background:#3a1a1a"></span>&lt;${this.yellow.toFixed(2)}`;
+      const g = (this.green ?? 0.60).toFixed(2);
+      const y = (this.yellow ?? 0.35).toFixed(2);
+      return `Plantae <span class="swatch" style="background:#1a3a1a"></span>≥${g} ` +
+             `<span class="swatch" style="background:#3a3a1a"></span>≥${y} ` +
+             `<span class="swatch" style="background:#3a1a1a"></span>&lt;${y}`;
     },
   }));
 });
