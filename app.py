@@ -1823,12 +1823,79 @@ def _apply_sort(results: list, sort: str) -> list:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> Response:
-    """Outer shell. Toolbar + grid-pane + modal + job-panel. Everything
-    below is HTMX-loaded."""
+    """Outer shell. Toolbar + grid-pane + modal + job-panel. The toolbar
+    pills are server-rendered (so they're visible on first paint); the
+    grid-pane hydrates via hx-get=/grid on load."""
+    # Server-render the cluster pills with default group_by=cluster so the
+    # user sees them immediately, without depending on a separate HTMX
+    # fetch that may race with the grid load.
+    qs = request.query_params
+    group_by = qs.get("group_by") or "cluster"
+    cluster_id = _int_or_none(qs.get("cluster_id"))
+    species = qs.get("species")
+    genus = qs.get("genus")
+    family = qs.get("family")
+    q = qs.get("q")
+    sort = qs.get("sort") or "rank"
+    pills_html = templates.get_template("_toolbar.html").render(
+        _filters_context(group_by, cluster_id, species, genus, family, q, sort)
+    )
     return templates.TemplateResponse(
         request, "base.html",
+        {"pills_html": pills_html},
         headers={"Cache-Control": "no-cache"},
     )
+
+
+def _int_or_none(v):
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _filters_context(group_by, cluster_id, species, genus, family, q, sort):
+    """Build the context dict for _toolbar.html. Used by both the
+    /filters endpoint and the / page (so they render identically)."""
+    entries = []
+    total_count = 0
+    active = None
+    if group_by == "cluster":
+        with storage.connect(DB_PATH) as conn:
+            rows = storage.cluster_summary(conn)
+            names = storage.ensure_cluster_names(conn)
+        for r in rows:
+            cid = r["cluster_id"]
+            info = names.get(cid, {})
+            entries.append({
+                "key": cid,
+                "label": info.get("name") or f"cluster #{cid}",
+                "count": r["n"],
+                "tooltip": info.get("name") or "",
+            })
+            total_count += r["n"]
+        active = cluster_id
+    else:
+        cache_key = _grid_cache_key(None, None, None, None, "rank")
+        _ensure_results_cached(None, None, None, None, "rank", cache_key)
+        with _results_lock:
+            cached = _results_cache.get(cache_key) or {}
+        tax = (cached.get("taxonomy") or {}).get(group_by) or []
+        for row in tax[:50]:
+            entries.append({
+                "key": row["name"], "label": row["name"],
+                "count": row["n"], "tooltip": row["name"],
+            })
+            total_count += row["n"]
+        active = {"species": species, "genus": genus, "family": family}.get(group_by)
+    qsuffix = ""
+    for k, v in (("q", q), ("sort", sort)):
+        if v is not None:
+            qsuffix += f"&{k}={v}"
+    return {
+        "entries": entries, "active": active, "group_by": group_by,
+        "total_count": total_count, "qsuffix": qsuffix,
+    }
 
 
 @app.get("/grid", response_class=HTMLResponse)
@@ -1889,45 +1956,10 @@ async def filters_partial(
     q: str | None = Query(default=None),
 ) -> Response:
     """Cluster / taxonomy pills. SWAP TARGET = #cluster-pills."""
-    entries = []
-    total_count = 0
-    active = None
-    if group_by == "cluster":
-        with storage.connect(DB_PATH) as conn:
-            rows = storage.cluster_summary(conn)
-            names = storage.ensure_cluster_names(conn)
-        for r in rows:
-            cid = r["cluster_id"]
-            info = names.get(cid, {})
-            entries.append({
-                "key": cid,
-                "label": info.get("name") or f"cluster #{cid}",
-                "count": r["n"],
-                "tooltip": info.get("name") or "",
-            })
-            total_count += r["n"]
-        active = cluster_id
-    else:
-        cache_key = _grid_cache_key(None, None, None, None, "rank")
-        _ensure_results_cached(None, None, None, None, "rank", cache_key)
-        with _results_lock:
-            cached = _results_cache.get(cache_key) or {}
-        tax = (cached.get("taxonomy") or {}).get(group_by) or []
-        for row in tax[:50]:
-            entries.append({
-                "key": row["name"], "label": row["name"],
-                "count": row["n"], "tooltip": row["name"],
-            })
-            total_count += row["n"]
-        active = {"species": species, "genus": genus, "family": family}.get(group_by)
-    qsuffix = ""
-    for k, v in (("q", q), ("sort", request.query_params.get("sort"))):
-        if v is not None:
-            qsuffix += f"&{k}={v}"
     return templates.TemplateResponse(
         request, "_toolbar.html",
-        {"entries": entries, "active": active, "group_by": group_by,
-         "total_count": total_count, "qsuffix": qsuffix},
+        _filters_context(group_by, cluster_id, species, genus, family,
+                         q, request.query_params.get("sort") or "rank"),
         headers={"Cache-Control": "no-cache"},
     )
 

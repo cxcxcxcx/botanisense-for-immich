@@ -132,14 +132,14 @@
            @input.debounce.300ms="localStorage.setItem('q', $event.target.value)">
   </fieldset>
 
-  {# Cluster / taxonomy pills. Re-rendered on group-by change. #}
-  {# We DON'T trigger the toolbar form on group_by change — that would #}
-  {# re-submit /grid. Instead, the group_by change only refreshes pills. #}
+  {# Cluster / taxonomy pills. Server-rendered on initial load; client-#}
+  {# refreshed on group_by change. We render at SSR time so the user #}
+  {# sees pills immediately, without waiting for a separate HTMX fetch. #}
   <div id="cluster-pills"
        hx-get="/filters"
-       hx-trigger="load once, change from:#group-by"
+       hx-trigger="change from:#group-by"
        hx-include="#toolbar"
-       hx-swap="innerHTML"></div>
+       hx-swap="innerHTML">{{ pills_html|safe }}</div>
 </form>
 
 {# ----- Cluster album bar — appears only when a cluster pill is clicked. #}
@@ -157,26 +157,31 @@
 </nav>
 
 {# ----- Grid pane (the only thing that swaps on filter/pagination changes) ----- #}
-{# Wraps grid cards + pagination. hx-target="#grid-pane" so we swap both at once. #}
-{# On load, we forward the current URL's query string so reload preserves filters. #}
-<div id="grid-pane"
-     hx-get="/grid"
-     hx-trigger="load once"
-     hx-target="this"
-     hx-swap="outerHTML">
+{# Wraps grid cards + pagination. Loaded once on DOMContentLoaded by the #}
+{# script below; reload preserves filters via window.location.search.    #}
+<div id="grid-pane">
   <div class="empty">Loading…</div>
 </div>
 <script>
-  // On load, if the URL has filter params, re-trigger #grid-pane with them.
-  // HTMX's `hx-include` doesn't pick up window.location; we do it manually.
-  document.addEventListener('DOMContentLoaded', () => {
-    const qs = window.location.search;
-    if (qs) {
-      const pane = document.getElementById('grid-pane');
-      if (pane) pane.setAttribute('hx-get', '/grid' + qs);
-      htmx.trigger('#grid-pane', 'load');
+  // Trigger the grid load after HTMX is ready. We use the current URL's
+  // query string so filtered URLs (?cluster_id=N) keep their filter on
+  // reload. We use a small delay to ensure HTMX has finished initializing
+  // (it processes elements on DOMContentLoaded).
+  function loadGrid() {
+    if (typeof htmx === 'undefined') {
+      setTimeout(loadGrid, 50);
+      return;
     }
-  });
+    const qs = window.location.search || '?';
+    const pane = document.getElementById('grid-pane');
+    if (!pane) return;
+    htmx.ajax('GET', '/grid' + qs, { target: '#grid-pane', swap: 'innerHTML' });
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', loadGrid);
+  } else {
+    loadGrid();
+  }
 </script>
 
 {# ----- Photo detail modal. Native <dialog>. Body loaded by HTMX. ----- #}
