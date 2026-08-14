@@ -1,0 +1,40 @@
+{# Pagination. Matches pagination.js: « ‹ 1 2 … 50 › ». #}
+{# Buttons swap #grid-pane (NOT #root) so the toolbar survives. #}
+{% set p = pagination %}
+{% set total_pages = p.total_pages %}
+{% set cur = p.page %}
+<nav id="pagination-bar" aria-label="Pagination">
+  <small>
+    {{ p.total }} photos · page {{ cur + 1 }} of {{ total_pages }}
+  </small>
+  <div class="pages">
+    {% macro pgbtn(target_page, label, disabled=False, current=False) %}
+      <button class="pg-btn {{ 'on' if current else '' }}"
+              {{ 'disabled' if disabled else '' }}
+              @click="
+                htmx.ajax('GET', '/grid?page={{ target_page }}&page_size={{ p.page_size }}{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
+                history.pushState({}, '', '?page={{ target_page }}{{ qsuffix }}');
+              ">
+        {{ label }}
+      </button>
+    {% endmacro %}
+
+    {{ pgbtn(0, '«', cur == 0) }}
+    {{ pgbtn(cur - 1, '‹', cur == 0) }}
+
+    {% set window = 2 %}
+    {% set shown = namespace(start=False, end=False) %}
+    {% for pg in range(total_pages) %}
+      {% if pg == 0 or pg == total_pages - 1 or (pg >= cur - window and pg <= cur + window) %}
+        {{ pgbtn(pg, pg + 1, current=(pg == cur)) }}
+      {% elif pg == cur - window - 1 %}
+        <small class="ellipsis">…</small>
+      {% elif pg == cur + window + 1 %}
+        <small class="ellipsis">…</small>
+      {% endif %}
+    {% endfor %}
+
+    {{ pgbtn(cur + 1, '›', cur >= total_pages - 1) }}
+    {{ pgbtn(total_pages - 1, '»', cur >= total_pages - 1) }}
+  </div>
+</nav>

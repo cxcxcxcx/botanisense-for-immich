@@ -1,0 +1,36 @@
+{# Per-cluster album controls. Loaded into #cluster-album-bar when a pill is clicked. #}
+{# Shows: existing-album chip OR sync-this-cluster button.                  #}
+{# Delete flow is dispatched as a confirm + checkbox + DELETE request.      #}
+{% if album %}
+<div class="cluster-album-controls">
+  <span class="muted">Album:</span>
+  <a href="{{ album.album_url }}" target="_blank" rel="noopener">
+    {{ album.album_id[:8] }}… ({{ album.n_assets }} photos)
+  </a>
+  <button class="secondary outline"
+          @click="
+            $dispatch('open-job-panel', {kind:'cluster', clusterId: {{ cluster_id }}});
+          ">
+    ↻ Re-sync
+  </button>
+  <button class="secondary outline"
+          @click="
+            if (!confirm('Delete cluster #{{ cluster_id }} album mapping?')) return;
+            const alsoDelete = confirm('Also delete the album in Immich?\\n\\nOK = delete in Immich too\\nCancel = keep album, drop mapping only');
+            fetch('/api/album/cluster/{{ cluster_id }}?delete_in_immich=' + (alsoDelete ? 'true' : 'false'), {method: 'DELETE'})
+              .then(r => r.json())
+              .then(j => window.toast(j.remote_deleted ? 'Album deleted everywhere' : 'Mapping removed', 'success', 2500))
+              .then(() => $dispatch('cluster-pill-clicked', {id: null}));
+          ">
+    🗑 Delete
+  </button>
+</div>
+{% else %}
+<div class="cluster-album-controls">
+  <span class="muted">No album for cluster #{{ cluster_id }} yet.</span>
+  <button class="primary outline"
+          @click="$dispatch('open-job-panel', {kind:'cluster', clusterId: {{ cluster_id }}})">
+    + Sync this cluster as album
+  </button>
+</div>
+{% endif %}

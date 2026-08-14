@@ -1,0 +1,183 @@
+{# Wrapped in #grid-pane so HTMX swaps grid + pagination together. #}
+<div id="grid-pane">
+  {% if not results %}
+  <div class="empty">No results in this view.</div>
+  {% else %}
+  <div class="photo-grid">
+    {% for r in results %}
+    <article class="card" id="card-{{ r.asset_id }}"
+             data-aid="{{ r.asset_id }}"
+             @click="$dispatch('open-asset', {id: '{{ r.asset_id }}'})">
+      <div class="img-wrap">
+        <img src="/thumb/{{ r.asset_id }}" alt="{{ r.original_file_name }}"
+             loading="lazy" decoding="async">
+        {% if r.cluster_id is not none %}<span class="cluster-tag">cluster {{ r.cluster_id }}</span>{% endif %}
+        {% if r.rank is not none %}<span class="rank-tag">#{{ r.rank + 1 }}</span>{% endif %}
+        {% if r.near_dups and r.near_dups|length %}
+          <span class="dup-badge"
+                title="{{ r.near_dups|length }} similar photo(s) (cosine ≥ 0.97)">{{ r.near_dups|length }}×</span>
+        {% endif %}
+
+        {# YOLO bboxes as inline SVG (matches grid.js bboxSvg) #}
+        {% set dets = r.detections or [] %}
+        {% if dets %}
+          {% set ns = namespace(bbox_svg='') %}
+          {% for d in dets if d.score >= 0.10 %}
+            {% set x = '%.2f' | format(d.x * 100) %}
+            {% set y = '%.2f' | format(d.y * 100) %}
+            {% set w = '%.2f' | format(d.w * 100) %}
+            {% set h = '%.2f' | format(d.h * 100) %}
+            {% set lbl = d.label ~ ' ' ~ ('%.0f' | format(d.score * 100)) ~ '%' %}
+            {% set ty = '%.2f' | format((d.y - 0.005) * 100) %}
+            {% set ns.bbox_svg = ns.bbox_svg ~
+              '<rect x="' ~ x ~ '%" y="' ~ y ~ '%" width="' ~ w ~ '%" height="' ~ h ~ '%"/>' ~
+              '<text x="' ~ x ~ '%" y="' ~ ty ~ '%">' ~ lbl ~ '</text>' %}
+          {% endfor %}
+          <svg class="bbox" viewBox="0 0 100 100" preserveAspectRatio="none">{{ ns.bbox_svg|safe }}</svg>
+        {% endif %}
+
+        {# Plantae badge corner overlay #}
+        {% set plantae = r.taxon_scores.Plantae if r.taxon_scores else none %}
+        {% if plantae is not none %}
+          {% if plantae >= plantae_green %}
+            <span class="plantae green" title="Plantae ≥ {{ plantae_green }}">Plantae {{ '%.1f' | format(plantae * 100) }}%</span>
+          {% elif plantae >= plantae_yellow %}
+            <span class="plantae yellow" title="Plantae ≥ {{ plantae_yellow }}">Plantae {{ '%.1f' | format(plantae * 100) }}%</span>
+          {% else %}
+            <span class="plantae red">Plantae {{ '%.1f' | format(plantae * 100) }}%</span>
+          {% endif %}
+        {% endif %}
+      </div>
+
+      <div class="meta-card">
+        <div class="name">{{ r.original_file_name }}</div>
+        <div>
+          {% set k = r.top_predictions[0] if r.top_predictions else {} %}
+          <span class="badge">{{ k.kingdom or '?' }}</span>
+          <span class="badge">{{ k.family or '?' }}</span>
+          <span class="badge">{{ k.genus or '?' }}</span>
+          {% if r.taxon_scores %}
+            <small class="muted">
+            {% set others = [] %}
+            {% for n, s in r.taxon_scores.items() if n != 'Plantae' %}
+              {% set _ = others.append((n, s)) %}
+            {% endfor %}
+            {% for n, s in others|sort(attribute=1, reverse=true) %}
+              {% if not loop.first %} · {% endif %}{{ n }}={{ '%.0f' | format(s * 100) }}
+            {% endfor %}
+            </small>
+          {% endif %}
+        </div>
+        <div class="urls">
+          <a href="{{ r.original_url }}" target="_blank">original →</a>
+          <a href="{{ r.thumbnail_url }}" target="_blank">thumb →</a>
+        </div>
+      </div>
+
+      <div class="preds">
+        {% for p in r.top_predictions[:5] %}
+        <div class="pred">
+          <div class="sp">{{ p.species }}<div class="cn">{{ p.common_name or '' }}</div></div>
+          <div class="sc">{{ '%.2f' | format(p.score * 100) }}%</div>
+        </div>
+        {% endfor %}
+      </div>
+
+      {# Per-detection predictions (matches grid.js detBlocks) #}
+      {% set full_top1 = r.top_predictions[0].species if r.top_predictions else '' %}
+      {% set full_top1_score = r.top_predictions[0].score if r.top_predictions else 0 %}
+      {% if dets %}
+      <div class="dets">
+        {% for d in dets if d.score >= 0.10 %}
+          {% set bp = (d.bbox_predictions or [])[:3] %}
+          {% if bp %}
+          <div class="det-block">
+            <div class="det-header">crop {{ loop.index }}: {{ d.label }} {{ '%.0f' | format(d.score * 100) }}%</div>
+            {% for p in bp %}
+              {% set beats = p.species == full_top1 and p.score > full_top1_score %}
+              <div class="pred">
+                <div class="sp">{{ p.species }}<div class="cn">{{ p.common_name or '' }}</div></div>
+                <div class="sc">{{ '%.2f' | format(p.score * 100) }}%{% if beats %} ↑{% endif %}</div>
+              </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+      {% endif %}
+
+      {# Near-dup panel (matches grid.js nearDupPanel) #}
+      {% if r.near_dups %}
+      <div class="near-dup">
+        <button class="near-dup-toggle"
+                data-aid="{{ r.asset_id }}"
+                @click="$event.target.nextElementSibling.hidden = !$event.target.nextElementSibling.hidden">
+          ▸ {{ r.near_dups|length }} similar image{{ 's' if r.near_dups|length > 1 else '' }} (cosine ≥ 0.99)
+        </button>
+        <div class="near-dup-panel" hidden>
+          {% for d in r.near_dups %}
+          <div class="near-dup-item" data-aid="{{ r.asset_id }}" data-other="{{ d.asset_id }}">
+            <img src="/thumb/{{ d.asset_id }}" alt="{{ d.original_file_name or '' }}" loading="lazy">
+            <div class="near-dup-name" title="{{ d.original_file_name or '' }}">{{ d.original_file_name or d.asset_id }}</div>
+            <button class="near-dup-pick"
+                    @click="
+                      $event.stopPropagation();
+                      const card = $event.target.closest('.card');
+                      const img = card.querySelector('.img-wrap img');
+                      img.src = '/thumb/{{ d.asset_id }}';
+                      window.toast('Primary image updated (local only)', 'info', 2000);
+                    ">
+              use as primary
+            </button>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      {# In-card KNN block (matches renderKnnBlock) #}
+      {% if r.knn and r.knn.top_species %}
+      <div class="knn-block">
+        <div class="knn-header">
+          <span>KNN top-1: {{ r.knn.top_species }}{{ ' (' ~ r.knn.common_name ~ ')' if r.knn.common_name else '' }} · {{ '%.1f' | format((r.knn.score or 0) * 100) }}%</span>
+          <small>{{ r.knn.kingdom or '' }}{{ ' · ' ~ r.knn.family if r.knn.family else '' }}</small>
+        </div>
+        {% for n in (r.knn.neighbors or [])[:3] %}
+        <div class="pred">
+          <div class="sp">{{ n.species }}<div class="cn">{{ n.common_name or '' }}</div></div>
+          <div class="sc">{{ '%.1f' | format(n.sim * 100) }}%</div>
+        </div>
+        {% endfor %}
+        <button class="reclassify-btn"
+                @click.stop="
+                  fetch('/api/reclassify', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({asset_ids: ['{{ r.asset_id }}']})
+                  }).then(r => r.json()).then(() => window.toast('KNN reclassified','success',2000));
+                ">
+          Re-run KNN
+        </button>
+      </div>
+      {% else %}
+      <div class="knn-block">
+        <div class="knn-empty">No KNN result yet.</div>
+        <button class="reclassify-btn"
+                @click.stop="
+                  fetch('/api/reclassify', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/json'},
+                    body: JSON.stringify({asset_ids: ['{{ r.asset_id }}']})
+                  }).then(r => r.json()).then(() => window.toast('KNN reclassified','success',2000));
+                ">
+          Reclassify with KNN
+        </button>
+      </div>
+      {% endif %}
+    </article>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  {% include "_pagination.html" %}
+</div>

@@ -1,0 +1,33 @@
+{# Cluster / taxonomy filter pills. Loaded into #cluster-pills. #}
+{# Each pill dispatches cluster-pill-clicked so the cluster-album-bar updates, #}
+{# AND triggers an HTMX /grid swap. The "all" pill clears the filter.       #}
+<div class="cluster-pills">
+  {# "All" pill — clears any active filter. #}
+  <button class="cluster-pill {{ '' if active else 'on' }}"
+          @click="
+            $dispatch('cluster-pill-clicked', {id: null});
+            htmx.ajax('GET', '/grid?{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
+            history.pushState({}, '', '/');
+          "
+          title="Show all {{ total_count }} photos">
+    all <small>{{ total_count }}</small>
+  </button>
+
+  {% for entry in entries %}
+    {% set is_active = (active == entry.key) %}
+    <button class="cluster-pill {{ 'on' if is_active }}"
+            title="{{ entry.tooltip or '' }}"
+            @click="
+              $dispatch('cluster-pill-clicked', {id: {{ entry.key if group_by == 'cluster' else 'null' }}, is_active: {{ 'true' if is_active else 'false' }}, kind: '{{ group_by }}', value: '{{ entry.key }}' });
+              {% if is_active %}
+                htmx.ajax('GET', '/grid?{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
+                history.pushState({}, '', '/');
+              {% else %}
+                htmx.ajax('GET', '/grid?{{ group_by }}={{ entry.key }}{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
+                history.pushState({}, '', '?{{ group_by }}={{ entry.key }}');
+              {% endif %}
+            ">
+      {{ entry.label }} <small>{{ entry.count }}</small>
+    </button>
+  {% endfor %}
+</div>

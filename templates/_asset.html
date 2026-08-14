@@ -1,0 +1,99 @@
+{# Asset detail body. Loaded into #modal-body on open-asset. #}
+{# Mirrors modal.js renderDetailBody — same content, server-rendered. #}
+<figure>
+  <img src="{{ asset.original_url }}" alt="{{ asset.original_file_name }}">
+</figure>
+
+<div class="meta-card">
+  <div class="name">{{ asset.original_file_name }}</div>
+  <div>
+    <button class="secondary outline"
+            @click="$dispatch('close-asset'); history.pushState({}, '', '?cluster_id={{ asset.cluster_id }}'); htmx.ajax('GET', '/grid?cluster_id={{ asset.cluster_id }}', {target: '#grid-pane', swap: 'outerHTML'});">
+      cluster #{{ asset.cluster_id }}
+    </button>
+    {% set k = asset.top_predictions[0] if asset.top_predictions else {} %}
+    <span class="badge">{{ k.kingdom or '?' }}</span>
+    <span class="badge">{{ k.family or '?' }}</span>
+    <span class="badge">{{ k.genus or '?' }}</span>
+    {% if asset.taxon_scores and asset.taxon_scores.Plantae is defined %}
+      {% set p = asset.taxon_scores.Plantae %}
+      <span class="plantae {{ 'green' if p >= 0.60 else 'yellow' if p >= 0.35 else 'red' }}">
+        Plantae {{ '%.1f' | format(p * 100) }}%
+      </span>
+    {% endif %}
+  </div>
+  <div class="urls">
+    <a href="{{ asset.original_url }}" target="_blank">original →</a>
+    <a href="{{ asset.thumbnail_url }}" target="_blank">thumb →</a>
+  </div>
+</div>
+
+<h5>Closest photos in your library</h5>
+<div class="library-neighbors">
+  {% for n in asset.library_neighbors or [] %}
+  <div class="lib-neighbor"
+       @click="$dispatch('open-asset', {id: '{{ n.asset_id }}'})">
+    <img src="/thumb/{{ n.asset_id }}" alt="{{ n.original_file_name or '' }}" loading="lazy">
+    <small>cluster {{ n.cluster_id if n.cluster_id is not none else '?' }} · {{ '%.1f' | format((n.similarity or 0) * 100) }}%</small>
+  </div>
+  {% endfor %}
+</div>
+
+<h5>Top-K BioCLIP</h5>
+<div class="preds">
+  {% for p in asset.top_predictions[:8] %}
+  <div class="pred">
+    <div class="sp">{{ p.species }}<div class="cn">{{ p.common_name or '' }}</div></div>
+    <div class="sc">{{ '%.2f' | format(p.score * 100) }}%</div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if asset.knn %}
+<h5>KNN ({{ asset.knn.index_version }})</h5>
+<div class="knn-block">
+  <div class="knn-header">
+    <strong>{{ asset.knn.top_species }}</strong>
+    {{ '%.2f' | format(asset.knn.score * 100) }}%
+    <small>{{ asset.knn.kingdom or '' }}{{ ' · ' ~ asset.knn.family if asset.knn.family else '' }}</small>
+  </div>
+  <div class="library-neighbors">
+    {% for n in asset.knn.neighbors[:8] %}
+    <div class="lib-neighbor">
+      <img src="/thumb/{{ n.asset_id }}" alt="{{ n.original_file_name or '' }}" loading="lazy">
+    </div>
+    {% endfor %}
+  </div>
+  <button class="reclassify-btn"
+          hx-post="/api/reclassify"
+          hx-vals='{"asset_ids": ["{{ asset.asset_id }}"]}'
+          hx-swap="none"
+          hx-on::after-request="if(event.detail.successful) window.toast('KNN re-run','success',2000)">
+    Re-run KNN
+  </button>
+</div>
+{% endif %}
+
+{% if asset.detections %}
+<h5>YOLO detections</h5>
+{% for d in asset.detections %}
+<div class="det-block">
+  <div class="det-header">{{ d.label }} {{ '%.2f' | format(d.score * 100) }}%</div>
+  <div class="preds">
+    {% for p in (d.bbox_predictions or [])[:5] %}
+    <div class="pred">
+      <div class="sp">{{ p.species }}<div class="cn">{{ p.common_name or '' }}</div></div>
+      <div class="sc">{{ '%.2f' | format(p.score * 100) }}%</div>
+    </div>
+    {% endfor %}
+  </div>
+  <button class="reclassify-btn"
+          hx-post="/api/reclassify-bbox"
+          hx-vals='{"asset_id": "{{ asset.asset_id }}", "bbox_index": {{ loop.index0 }}}'
+          hx-swap="none"
+          hx-on::after-request="if(event.detail.successful) window.toast('Crop reclassified','success',2000)">
+    Reclassify crop
+  </button>
+</div>
+{% endfor %}
+{% endif %}

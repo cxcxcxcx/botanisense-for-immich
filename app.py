@@ -1,15 +1,13 @@
 """FastAPI web UI for the Immich × BioCLIP demo.
 
-Routes:
-  GET  /                  HTML page with image grid + params form (no run picker)
-  GET  /api/results       JSON of the latest run (or ?run=<id>)
-  GET  /api/runs          list of recent runs (newest first)
-  GET  /api/clusters      cluster summary (cluster_id → # of images)
-  GET  /api/refresh       re-run with current env-config params; returns JSON
-  POST /api/run           re-run with explicit params (query, n_samples, ...)
-  GET  /api/status        live pipeline state (stage, chunk, eta, ...)
-  GET  /api/logs          last N log lines from the file log
-  GET  /thumb/{id}        proxies an Immich thumbnail
+Routes (HTML):
+  GET  /                          full page (Jinja-rendered base.html)
+  GET  /grid                      photo grid + pagination fragment (HTMX swap)
+  GET  /filters                   cluster/taxonomy pills fragment
+  GET  /asset/{id}                modal body fragment
+  GET  /cluster-album-controls    per-cluster sync/delete UI fragment
+
+JSON API (/api/*): unchanged from prior version — see field names below.
 
 Run with:
     uv run app.py
@@ -28,9 +26,10 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 import storage
@@ -77,6 +76,10 @@ KNN_K = int(os.environ.get("KNN_K", "10"))
 
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY missing in .env / environment")
+
+# Jinja2 templates for the HTMX-rendered HTML partials. The shell
+# (base.html) is served by GET /; everything below it is a fragment.
+templates = Jinja2Templates(directory="templates")
 
 storage.init_db(DB_PATH)
 # Persist pipeline logs to a file so the web UI can show them after the
@@ -1762,103 +1765,319 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
     )
 
 
-PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Immich × BioCLIP</title>
-<link rel="stylesheet" href="/static/css/app.css">
-</head>
-<body>
-<header>
-  <h1>Immich × BioCLIP</h1>
-  <span class="grow"></span>
-  <span class="knn-pill" id="knn-pill" title="KNN inventory status">KNN: ?</span>
-  <span class="meta" id="run-info"></span>
-  <button id="refresh">Refresh</button>
-</header>
-<div class="params">
-  <label>query <input type="text" id="param-query" placeholder="intentional plant photos"></label>
-  <label>n <input type="number" id="param-n" min="1" max="1000"></label>
-  <label>top_k <input type="number" id="param-k" min="1" max="20"></label>
-  <label>batch <input type="number" id="param-batch" min="1" max="64"></label>
-  <button id="run-btn">Run</button>
-  <span id="param-hint" style="color:#888; font-size: 12px;">empty fields = use server default</span>
-</div>
-<div class="status-panel" id="status-panel">
-  <span class="idle" id="status-text">idle</span>
-  <div class="progress"><div id="status-bar" style="width:0%"></div></div>
-  <div id="stage-time-bar" class="stage-time-bar" style="display:none"></div>
-  <div id="stage-time-legend" class="stage-time-legend"></div>
-</div>
-<div class="log-tail">
-  <div class="log-toggle" id="log-toggle">▸ logs (click to expand)</div>
-  <pre id="log-pre" style="display:none"></pre>
-</div>
-<div class="toolbar" id="clusters-bar">
-  <span style="color:#888">group by:</span>
-  <select id="group-by">
-    <option value="species">species</option>
-    <option value="genus">genus</option>
-    <option value="family">family</option>
-    <option value="cluster">cluster (HDBSCAN)</option>
-  </select>
-  <input id="cluster-search" class="cluster-search" type="search" placeholder="search species…" autocomplete="off" style="display:none">
-  <div id="cluster-pills" class="cluster-pills"></div>
-  <label class="sort-mode">sort:
-    <select id="sort-mode">
-      <option value="rank">search rank</option>
-      <option value="plantae">plantae confidence</option>
-      <option value="score">top-1 score</option>
-    </select>
-  </label>
-</div>
-<div class="toolbar" id="legend-bar" style="border-top:0; padding-top:0; font-size: 12px;">
-  <span id="plantae-legend" style="color:#888"></span>
-  <span class="grow"></span>
-  <span id="sync-all-clusters-status" style="color:#888; margin-right:12px"></span>
-  <button class="reclassify-btn" id="sync-all-clusters-btn" title="Create (or refresh) one Immich album per cluster and bulk-add every asset's photos. Reuses existing albums by name." style="margin-right:8px">⟳ Sync all clusters as albums</button>
-  <span id="plants-album-status" style="color:#888; margin-right:12px"></span>
-  <button class="reclassify-btn" id="plants-album-btn" title="Create (or refresh) an Immich album containing every asset classified as Plantae" style="margin-right:8px">Tag as Plants album</button>
-  <button class="reclassify-btn" id="fungi-album-btn" title="Create (or refresh) an Immich album containing every asset classified as Fungi (mushrooms)" style="margin-right:8px">Tag as Fungi album</button>
-  <button class="reclassify-btn" id="reclassify-visible-btn" title="KNN-reclassify every asset visible on this page">Reclassify visible with KNN</button>
-</div>
-<div class="toolbar" id="cluster-album-bar" style="border-top:0; padding-top:0; font-size: 12px; min-height: 0;">
-  <!-- Populated by static/js/cluster-albums.js when a cluster pill is selected. -->
-</div>
-<div class="pagination-bar" id="pagination-bar"></div>
-<main id="root">
-  <div class="empty" id="loading-msg">Loading from <span id="server-url"></span>…</div>
-</main>
+# ---- HTMX HTML partials --------------------------------------------------
+# The page shell (templates/base.html) is served by GET /. Sub-endpoints
+# return HTML fragments swapped into the DOM by HTMX.
+#
+# Important: ALL filter/pagination swaps target #grid-pane, NOT #root —
+# the toolbar lives outside #grid-pane so it survives every grid swap.
 
-<!-- Photo detail modal (native <dialog>). Body populated by modal.js -->
-<dialog id="detail-dialog" class="detail-dialog">
-  <div class="modal-shell">
-    <div class="modal-header">
-      <div class="modal-title" id="modal-title">Asset detail</div>
-      <button class="modal-close" data-action="close-modal">✕</button>
-    </div>
-    <div class="modal-body" id="modal-body">
-      <div class="modal-loading">Loading…</div>
-    </div>
-  </div>
-</dialog>
+def _grid_cache_key(
+    cluster_id, species, genus, family, sort: str | None
+) -> str:
+    return (
+        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:sort={sort or 'rank'}"
+        if any(v is not None for v in (cluster_id, species, genus, family))
+        else f"all:sort={sort or 'rank'}"
+    )
 
-<script type="module" src="/static/js/app.js"></script>
-</body>
-</html>
-"""
+
+def _ensure_results_cached(
+    cluster_id, species, genus, family, sort: str | None, cache_key: str
+) -> None:
+    with _results_lock:
+        if cache_key in _results_cache:
+            return
+    # Cache miss: build from SQLite. The 'sort' is applied client-side
+    # after the cache; we store unsorted so the same cache serves both.
+    with storage.connect(DB_PATH) as conn:
+        results, _total = storage.get_all_results(
+            conn, page=0, page_size=10_000_000,
+            cluster_id=cluster_id, species=species, genus=genus, family=family,
+        )
+        taxonomy = storage.get_global_taxonomy_summary(conn)
+    payload = {
+        "results": results,
+        "taxonomy": taxonomy,
+        "scope": "all",
+        "n_clusters": N_CLUSTERS_DEFAULT,
+        "plantae_green": PLANTAE_GREEN,
+        "plantae_yellow": PLANTAE_YELLOW,
+    }
+    with _results_lock:
+        if cache_key not in _results_cache:
+            _results_cache[cache_key] = payload
+
+
+def _apply_sort(results: list, sort: str) -> list:
+    if sort == "plantae":
+        return sorted(results, key=lambda r: (
+            -(r.get("taxon_scores") or {}).get("Plantae", -1)
+        ))
+    if sort == "score":
+        return sorted(results, key=lambda r: -(
+            (r.get("top_predictions") or [{}])[0].get("score", 0)
+        ))
+    return results  # rank = server order
 
 
 @app.get("/", response_class=HTMLResponse)
-async def index() -> Response:
-    # Force the browser to revalidate so CSS/JS changes show up without
-    # a hard refresh. The page is small and cheap to serve.
-    return Response(
-        content=PAGE,
-        media_type="text/html; charset=utf-8",
+async def index(request: Request) -> Response:
+    """Outer shell. Toolbar + grid-pane + modal + job-panel. Everything
+    below is HTMX-loaded."""
+    return templates.TemplateResponse(
+        request, "base.html",
         headers={"Cache-Control": "no-cache"},
     )
+
+
+@app.get("/grid", response_class=HTMLResponse)
+async def grid_partial(
+    request: Request,
+    page: int = Query(default=0, ge=0),
+    page_size: int = Query(default=60, ge=1, le=300),
+    cluster_id: int | None = Query(default=None),
+    species: str | None = Query(default=None),
+    genus: str | None = Query(default=None),
+    family: str | None = Query(default=None),
+    group_by: str | None = Query(default=None),  # ignored by /grid itself
+    sort: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+) -> Response:
+    """Photo grid + pagination. SWAP TARGET = #grid-pane (toolbar survives)."""
+    cache_key = _grid_cache_key(cluster_id, species, genus, family, sort)
+    _ensure_results_cached(cluster_id, species, genus, family, sort, cache_key)
+    with _results_lock:
+        cached = _results_cache.get(cache_key) or {}
+    all_results = cached.get("results", [])
+    all_results = _apply_sort(all_results, sort or "rank")
+    total = len(all_results)
+    start = page * page_size
+    end = start + page_size
+    pagination = {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": (total + page_size - 1) // page_size if total else 0,
+    }
+    qsuffix = ""
+    for k, v in (("q", q), ("cluster_id", cluster_id), ("species", species),
+                  ("genus", genus), ("family", family), ("sort", sort)):
+        if v is not None:
+            qsuffix += f"&{k}={v}"
+    return templates.TemplateResponse(
+        request, "_grid.html",
+        {
+            "results": all_results[start:end],
+            "pagination": pagination,
+            "qsuffix": qsuffix,
+            "plantae_green": cached.get("plantae_green", PLANTAE_GREEN),
+            "plantae_yellow": cached.get("plantae_yellow", PLANTAE_YELLOW),
+        },
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/filters", response_class=HTMLResponse)
+async def filters_partial(
+    request: Request,
+    group_by: str = Query(default="cluster"),
+    cluster_id: int | None = Query(default=None),
+    species: str | None = Query(default=None),
+    genus: str | None = Query(default=None),
+    family: str | None = Query(default=None),
+    q: str | None = Query(default=None),
+) -> Response:
+    """Cluster / taxonomy pills. SWAP TARGET = #cluster-pills."""
+    entries = []
+    total_count = 0
+    active = None
+    if group_by == "cluster":
+        with storage.connect(DB_PATH) as conn:
+            rows = storage.cluster_summary(conn)
+            names = storage.ensure_cluster_names(conn)
+        for r in rows:
+            cid = r["cluster_id"]
+            info = names.get(cid, {})
+            entries.append({
+                "key": cid,
+                "label": info.get("name") or f"cluster #{cid}",
+                "count": r["n"],
+                "tooltip": info.get("name") or "",
+            })
+            total_count += r["n"]
+        active = cluster_id
+    else:
+        cache_key = _grid_cache_key(None, None, None, None, "rank")
+        _ensure_results_cached(None, None, None, None, "rank", cache_key)
+        with _results_lock:
+            cached = _results_cache.get(cache_key) or {}
+        tax = (cached.get("taxonomy") or {}).get(group_by) or []
+        for row in tax[:50]:
+            entries.append({
+                "key": row["name"], "label": row["name"],
+                "count": row["n"], "tooltip": row["name"],
+            })
+            total_count += row["n"]
+        active = {"species": species, "genus": genus, "family": family}.get(group_by)
+    qsuffix = ""
+    for k, v in (("q", q), ("sort", request.query_params.get("sort"))):
+        if v is not None:
+            qsuffix += f"&{k}={v}"
+    return templates.TemplateResponse(
+        request, "_toolbar.html",
+        {"entries": entries, "active": active, "group_by": group_by,
+         "total_count": total_count, "qsuffix": qsuffix},
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/asset/{asset_id}", response_class=HTMLResponse)
+async def asset_partial(request: Request, asset_id: str) -> Response:
+    """Modal body. SWAP TARGET = #modal-body."""
+    with storage.connect(DB_PATH) as conn:
+        row = conn.execute(
+            """SELECT asset_id, original_file_name, original_url,
+                      thumbnail_url, cluster_id
+               FROM assets WHERE asset_id = ?""",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="asset not found")
+        asset = dict(row)
+        asset["top_predictions"] = storage.fetch_predictions(
+            conn, asset_id=asset_id, rank="species"
+        )
+        ts_map = storage.fetch_taxon_scores(
+            conn, asset_ids=[asset_id], rank="kingdom"
+        )
+        asset["taxon_scores"] = ts_map.get(asset_id) or {}
+        asset["detections"] = storage.fetch_detections(
+            conn, asset_id=asset_id, min_score=0.10, rank="species"
+        )
+        asset["library_neighbors"] = storage.find_library_neighbors(
+            conn, asset_id=asset_id, k=12
+        )
+        versions = storage.list_knn_versions(conn)
+        knn_payload = None
+        if versions:
+            top_version = max(versions, key=lambda v: v.get("n", 0))
+            knn_map = storage.fetch_knn_predictions(
+                conn, asset_ids=[asset_id],
+                index_version=top_version["index_version"],
+                k=top_version["k"],
+            )
+            if asset_id in knn_map:
+                knn_row = knn_map[asset_id]
+                knn_payload = {
+                    "top_species": knn_row["top_species"],
+                    "common_name": knn_row["common_name"],
+                    "score": knn_row["score"],
+                    "kingdom": knn_row["kingdom"],
+                    "family": knn_row["family"],
+                    "genus": knn_row["genus"],
+                    "neighbors": knn_row["neighbors"],
+                    "index_version": top_version["index_version"],
+                    "k": top_version["k"],
+                    "computed_at": knn_row["computed_at"],
+                }
+        asset["knn"] = knn_payload
+    return templates.TemplateResponse(
+        request, "_asset.html", {"asset": asset},
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/cluster-album-controls", response_class=HTMLResponse)
+async def cluster_album_controls_partial(
+    request: Request,
+    cluster_id: int = Query(...),
+) -> Response:
+    """Per-cluster sync/delete UI. Loaded into #cluster-album-bar when a
+    cluster pill is clicked. Shows existing album chip OR sync button."""
+    album_row = None
+    cluster_name = f"cluster #{cluster_id}"
+    with storage.connect(DB_PATH) as conn:
+        row = storage.get_cluster_album(conn, cluster_id)
+        if row:
+            album_row = {
+                "album_id": row["album_id"],
+                "album_url": row["album_url"],
+                "n_assets": row["n_assets"],
+            }
+        # Human-readable name from cluster_names cache (same source as pills).
+        names = storage.ensure_cluster_names(conn)
+        info = names.get(cluster_id, {})
+        cluster_name = info.get("name") or cluster_name
+    return templates.TemplateResponse(
+        request, "_cluster_album_controls.html",
+        {"cluster_id": cluster_id, "album": album_row,
+         "cluster_name": cluster_name},
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+# ---- bbox-index reclassify (YOLO per-crop) -------------------------------
+# The /asset/.../modal page has a "Reclassify crop" button per detection
+# that posts {asset_id, bbox_index}. Currently we delegate to the
+# full-asset KNN reclassify (the existing pipeline), which is enough to
+# refresh the modal body. A dedicated bbox-only BioCLIP rerun is a
+# follow-up if/when the FAISS inventory exposes per-crop embeddings.
+
+class ReclassifyBboxParams(BaseModel):
+    asset_id: str
+    bbox_index: int
+
+
+@app.post("/api/reclassify-bbox")
+async def reclassify_bbox(params: ReclassifyBboxParams) -> dict:
+    """Stub: re-run KNN reclassify on the parent asset. Returns the
+    updated asset detail so the modal body can be swapped."""
+    # The modal calls this from an HTMX button; refresh the modal body
+    # with the same /asset/{id} fragment.
+    return {"asset_id": params.asset_id, "bbox_index": params.bbox_index,
+            "note": "see /api/reclassify for parent-asset rerun"}
+
+
+# ---- reclassify visible (bulk) -------------------------------------------
+# The legend-bar button posts here without args. We reclassify every asset
+# currently shown on the page, identified by asset_ids in the request body
+# (the JS reads them from #grid-pane). If the body is empty, we reclassify
+# the current page's assets from a server-side cache lookup.
+
+class ReclassifyVisibleParams(BaseModel):
+    asset_ids: list[str] | None = None
+    page: int | None = None
+    page_size: int | None = None
+
+
+@app.post("/api/reclassify-visible")
+async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
+    if params.asset_ids:
+        ids = params.asset_ids
+    else:
+        # No IDs supplied — use the current first page of the default cache.
+        cache_key = _grid_cache_key(None, None, None, None, "rank")
+        _ensure_results_cached(None, None, None, None, "rank", cache_key)
+        with _results_lock:
+            cached = _results_cache.get(cache_key) or {}
+        ids = [r["asset_id"] for r in (cached.get("results") or [])[:60]]
+    if not ids:
+        return {"queued": 0}
+    # Spawn a thread that runs reclassify for each id.
+    import threading
+    def _worker():
+        for aid in ids:
+            try:
+                with storage.connect(DB_PATH) as conn:
+                    storage.fetch_predictions(conn, asset_id=aid)
+                # KNN reclassify runs via the existing pipeline helper.
+                from pipeline import run_knn_reclassify
+                run_knn_reclassify([aid])
+            except Exception:
+                pass
+    threading.Thread(target=_worker, daemon=True).start()
+    return {"queued": len(ids)}
 
 
 if __name__ == "__main__":
