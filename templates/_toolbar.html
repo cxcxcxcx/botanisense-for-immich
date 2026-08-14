@@ -1,13 +1,17 @@
 {# Cluster / taxonomy filter pills. Loaded into #cluster-pills. #}
 {# Each pill dispatches cluster-pill-clicked so the cluster-album-bar updates, #}
 {# AND triggers an HTMX /grid swap. The "all" pill clears the filter.       #}
+{# Map group_by to the query-param name the /grid endpoint understands: #}
+{#   cluster → cluster_id, species → species, genus → genus, family → family #}
+{% set filter_param = 'cluster_id' if group_by == 'cluster' else group_by %}
+
 <div class="cluster-pills">
   {# "All" pill — clears any active filter. #}
-  <button class="cluster-pill {{ '' if active else 'on' }}"
+  <button class="cluster-pill {{ 'on' if active is none else '' }}"
           @click="
             $dispatch('cluster-pill-clicked', {id: null});
-            htmx.ajax('GET', '/grid?{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
-            history.pushState({}, '', '/');
+            htmx.ajax('GET', '/grid?sort=rank', {target: '#grid-pane', swap: 'outerHTML'});
+            history.pushState({}, '', '?');
           "
           title="Show all {{ total_count }} photos">
     all <small>{{ total_count }}</small>
@@ -15,16 +19,17 @@
 
   {% for entry in entries %}
     {% set is_active = (active == entry.key) %}
-    <button class="cluster-pill {{ 'on' if is_active }}"
+    <button class="cluster-pill {{ 'on' if is_active else '' }}"
             title="{{ entry.tooltip or '' }}"
             @click="
-              $dispatch('cluster-pill-clicked', {id: {{ entry.key if group_by == 'cluster' else 'null' }}, is_active: {{ 'true' if is_active else 'false' }}, kind: '{{ group_by }}', value: '{{ entry.key }}' });
+              const id = {{ entry.key if group_by == 'cluster' else 'null' }};
+              $dispatch('cluster-pill-clicked', {id: id, kind: '{{ group_by }}', value: '{{ entry.key }}' });
               {% if is_active %}
-                htmx.ajax('GET', '/grid?{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
-                history.pushState({}, '', '/');
+                htmx.ajax('GET', '/grid?sort=rank', {target: '#grid-pane', swap: 'outerHTML'});
+                history.pushState({}, '', '?');
               {% else %}
-                htmx.ajax('GET', '/grid?{{ group_by }}={{ entry.key }}{{ qsuffix }}', {target: '#grid-pane', swap: 'outerHTML'});
-                history.pushState({}, '', '?{{ group_by }}={{ entry.key }}');
+                htmx.ajax('GET', '/grid?{{ filter_param }}={{ entry.key }}&sort=rank', {target: '#grid-pane', swap: 'outerHTML'});
+                history.pushState({}, '', '?{{ filter_param }}={{ entry.key }}');
               {% endif %}
             ">
       {{ entry.label }} <small>{{ entry.count }}</small>

@@ -101,13 +101,14 @@
 
 {# ----- Toolbar (filters + cluster pills) ----- #}
 {# OUTSIDE #root. Survives every grid swap. #}
-<form id="toolbar" hx-get="/grid" hx-target="#grid-pane" hx-trigger="change from:select, input changed delay:300ms from:input[type=search], search from:input[type=search]"
+<form id="toolbar" hx-get="/grid" hx-target="#grid-pane"
+      hx-trigger="change from:#sort-mode, input changed delay:300ms from:input[type=search], search from:input[type=search]"
       hx-push-url="true">
   <fieldset role="group">
     <label>group by
       <select id="group-by" name="group_by"
               x-data="{ v: $el.value }"
-              x-init="v = localStorage.getItem('groupBy') || 'cluster'; $el.value = v; $dispatch('change')"
+              x-init="$nextTick(() => { v = localStorage.getItem('groupBy') || 'cluster'; $el.value = v; $dispatch('change'); })"
               @change="v = $event.target.value; localStorage.setItem('groupBy', v); $dispatch('change')">
         <option value="species">species</option>
         <option value="genus">genus</option>
@@ -118,7 +119,7 @@
     <label>sort
       <select id="sort-mode" name="sort"
               x-data="{ v: $el.value }"
-              x-init="v = localStorage.getItem('sortMode') || 'rank'; $el.value = v; $dispatch('change')"
+              x-init="$nextTick(() => { v = localStorage.getItem('sortMode') || 'rank'; $el.value = v; $dispatch('change'); })"
               @change="v = $event.target.value; localStorage.setItem('sortMode', v); $dispatch('change')">
         <option value="rank">search rank</option>
         <option value="plantae">plantae confidence</option>
@@ -132,6 +133,8 @@
   </fieldset>
 
   {# Cluster / taxonomy pills. Re-rendered on group-by change. #}
+  {# We DON'T trigger the toolbar form on group_by change — that would #}
+  {# re-submit /grid. Instead, the group_by change only refreshes pills. #}
   <div id="cluster-pills"
        hx-get="/filters"
        hx-trigger="load once, change from:#group-by"
@@ -155,10 +158,26 @@
 
 {# ----- Grid pane (the only thing that swaps on filter/pagination changes) ----- #}
 {# Wraps grid cards + pagination. hx-target="#grid-pane" so we swap both at once. #}
-<div id="grid-pane" hx-get="/grid" hx-trigger="load once" hx-swap="outerHTML">
-  {# Hydrated on load by hx-get=/grid above; nothing here at SSR time. #}
+{# On load, we forward the current URL's query string so reload preserves filters. #}
+<div id="grid-pane"
+     hx-get="/grid"
+     hx-trigger="load once"
+     hx-target="this"
+     hx-swap="outerHTML">
   <div class="empty">Loading…</div>
 </div>
+<script>
+  // On load, if the URL has filter params, re-trigger #grid-pane with them.
+  // HTMX's `hx-include` doesn't pick up window.location; we do it manually.
+  document.addEventListener('DOMContentLoaded', () => {
+    const qs = window.location.search;
+    if (qs) {
+      const pane = document.getElementById('grid-pane');
+      if (pane) pane.setAttribute('hx-get', '/grid' + qs);
+      htmx.trigger('#grid-pane', 'load');
+    }
+  });
+</script>
 
 {# ----- Photo detail modal. Native <dialog>. Body loaded by HTMX. ----- #}
 <dialog id="detail-dialog"
