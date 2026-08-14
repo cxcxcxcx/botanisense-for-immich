@@ -192,6 +192,54 @@ CREATE TABLE IF NOT EXISTS album_meta (
   value_json   TEXT NOT NULL,
   updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Pickled HDBSCAN clusterer, persisted across server restarts so the
+-- incremental-assign path can call approximate_predict() without
+-- retraining. Single row enforced by CHECK (id = 1). `n_assets_at_fit`
+-- is what `should_refit()` compares against the current row count to
+-- decide whether the corpus has grown enough to warrant a full refit.
+CREATE TABLE IF NOT EXISTS clusterer_state (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  clusterer_blob    BLOB NOT NULL,
+  min_cluster_size  INTEGER NOT NULL,
+  n_assets_at_fit   INTEGER NOT NULL,
+  n_clusters        INTEGER NOT NULL,
+  metric            TEXT NOT NULL DEFAULT 'euclidean',
+  selection_method  TEXT NOT NULL DEFAULT 'eom',
+  fitted_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Audit trail of Hungarian decisions from refit_with_remap(). One row
+-- per (old_cluster_id, new_cluster_id) pair, plus extras for `new` /
+-- `gone` clusters and the noise row. Lets the UI / debugging answer
+-- "what changed at the last refit?" without re-running the algorithm.
+CREATE TABLE IF NOT EXISTS cluster_remap (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  old_cluster_id  INTEGER NOT NULL,
+  new_cluster_id  INTEGER NOT NULL,
+  overlap_count   INTEGER NOT NULL,
+  union_count     INTEGER NOT NULL,
+  jaccard         REAL NOT NULL,
+  kind            TEXT NOT NULL CHECK (kind IN ('match','merge','split','new','gone','noise')),
+  refit_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_cluster_remap_at   ON cluster_remap(refit_at DESC);
+CREATE INDEX IF NOT EXISTS idx_cluster_remap_old  ON cluster_remap(old_cluster_id);
+CREATE INDEX IF NOT EXISTS idx_cluster_remap_new  ON cluster_remap(new_cluster_id);
+
+-- Server-owned mapping cluster_id -> Immich album. PRIMARY KEY enforces
+-- 1:1 (one cluster, at most one Immich album). No FK to assets.cluster_id
+-- because cluster_ids are renumbered across refits; the reference is
+-- logical, not enforced.
+CREATE TABLE IF NOT EXISTS cluster_albums (
+  cluster_id        INTEGER PRIMARY KEY,
+  album_id          TEXT NOT NULL,
+  album_url         TEXT NOT NULL,
+  n_assets          INTEGER NOT NULL DEFAULT 0,
+  reused_existing   INTEGER NOT NULL DEFAULT 0,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  last_synced_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -580,6 +628,307 @@ def ensure_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     return load_cluster_names(conn)
 
 
+# ---------- clusterer_state ---------------------------------------------
+# Pickled HDBSCAN clusterer persisted across server restarts so the
+# incremental-assign path can call approximate_predict() without a full
+# refit. The blob is written by clusters.save_clusterer(); the loader
+# is in clusters.py so it can clear state on unpickle failure (HDBSCAN
+# version mismatch) and fall back to a full refit.
+
+
+def get_clusterer_state(conn: sqlite3.Connection) -> dict | None:
+    """Read the singleton clusterer_state row. Returns None when no
+    clusterer has ever been fit (fresh DB)."""
+    row = conn.execute(
+        """
+        SELECT clusterer_blob, min_cluster_size, n_assets_at_fit, n_clusters,
+               metric, selection_method, fitted_at
+        FROM clusterer_state WHERE id = 1
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "clusterer_blob": bytes(row["clusterer_blob"]),
+        "min_cluster_size": int(row["min_cluster_size"]),
+        "n_assets_at_fit": int(row["n_assets_at_fit"]),
+        "n_clusters": int(row["n_clusters"]),
+        "metric": row["metric"],
+        "selection_method": row["selection_method"],
+        "fitted_at": row["fitted_at"],
+    }
+
+
+def save_clusterer_state(
+    conn: sqlite3.Connection,
+    *,
+    clusterer_blob: bytes,
+    min_cluster_size: int,
+    n_assets_at_fit: int,
+    n_clusters: int,
+    metric: str = "euclidean",
+    selection_method: str = "eom",
+) -> None:
+    """UPSERT the singleton row. Caller passes the already-pickled blob
+    (clusters.save_clusterer does the pickling so the storage layer
+    doesn't need to import hdbscan)."""
+    conn.execute(
+        """
+        INSERT INTO clusterer_state
+          (id, clusterer_blob, min_cluster_size, n_assets_at_fit, n_clusters,
+           metric, selection_method, fitted_at)
+        VALUES (1, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET
+          clusterer_blob   = excluded.clusterer_blob,
+          min_cluster_size = excluded.min_cluster_size,
+          n_assets_at_fit  = excluded.n_assets_at_fit,
+          n_clusters       = excluded.n_clusters,
+          metric           = excluded.metric,
+          selection_method = excluded.selection_method,
+          fitted_at        = excluded.fitted_at
+        """,
+        (
+            clusterer_blob,
+            int(min_cluster_size),
+            int(n_assets_at_fit),
+            int(n_clusters),
+            metric,
+            selection_method,
+        ),
+    )
+    conn.commit()
+
+
+def clear_clusterer_state(conn: sqlite3.Connection) -> None:
+    """Drop the clusterer singleton. Used by clusters.load_clusterer when
+    the pickled blob fails to unpickle (HDBSCAN version mismatch); the
+    caller then falls back to a full refit. Also exposed for tests."""
+    conn.execute("DELETE FROM clusterer_state WHERE id = 1")
+    conn.commit()
+
+
+# ---------- cluster_remap ------------------------------------------------
+# Audit trail of Hungarian decisions from refit_with_remap(). Each
+# refit event appends rows; the UI / debugging surfaces them via
+# recent_cluster_remap().
+
+
+def insert_cluster_remap(
+    conn: sqlite3.Connection, rows: Iterable[dict]
+) -> None:
+    """Bulk insert audit rows for one refit event. Each row must have
+    keys: old_cluster_id (int), new_cluster_id (int), overlap_count (int),
+    union_count (int), jaccard (float), kind (str in the CHECK set).
+    refit_at is set by SQLite's default (datetime('now'))."""
+    rows = list(rows)
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO cluster_remap
+          (old_cluster_id, new_cluster_id, overlap_count, union_count,
+           jaccard, kind)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                int(r["old_cluster_id"]),
+                int(r["new_cluster_id"]),
+                int(r["overlap_count"]),
+                int(r["union_count"]),
+                float(r["jaccard"]),
+                str(r["kind"]),
+            )
+            for r in rows
+        ],
+    )
+    conn.commit()
+
+
+def recent_cluster_remap(
+    conn: sqlite3.Connection, *, limit: int = 20
+) -> list[dict]:
+    """Most recent remap rows, ordered by id DESC (== refit_at DESC,
+    since id is autoincrement and each refit writes a contiguous batch).
+    Includes the `refit_at` so callers can group by event."""
+    rows = conn.execute(
+        """
+        SELECT id, old_cluster_id, new_cluster_id, overlap_count,
+               union_count, jaccard, kind, refit_at
+        FROM cluster_remap
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+# ---------- cluster_albums -----------------------------------------------
+# Server-owned cluster_id -> Immich album mapping. PRIMARY KEY on
+# cluster_id enforces 1:1 (one cluster, at most one Immich album). The
+# mapping is a logical reference to assets.cluster_id, not a foreign key,
+# because cluster_ids get renumbered across refits.
+
+
+def get_cluster_album(
+    conn: sqlite3.Connection, cluster_id: int
+) -> dict | None:
+    """Read one mapping. None if no album is synced for this cluster."""
+    row = conn.execute(
+        """
+        SELECT cluster_id, album_id, album_url, n_assets, reused_existing,
+               created_at, last_synced_at
+        FROM cluster_albums WHERE cluster_id = ?
+        """,
+        (int(cluster_id),),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def set_cluster_album(
+    conn: sqlite3.Connection,
+    *,
+    cluster_id: int,
+    album_id: str,
+    album_url: str,
+    n_assets: int,
+    reused: bool,
+) -> None:
+    """UPSERT one mapping. `reused` is a bool (stored as 0/1) so the UI
+    can show "(reused existing album)" after the second click."""
+    conn.execute(
+        """
+        INSERT INTO cluster_albums
+          (cluster_id, album_id, album_url, n_assets, reused_existing,
+           created_at, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+        ON CONFLICT(cluster_id) DO UPDATE SET
+          album_id       = excluded.album_id,
+          album_url      = excluded.album_url,
+          n_assets       = excluded.n_assets,
+          reused_existing = excluded.reused_existing,
+          last_synced_at = datetime('now')
+        """,
+        (int(cluster_id), album_id, album_url, int(n_assets), 1 if reused else 0),
+    )
+    conn.commit()
+
+
+def delete_cluster_album(
+    conn: sqlite3.Connection, cluster_id: int
+) -> bool:
+    """Drop the local mapping. Returns whether a row was removed. The
+    Immich-side album is left alone; the caller decides whether to also
+    call ImmichClient.delete_album() (delete_in_immich=true)."""
+    cur = conn.execute(
+        "DELETE FROM cluster_albums WHERE cluster_id = ?",
+        (int(cluster_id),),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def list_cluster_albums(conn: sqlite3.Connection) -> list[dict]:
+    """Every mapping, joined with cluster_names so the UI can render
+    "Album for Saguaro (17)" without a second round-trip."""
+    rows = conn.execute(
+        """
+        SELECT ca.cluster_id, ca.album_id, ca.album_url, ca.n_assets,
+               ca.reused_existing, ca.created_at, ca.last_synced_at,
+               cn.name AS cluster_name
+        FROM cluster_albums ca
+        LEFT JOIN cluster_names cn ON cn.cluster_id = ca.cluster_id
+        ORDER BY ca.cluster_id ASC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_assets_in_cluster(
+    conn: sqlite3.Connection, cluster_id: int
+) -> list[str]:
+    """Asset_ids belonging to a cluster, in alphabetical order (stable
+    for bulk-add idempotency). Used by the per-cluster album sync
+    worker to drive PUT /api/albums/{id}/assets."""
+    rows = conn.execute(
+        """
+        SELECT asset_id FROM assets
+        WHERE cluster_id = ?
+        ORDER BY asset_id ASC
+        """,
+        (int(cluster_id),),
+    ).fetchall()
+    return [r["asset_id"] for r in rows]
+
+
+def count_assets_in_cluster(
+    conn: sqlite3.Connection, cluster_id: int
+) -> int:
+    """SQL COUNT(*) variant. Cheap; used by the per-cluster sync
+    preview endpoint."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM assets WHERE cluster_id = ?",
+        (int(cluster_id),),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+# ---------- kingdom helpers ----------------------------------------------
+# Kingdom-parameterized versions of the Plantae-specific helpers that
+# already exist (find_plantae_assets, get_album_meta). The kingdom
+# parameter is bound to taxon_name in taxon_scores. The old Plantae
+# functions become thin shims that delegate here.
+
+
+def find_kingdom_assets(
+    conn: sqlite3.Connection, *, kingdom: str, min_score: float
+) -> list[str]:
+    """Distinct asset_ids whose kingdom-rank score for `kingdom` is at
+    least `min_score`. Mirrors the green-leg threshold on the card grid
+    but parameterized by kingdom (Plantae / Fungi / Animalia / ...)."""
+    rows = conn.execute(
+        """
+        SELECT DISTINCT asset_id
+        FROM taxon_scores
+        WHERE rank = 'kingdom' AND taxon_name = ? AND score >= ?
+        """,
+        (kingdom, float(min_score)),
+    ).fetchall()
+    return [r["asset_id"] for r in rows]
+
+
+def count_kingdom_assets(
+    conn: sqlite3.Connection, *, kingdom: str, min_score: float
+) -> int:
+    """Count-only variant of find_kingdom_assets for the preview
+    endpoint (avoids materializing the asset_id list)."""
+    row = conn.execute(
+        """
+        SELECT COUNT(DISTINCT asset_id) AS n
+        FROM taxon_scores
+        WHERE rank = 'kingdom' AND taxon_name = ? AND score >= ?
+        """,
+        (kingdom, float(min_score)),
+    ).fetchone()
+    return int(row["n"]) if row else 0
+
+
+def get_kingdom_album_meta(
+    conn: sqlite3.Connection, kingdom: str
+) -> dict | None:
+    """Read album_meta by kingdom name. Backed by the existing
+    album_meta table (key = kingdom name)."""
+    return get_album_meta(conn, kingdom)
+
+
+def set_kingdom_album_meta(
+    conn: sqlite3.Connection, kingdom: str, value: dict
+) -> None:
+    """Write album_meta by kingdom name."""
+    set_album_meta(conn, kingdom, value)
+
+
 # ---------- embeddings ---------------------------------------------------
 
 
@@ -938,19 +1287,11 @@ def fetch_taxon_scores(
 
 
 def find_plantae_assets(conn: sqlite3.Connection, *, min_score: float) -> list[str]:
-    """Return distinct asset_ids whose Plantae kingdom-rank score is at
-    least `min_score`. Used by the Plants-album feature to drive an Immich
-    bulk-add. Mirrors the green-leg threshold on the card grid.
-    """
-    rows = conn.execute(
-        """
-        SELECT DISTINCT asset_id
-        FROM taxon_scores
-        WHERE rank = 'kingdom' AND taxon_name = 'Plantae' AND score >= ?
-        """,
-        (min_score,),
-    ).fetchall()
-    return [r["asset_id"] for r in rows]
+    """Backward-compat shim — delegates to find_kingdom_assets with
+    kingdom='Plantae'. Used by the existing Plants-album feature;
+    new code should call find_kingdom_assets directly so it works for
+    any kingdom (Fungi / Animalia / ...)."""
+    return find_kingdom_assets(conn, kingdom="Plantae", min_score=min_score)
 
 
 # ---------- runs --------------------------------------------------------

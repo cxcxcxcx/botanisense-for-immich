@@ -6,26 +6,66 @@ to a dot product. HDBSCAN handles non-spherical clusters and varying
 densities better than k-means on small N (10s–1000s), and doesn't require
 specifying K up front.
 
-Noise label: HDBSCAN assigns label -1 to points it considers outliers (not
-in any cluster). We preserve that as cluster_id = -1 so the UI can show
-"outliers (N)" as a distinct pill.
+Incremental clustering (this module)
+------------------------------------
+HDBSCAN is fundamentally batch — its mutual-reachability graph +
+single-linkage dendrogram depend on every point at once, so the library
+exposes no incremental API. We work around it with two paths:
 
-`compute_clusters()` returns `{asset_id: cluster_id}` and the number of
-clusters actually produced (excluding noise). The caller persists
-cluster_id onto each asset and the run row.
+  - **Incremental assign** (`assign_new_points`): load the trained
+    clusterer we pickled last time and call
+    `clusterer.approximate_predict(new_vectors)`. This uses the existing
+    condensed tree to figure out which existing cluster (or noise) a new
+    point would land in, without rebuilding K-NN. ~1 ms per new point.
+
+  - **Full refit + Hungarian remap** (`refit_with_remap`): every time the
+    corpus grows by `growth_threshold_pct` (default 10%), or when the
+    user hits "Force refit", we re-fit HDBSCAN on every embedded asset.
+    To keep cluster IDs stable across refits, we build a membership-
+    overlap matrix between OLD and NEW clusters, run scipy's Hungarian
+    algorithm to find the optimal pairing (max overlap), and reassign
+    the new raw labels so matched pairs keep their old IDs. Unmatched
+    new clusters get fresh IDs appended after the highest old ID; the
+    audit trail lands in the `cluster_remap` table.
+
+Noise label: HDBSCAN assigns -1 to points it considers outliers. In the
+DB we remap -1 to the highest positive cluster_id so it sorts last in
+the UI (existing convention). `assign_new_points` does the same remap
+via the `label_map` persisted alongside the clusterer.
+
+Public surface (used by pipeline.py / app.py):
+  - `should_refit(conn, *, growth_threshold_pct=0.10) -> bool`
+  - `assign_new_points(conn, *, new_asset_ids, new_vectors) -> dict | None`
+  - `refit_with_remap(conn, *, growth_threshold_pct=0.10) -> tuple`
+  - `save_clusterer(conn, clusterer, *, ...) -> None`
+  - `load_clusterer(conn) -> tuple[hdbscan.HDBSCAN, dict] | None`
+  - `get_min_cluster_size(n) -> int`  (utility, also exposed)
 """
 
 from __future__ import annotations
 
+import logging
+import pickle
 import sqlite3
+from typing import Iterable
 
 import hdbscan
 import numpy as np
+from hdbscan import approximate_predict
+from scipy.optimize import linear_sum_assignment
 
 import storage
 
+_log = logging.getLogger("clusters")
+if not _log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+    _log.addHandler(_h)
+    _log.setLevel(logging.INFO)
+    _log.propagate = False
 
-def _min_cluster_size(n: int) -> int:
+
+def get_min_cluster_size(n: int) -> int:
     """Pick min_cluster_size as a small fraction of N, with sensible bounds.
 
     For small N (< 10) we fall back to k-means style behaviour (each point
@@ -38,49 +78,395 @@ def _min_cluster_size(n: int) -> int:
     return max(2, min(5, max(2, n // 6)))
 
 
-def compute_clusters(
-    conn: sqlite3.Connection, *, min_cluster_size: int | None = None
-) -> tuple[dict[str, int], int]:
-    """Re-cluster every embedded asset. Returns `{asset_id: cluster_id}`
-    and the number of clusters actually produced (excluding noise label -1).
+# Backward-compat alias. Kept so any caller that imported the private name
+# still resolves; new code should call get_min_cluster_size.
+_min_cluster_size = get_min_cluster_size
+
+
+# ---------- clusterer persistence ---------------------------------------
+
+
+def save_clusterer(
+    conn: sqlite3.Connection,
+    clusterer: "hdbscan.HDBSCAN",
+    *,
+    min_cluster_size: int,
+    n_assets_at_fit: int,
+    n_clusters: int,
+    label_map: dict[int, int],
+) -> None:
+    """Persist the trained clusterer + the raw-label -> stable-id map.
+
+    The blob is pickled as a dict {"clusterer": ..., "label_map": ...}
+    so subsequent `load_clusterer` calls can recover both. The label_map
+    is what `assign_new_points` uses to translate approximate_predict's
+    raw HDBSCAN labels back into the user-facing stable integer space.
     """
+    payload = {"clusterer": clusterer, "label_map": dict(label_map)}
+    blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+    storage.save_clusterer_state(
+        conn,
+        clusterer_blob=blob,
+        min_cluster_size=int(min_cluster_size),
+        n_assets_at_fit=int(n_assets_at_fit),
+        n_clusters=int(n_clusters),
+    )
+
+
+def load_clusterer(
+    conn: sqlite3.Connection,
+) -> tuple["hdbscan.HDBSCAN", dict[int, int]] | None:
+    """Return (clusterer, label_map) or None if no clusterer has been fit
+    yet (fresh DB) or if the pickled blob fails to unpickle (e.g., HDBSCAN
+    version mismatch).
+
+    On unpickle failure we clear the state row so the caller can fall
+    back to a full refit without infinite retry.
+    """
+    state = storage.get_clusterer_state(conn)
+    if state is None:
+        return None
+    try:
+        payload = pickle.loads(state["clusterer_blob"])
+        # Backward compat: legacy blobs (pre-label_map) only carry the
+        # raw clusterer; treat them as "no incremental path available".
+        if not isinstance(payload, dict) or "clusterer" not in payload:
+            _log.warning("[clusters] legacy clusterer blob has no metadata; clearing")
+            storage.clear_clusterer_state(conn)
+            return None
+        return payload["clusterer"], dict(payload.get("label_map") or {})
+    except Exception as e:
+        _log.warning(
+            f"[clusters] unpickle failed ({type(e).__name__}: {e}); "
+            "clearing state so the next call falls back to a full refit"
+        )
+        storage.clear_clusterer_state(conn)
+        return None
+
+
+# ---------- refit trigger -------------------------------------------------
+
+
+def should_refit(
+    conn: sqlite3.Connection, *, growth_threshold_pct: float = 0.10
+) -> bool:
+    """Return True when the corpus has grown enough since the last fit
+    to warrant a full refit (default: 10%). Always True on a fresh DB
+    (no clusterer_state row) so the first refit happens unconditionally.
+    """
+    state = storage.get_clusterer_state(conn)
+    if state is None:
+        return True  # First fit; no clusterer persisted yet.
+    n_at_fit = state["n_assets_at_fit"]
+    if n_at_fit <= 0:
+        return True
+    # "Current N" = number of distinct embedded assets. We don't want to
+    # force a refit just because someone re-uploaded the same image.
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT asset_id) AS n FROM embeddings"
+    ).fetchone()
+    n_current = int(row["n"]) if row else 0
+    growth = (n_current - n_at_fit) / n_at_fit
+    return growth >= growth_threshold_pct
+
+
+# ---------- incremental assign -------------------------------------------
+
+
+def assign_new_points(
+    conn: sqlite3.Connection,
+    *,
+    new_asset_ids: list[str],
+    new_vectors: np.ndarray,
+) -> dict[str, int] | None:
+    """Assign cluster labels to new points using the persisted clusterer.
+
+    Returns None when no clusterer is persisted yet (caller should refit
+    first). Otherwise returns {asset_id: stable_cluster_id} for every
+    new_asset_id. New clusters are NOT discovered here — approximate_predict
+    only emits labels from the training set, so a genuinely-novel group of
+    new photos will be marked noise (-1) until the next full refit
+    promotes them.
+
+    `new_vectors` must be (N, EMB_DIM) float32, L2-normalized, aligned
+    with `new_asset_ids`. Caller is responsible for normalization
+    (BioCLIP-2 already normalizes upstream).
+    """
+    loaded = load_clusterer(conn)
+    if loaded is None:
+        return None
+    clusterer, label_map = loaded
+    if not new_asset_ids:
+        return {}
+    if new_vectors.shape[0] != len(new_asset_ids):
+        raise ValueError(
+            f"new_vectors has {new_vectors.shape[0]} rows but "
+            f"new_asset_ids has {len(new_asset_ids)} entries"
+        )
+    if not label_map:
+        _log.warning(
+            "[clusters] persisted clusterer has no label_map; "
+            "falling back to full refit"
+        )
+        return None
+
+    raw_labels, _strengths = approximate_predict(clusterer, new_vectors)
+    out: dict[str, int] = {}
+    for aid, raw in zip(new_asset_ids, raw_labels):
+        raw_int = int(raw)
+        # If approximate_predict emits a raw label we don't recognize
+        # (shouldn't happen — it's bounded by the training set), fall
+        # back to noise via the persisted label_map[-1].
+        out[aid] = label_map.get(raw_int, label_map.get(-1, -1))
+    return out
+
+
+# ---------- full refit + Hungarian remap ---------------------------------
+
+
+def refit_with_remap(
+    conn: sqlite3.Connection, *, growth_threshold_pct: float = 0.10
+) -> tuple[dict[str, int], int, dict[int, int]]:
+    """Full HDBSCAN refit, then Hungarian-match new cluster IDs onto the
+    existing IDs to preserve stability.
+
+    Returns:
+      (final_asset_to_cluster, n_real_clusters, remap_new_to_stable)
+      where `remap_new_to_stable[raw_hdbscan_label] = stable_cluster_id`.
+
+    Steps:
+      1. Snapshot the current asset->cluster mapping from the DB.
+      2. Load every embedding and run HDBSCAN.
+      3. Build a membership-overlap matrix between OLD clusters (rows)
+         and NEW clusters (columns); -1 is included in both if present.
+      4. `scipy.optimize.linear_sum_assignment(-M)` to maximize overlap.
+      5. Build a remap so matched pairs keep their old IDs (and the
+         matched new cluster "becomes" the matched old one); unmatched
+         new clusters get fresh dense IDs starting at max(old) + 1.
+         Noise is forced to the highest ID (existing convention).
+      6. Persist the new mapping via storage.set_cluster_ids.
+      7. Save the clusterer + label_map via save_clusterer.
+      8. Append audit rows to cluster_remap.
+      9. Invalidate cluster_names so the next /api/clusters call
+         recomputes labels for any newly-renumbered clusters.
+
+    `growth_threshold_pct` is currently unused inside this function but
+    accepted for API symmetry with `should_refit`; the caller decides
+    whether to call refit at all.
+    """
+    del growth_threshold_pct  # API symmetry; see docstring.
+
     ids, matrix = storage.all_embeddings(conn)
     if matrix.size == 0:
-        return {}, 0
-    if min_cluster_size is None:
-        min_cluster_size = _min_cluster_size(len(ids))
+        storage.clear_clusterer_state(conn)
+        return {}, 0, {}
 
-    # HDBSCAN with cosine-friendly settings:
-    #   metric='euclidean' is fine because vectors are L2-normalized
-    #   (cosine sim = euclidean distance up to monotonic transform).
-    #   cluster_selection_method='eom' merges sibling leaves when the
-    #   parent branch is stable, giving species-level groupings instead
-    #   of sub-variant leaves. Switch to 'leaf' for finer-grained clusters.
+    n = len(ids)
+    mcs = get_min_cluster_size(n)
+
+    # Step 1: snapshot old mapping.
+    old_assets = storage.all_assets(conn)
+    old_mapping: dict[str, int] = {
+        r["asset_id"]: int(r["cluster_id"])
+        for r in old_assets
+        if r["cluster_id"] is not None
+    }
+    old_clusters: dict[int, set[str]] = {}
+    for aid, cid in old_mapping.items():
+        old_clusters.setdefault(cid, set()).add(aid)
+
+    # Step 2: fit HDBSCAN.
     clusterer = hdbscan.HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=max(1, min_cluster_size // 2),
+        min_cluster_size=mcs,
+        min_samples=max(1, mcs // 2),
         metric="euclidean",
         cluster_selection_method="eom",
         core_dist_n_jobs=1,
+        # prediction_data=True caches the minimum-spanning tree and
+        # condensed cluster tree alongside the fit, so a later
+        # approximate_predict() call can reuse them without retraining.
+        # ~10-20% slower fit, ~30% larger pickled blob — acceptable
+        # trade-off since we pickle once per refit and predict many times.
+        prediction_data=True,
     )
     raw_labels = clusterer.fit_predict(matrix)
+    raw_labels = np.asarray(raw_labels, dtype=np.int64)
 
-    # Remap noise (-1) and any negative labels into a 0-based dense range so
-    # the UI's cluster_id filter stays intuitive (no negative numbers).
-    unique = sorted(set(int(x) for x in raw_labels))
-    remap: dict[int, int] = {}
-    next_id = 0
-    for u in unique:
-        if u == -1:
-            # Push noise to the END so it's the last cluster_id in the UI.
+    # Step 3: build new_clusters.
+    new_clusters: dict[int, set[str]] = {}
+    for aid, raw in zip(ids, raw_labels):
+        new_clusters.setdefault(int(raw), set()).add(aid)
+
+    # Include noise in both views so the matrix is well-defined when
+    # one side has outliers and the other doesn't.
+    if -1 not in new_clusters:
+        new_clusters[-1] = set()
+
+    # Step 4: Hungarian on the overlap matrix.
+    old_ids_list = sorted(old_clusters.keys())  # sorted for determinism
+    new_ids_list = sorted(new_clusters.keys())
+    n_old = len(old_ids_list)
+    n_new = len(new_ids_list)
+    if n_old == 0 or n_new == 0:
+        # No old (first refit) or no new (degenerate) — skip matching,
+        # every new cluster gets a fresh dense ID.
+        row_ind = np.empty((0,), dtype=np.int64)
+        col_ind = np.empty((0,), dtype=np.int64)
+    else:
+        M = np.zeros((n_old, n_new), dtype=np.int64)
+        for i, oc in enumerate(old_ids_list):
+            oc_set = old_clusters[oc]
+            for j, nc in enumerate(new_ids_list):
+                M[i, j] = len(oc_set & new_clusters[nc])
+        row_ind, col_ind = linear_sum_assignment(-M)
+
+    # Step 5: build remap (new_id -> stable_id).
+    # Initially: matched pairs reuse old IDs. Unmatched new clusters get
+    # fresh IDs after max(old). Noise gets the highest dense ID.
+    matched_new_ids: set[int] = set()
+    matched_old_ids: set[int] = set()
+    new_to_matched_old: dict[int, list[int]] = {}
+    audit_rows: list[dict] = []
+
+    # Pre-compute fresh-ID counter.
+    max_old = max(old_clusters.keys()) if old_clusters else -1
+    next_id = max_old + 1
+
+    for r, c in zip(row_ind, col_ind):
+        oc = old_ids_list[int(r)]
+        nc = new_ids_list[int(c)]
+        ov = int(
+            len(old_clusters[oc] & new_clusters[nc])
+        )
+        if ov == 0:
+            # Hungarian sometimes pairs a 0-overlap pair just to fill the
+            # rectangular matrix; ignore those.
             continue
-        remap[u] = next_id
-        next_id += 1
-    if -1 in unique:
-        remap[-1] = next_id  # noise becomes the highest cluster_id
-    n_clusters = next((
-        len([k for k in remap if k != -1]) for _ in [None]
-    ), 0)
+        matched_new_ids.add(nc)
+        matched_old_ids.add(oc)
+        new_to_matched_old.setdefault(nc, []).append(oc)
+        union = len(old_clusters[oc] | new_clusters[nc]) or 1
+        audit_rows.append(
+            {
+                "old_cluster_id": int(oc),
+                "new_cluster_id": int(nc),
+                "overlap_count": ov,
+                "union_count": int(union),
+                "jaccard": float(ov / union),
+                "kind": "match",  # possibly upgraded to 'merge' below
+            }
+        )
 
-    mapping = {aid: remap[int(c)] for aid, c in zip(ids, raw_labels)}
-    return mapping, len({v for k, v in remap.items() if k != -1})
+    # Remap dict: new_id -> stable_id. Matched new clusters adopt the
+    # OLD id of their single-matched old cluster (no merging for now —
+    # we treat each old cluster's assets as belonging to the matched new
+    # cluster; if two old clusters land on the same new cluster, the
+    # smaller-overlap old is marked 'merge' in the audit and its assets
+    # are reassigned to the dominant new cluster's stable id below).
+    remap: dict[int, int] = {}
+    for nc, olds in new_to_matched_old.items():
+        if len(olds) == 1:
+            remap[nc] = int(olds[0])
+        else:
+            # Multiple old clusters matched to one new cluster: the
+            # largest-overlap old "wins" the stable id, the others are
+            # marked 'merge' in the audit (their assets will be moved
+            # into the winner's stable id by `final_mapping` below).
+            ranked = sorted(
+                olds,
+                key=lambda o: -len(old_clusters[o] & new_clusters[nc]),
+            )
+            winner = int(ranked[0])
+            remap[nc] = winner
+            for loser in ranked[1:]:
+                loser = int(loser)
+                for row in audit_rows:
+                    if (
+                        row["old_cluster_id"] == loser
+                        and row["new_cluster_id"] == nc
+                    ):
+                        row["kind"] = "merge"
+                        break
+
+    # Unmatched old clusters -> 'gone'. Their assets were either
+    # absorbed into another cluster (merge) or pushed to noise in the
+    # refit; we record them either way.
+    for oc in old_clusters.keys():
+        if oc not in matched_old_ids:
+            audit_rows.append(
+                {
+                    "old_cluster_id": int(oc),
+                    "new_cluster_id": int(oc),  # self-ref for visibility
+                    "overlap_count": 0,
+                    "union_count": len(old_clusters[oc]),
+                    "jaccard": 0.0,
+                    "kind": "gone",
+                }
+            )
+
+    # Unmatched new clusters -> 'new'. Assign fresh dense IDs. Noise
+    # always becomes the highest ID (existing convention).
+    for nc in new_clusters.keys():
+        if nc in matched_new_ids:
+            continue
+        if nc == -1:
+            # Noise gets the highest stable ID so it sorts last in the UI.
+            remap[nc] = next_id
+            next_id += 1
+        else:
+            remap[nc] = next_id
+            next_id += 1
+        audit_rows.append(
+            {
+                "old_cluster_id": -1,
+                "new_cluster_id": int(remap[nc]),
+                "overlap_count": 0,
+                "union_count": len(new_clusters[nc]),
+                "jaccard": 0.0,
+                "kind": "new",
+            }
+        )
+
+    # Step 6: build the final asset->stable_cluster_id mapping.
+    final_mapping: dict[str, int] = {}
+    for aid, raw in zip(ids, raw_labels):
+        raw_int = int(raw)
+        if raw_int in remap:
+            final_mapping[aid] = remap[raw_int]
+        else:
+            # Shouldn't happen — every raw label is in new_clusters.
+            # Fall back to noise (the highest stable ID, if remap has it).
+            final_mapping[aid] = remap.get(-1, max(remap.values(), default=-1))
+
+    n_real_clusters = len(
+        {v for v in final_mapping.values() if v != remap.get(-1, -1)}
+    )
+
+    # Persist mapping.
+    storage.set_cluster_ids(conn, asset_to_cluster=final_mapping)
+
+    # Step 7: save clusterer + label_map.
+    save_clusterer(
+        conn,
+        clusterer,
+        min_cluster_size=mcs,
+        n_assets_at_fit=n,
+        n_clusters=n_real_clusters,
+        label_map=remap,
+    )
+
+    # Step 8: audit trail.
+    storage.insert_cluster_remap(conn, audit_rows)
+
+    # Step 9: invalidate cached cluster names — the asset->cluster
+    # mapping shifted (even if some IDs survived, the membership inside
+    # any cluster may have changed).
+    storage.invalidate_cluster_names(conn)
+
+    _log.info(
+        f"[clusters] refit  n={n}  n_clusters={n_real_clusters}  "
+        f"matched={len(matched_new_ids)}  new={n_new - len(matched_new_ids)}  "
+        f"gone={len(old_clusters) - len(matched_old_ids)}"
+    )
+
+    return final_mapping, n_real_clusters, remap

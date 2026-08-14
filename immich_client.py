@@ -180,6 +180,36 @@ class ImmichClient:
         r.raise_for_status()
         return r.json()
 
+    def list_albums(self) -> list[dict]:
+        """GET /api/albums — list every album the API key has access to.
+
+        Returns a list of {id, albumName, ...} dicts. We don't paginate
+        (a personal Immich install typically has <100 albums) but if a
+        future user has more, callers can chain `paged_albums`. Used by
+        the Plants-album flow to find a pre-existing "Plantae
+        (BioCLIP)" album before creating a new one, so a deleted
+        album_meta row doesn't lead to a duplicate album.
+        """
+        r = self._client.get("/api/albums")
+        r.raise_for_status()
+        data = r.json()
+        # Immich returns either a bare list or a {albums: [...], total: N}
+        # paged envelope depending on version; handle both.
+        if isinstance(data, dict):
+            return list(data.get("albums") or [])
+        return list(data)
+
+    def find_album_by_name(self, name: str) -> dict | None:
+        """Convenience: return the first album whose `albumName` exactly
+        matches `name`, or None. Match is case-sensitive and exact — we
+        own the album name, so we don't want to silently merge into an
+        unrelated album the user renamed.
+        """
+        for a in self.list_albums():
+            if a.get("albumName") == name:
+                return a
+        return None
+
     def add_assets_to_album(
         self, *, album_id: str, asset_ids: list[str]
     ) -> dict:
@@ -205,6 +235,13 @@ class ImmichClient:
         r = self._client.get(f"/api/albums/{album_id}")
         r.raise_for_status()
         return r.json()
+
+    def delete_album(self, *, album_id: str) -> None:
+        """DELETE /api/albums/{id}. Raises httpx.HTTPStatusError on
+        non-2xx; callers should handle 404 as a no-op (idempotent delete
+        — the album was already gone before this call)."""
+        r = self._client.delete(f"/api/albums/{album_id}")
+        r.raise_for_status()
 
     def close(self) -> None:
         self._client.close()

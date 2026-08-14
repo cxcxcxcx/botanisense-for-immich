@@ -2,6 +2,7 @@
 import { state } from './state.js';
 import { escapeHtml, safeFetch } from './utils.js';
 import { loadResults } from './results.js';
+import { renderClusterAlbumControls } from './cluster-albums.js';
 
 // Compute taxonomy pill data from the current results, OR fall back
 // to /api/clusters when grouping by cluster (HDBSCAN labels are global).
@@ -43,6 +44,7 @@ export async function loadClusterBar() {
           const v = el.getAttribute('data-cluster');
           state.currentGroupFilter = v === '' ? null : Number(v);
           loadClusterBar();
+          renderClusterAlbumControls();
           loadResults({page: 0, refreshPills: false, filter: {cluster_id: state.currentGroupFilter}});
         });
       });

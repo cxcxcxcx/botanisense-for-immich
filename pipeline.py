@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import gc
 import logging
+import os
+import sqlite3
 import tempfile
 import time
 from collections import defaultdict
@@ -66,6 +68,12 @@ def __getattr__(name: str):  # PEP 562
 
 THUMBNAIL_SIZE = "preview"
 DEFAULT_BATCH_SIZE = 16
+# Fractional growth in the embedded-asset count that triggers a full
+# HDBSCAN refit (vs. incremental assignment for new points only).
+# 0.10 = "refit when N grows by 10% since the last fit". Override with
+# the GROWTH_THRESHOLD_PCT env var; set to 0.0 to force a refit every
+# run, or to a very large value to effectively disable refits.
+GROWTH_THRESHOLD_PCT = float(os.environ.get("GROWTH_THRESHOLD_PCT", "0.10"))
 # YOLO bboxes with score >= this are cropped and re-classified with
 # BioCLIP so we can see if a tight crop gets a higher-confidence species
 # than the full image. Lower = more crops = more BioCLIP work.
@@ -318,6 +326,46 @@ class RunResult:
 def _chunks(items: list, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
+
+def _load_vectors(
+    conn: sqlite3.Connection, asset_ids: list[str]
+) -> np.ndarray:
+    """Fetch the BioCLIP embeddings for the given asset_ids, returned as
+    a (N, EMB_DIM) float32 contiguous array aligned with asset_ids.
+
+    Order matches asset_ids exactly. We don't assume the DB rows come
+    back in any particular order — we index by position so the caller
+    can zip the result with the input list.
+
+    Used by the cluster stage in `run_pipeline` to feed
+    clusters.assign_new_points() after the species embeddings have been
+    written for this run's new assets.
+    """
+    import storage as _storage
+
+    if not asset_ids:
+        return np.empty((0, 0), dtype="<f4")
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"""
+        SELECT asset_id, vector FROM embeddings
+        WHERE asset_id IN ({placeholders})
+        """,
+        asset_ids,
+    ).fetchall()
+    by_id = {
+        r["asset_id"]: np.frombuffer(r["vector"], dtype="<f4").copy()
+        for r in rows
+    }
+    # Re-order to match asset_ids. Missing (shouldn't happen) become zeros.
+    dim = next(iter(by_id.values())).shape[0] if by_id else 0
+    out = np.zeros((len(asset_ids), dim), dtype="<f4")
+    for i, aid in enumerate(asset_ids):
+        v = by_id.get(aid)
+        if v is not None:
+            out[i] = v
+    return np.ascontiguousarray(out)
 
 
 def _group_predictions(rows: list[dict], k: int) -> dict[str, list[dict]]:
@@ -910,14 +958,92 @@ def run_pipeline(
                 )
                 _stage_end("species")
 
-            # ---- Clustering: re-fit across all embedded assets ----
-            _log.info("[cluster] re-clustering with HDBSCAN on all embedded assets")
+            # ---- Clustering: incremental assign + conditional refit ----
+            # Strategy B: when a trained clusterer is persisted, do the
+            # fast path (approximate_predict on newly-embedded vectors);
+            # only when the corpus has grown by GROWTH_THRESHOLD_PCT since
+            # the last fit do we pay the full refit + Hungarian remap.
+            # cluster_names / _results_cache / near-dup caches are
+            # invalidated by `_run_and_store` after this function returns,
+            # so we don't bother here.
             _stage_begin("cluster")
             cluster_t0 = time.monotonic()
-            asset_to_cluster, n_clusters = _clusters.compute_clusters(conn)
-            storage.set_cluster_ids(conn, asset_to_cluster=asset_to_cluster)
+            newly_embedded_ids: list[str] = [a.id for a, _p in needs_bioclip]
+            asset_to_cluster: dict[str, int] = {}
+            n_clusters = 0
+            refit_done = False
+
+            clusterer_loaded = _clusters.load_clusterer(conn)
+            if clusterer_loaded is not None and newly_embedded_ids:
+                try:
+                    new_vectors = _load_vectors(conn, newly_embedded_ids)
+                    assign = _clusters.assign_new_points(
+                        conn,
+                        new_asset_ids=newly_embedded_ids,
+                        new_vectors=new_vectors,
+                    )
+                    if assign is not None:
+                        asset_to_cluster = assign
+                except Exception as e:
+                    _log.warning(
+                        f"[cluster] incremental assign failed: {type(e).__name__}: {e}; "
+                        "falling back to refit"
+                    )
+                    clusterer_loaded = None
+
+            needs_refit = (
+                clusterer_loaded is None
+                or _clusters.should_refit(
+                    conn, growth_threshold_pct=GROWTH_THRESHOLD_PCT
+                )
+            )
+
+            if needs_refit:
+                _log.info(
+                    f"[cluster] full refit "
+                    f"(growth > {GROWTH_THRESHOLD_PCT:.0%} since last fit "
+                    f"or no prior clusterer)"
+                )
+                asset_to_cluster, n_clusters, _remap = _clusters.refit_with_remap(
+                    conn, growth_threshold_pct=GROWTH_THRESHOLD_PCT
+                )
+                refit_done = True
+            elif asset_to_cluster:
+                # Incremental path produced new assignments only; the
+                # full mapping (old + new) already lives in assets.cluster_id.
+                # Compute n_clusters from the DB rather than scanning just
+                # the new points.
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT cluster_id) AS n "
+                    "FROM assets WHERE cluster_id IS NOT NULL AND cluster_id != -1"
+                ).fetchone()
+                n_clusters = int(row["n"]) if row else 0
+                _log.info(
+                    f"[cluster] incremental assign: {len(asset_to_cluster)} new points, "
+                    f"no refit needed"
+                )
+            else:
+                # Edge case: no new embeddings AND no refit. Pull n_clusters
+                # from the DB so the runs.n_clusters column stays sane.
+                row = conn.execute(
+                    "SELECT COUNT(DISTINCT cluster_id) AS n "
+                    "FROM assets WHERE cluster_id IS NOT NULL AND cluster_id != -1"
+                ).fetchone()
+                n_clusters = int(row["n"]) if row else 0
+                _log.info(
+                    f"[cluster] no-op: no new points, growth under threshold"
+                )
+
+            # set_cluster_ids is a no-op when asset_to_cluster is empty
+            # (e.g. cache-hit re-run with no new embeddings). It also
+            # wouldn't hurt on the refit path — refit_with_remap already
+            # wrote the full mapping — but skipping it saves a write.
+            if asset_to_cluster and not refit_done:
+                storage.set_cluster_ids(conn, asset_to_cluster=asset_to_cluster)
+
             _log.info(
                 f"[cluster] done  n_clusters={n_clusters}  "
+                f"refit={refit_done}  "
                 f"elapsed={_fmt_eta(time.monotonic() - cluster_t0)}"
             )
             _stage_end("cluster")

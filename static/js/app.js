@@ -12,6 +12,8 @@ import { wireSortGroup } from './sortgroup.js';
 import { wireDelegatedHandlers } from './handlers.js';
 import { wireReclassifyVisible } from './reclassify.js';
 import { wirePlantsBtn, refreshPlantsStatus } from './plants.js';
+import { wireFungiBtn, refreshFungiStatus } from './fungi.js';
+import { wireClusterAlbumBar, wireSyncAllClustersBtn, loadClusterAlbums, renderClusterAlbumControls } from './cluster-albums.js';
 import './modal.js';   // exports openDetailModal + closeDetailModal; no module-level wiring (handlers.js calls it)
 
 wireClusterSearch();
@@ -20,6 +22,9 @@ wireParams();
 wireSortGroup();
 wireReclassifyVisible();
 wirePlantsBtn();
+wireFungiBtn();
+wireSyncAllClustersBtn();
+wireClusterAlbumBar();
 wireDelegatedHandlers();
 
 (async () => {
@@ -28,6 +33,8 @@ wireDelegatedHandlers();
   await pollStatus();
   await loadResults();
   await refreshPlantsStatus();
+  await refreshFungiStatus();
+  await loadClusterAlbums();
 })();
 
 setInterval(pollStatus, 1000);
