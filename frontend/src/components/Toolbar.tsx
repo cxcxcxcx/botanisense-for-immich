@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useFilters, type GroupBy, type SortMode } from '../state/AppContext';
+import { useApp, useFilters, type GroupBy, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { useDebounce } from '../hooks/useDebounce';
 import { FilterCards } from './FilterCards';
@@ -13,6 +13,7 @@ const GROUP_BY_CARDS: { value: GroupBy; label: string }[] = [
 
 export function Toolbar() {
   const filters = useFilters();
+  const { state } = useApp();
   const setFilters = useUrlFilters();
   const debouncedQ = useDebounce(filters.q, 300);
   const [q, setQ] = useState(filters.q);
@@ -26,34 +27,43 @@ export function Toolbar() {
     }
   }, [debouncedQ, filters.q, setFilters]);
 
+  // When a filter is active and FilterCards is showing only the
+  // collapsed active-bar, hide the group-by card row too — the
+  // active-bar already carries the cluster/taxon identity, so
+  // showing "cluster" highlighted AND a cluster active-bar at the
+  // same time reads as a duplicate.
+  const collapsed = state.filtersCollapsed;
+
   return (
     <form className="toolbar" onSubmit={e => e.preventDefault()}>
-      <fieldset role="group" className="toolbar-fieldset">
-        <div className="group-by-cards" role="radiogroup" aria-label="Group by">
-          {GROUP_BY_CARDS.map(g => (
-            <button
-              key={g.value}
-              type="button"
-              role="radio"
-              aria-checked={filters.group_by === g.value}
-              className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
-              onClick={() => setFilters({ group_by: g.value, page: 0 })}
+      {!collapsed && (
+        <fieldset role="group" className="toolbar-fieldset">
+          <div className="group-by-cards" role="radiogroup" aria-label="Group by">
+            {GROUP_BY_CARDS.map(g => (
+              <button
+                key={g.value}
+                type="button"
+                role="radio"
+                aria-checked={filters.group_by === g.value}
+                className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
+                onClick={() => setFilters({ group_by: g.value, page: 0 })}
+              >
+                {g.label}
+              </button>
+            ))}
+          </div>
+          <label className="toolbar-sort">sort
+            <select
+              value={filters.sort}
+              onChange={e => setFilters({ sort: e.target.value as SortMode })}
             >
-              {g.label}
-            </button>
-          ))}
-        </div>
-        <label className="toolbar-sort">sort
-          <select
-            value={filters.sort}
-            onChange={e => setFilters({ sort: e.target.value as SortMode })}
-          >
-            <option value="rank">search rank</option>
-            <option value="plantae">plantae confidence</option>
-            <option value="score">top-1 score</option>
-          </select>
-        </label>
-      </fieldset>
+              <option value="rank">search rank</option>
+              <option value="plantae">plantae confidence</option>
+              <option value="score">top-1 score</option>
+            </select>
+          </label>
+        </fieldset>
+      )}
       <FilterCards />
       <input
         type="search"
