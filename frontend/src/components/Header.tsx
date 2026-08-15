@@ -8,6 +8,7 @@ interface Props {
 }
 
 export function Header({ view }: Props) {
+  void navigate; // reserved for future header-level actions
   return (
     <header className="app-header">
       <div className="view-tabs" role="tablist" aria-label="View">
@@ -31,24 +32,10 @@ export function Header({ view }: Props) {
       <hgroup>
         <h1>Immich × BioCLIP</h1>
         <KnnPill />
-        <div className="header-buttons">
-          <button
-            type="button"
-            className="secondary outline header-btn"
-            onClick={() => navigate('run')}
-            title="Pipeline parameters"
-          >
-            ⚙ params
-          </button>
-          <button
-            type="button"
-            className="secondary outline header-btn"
-            onClick={() => navigate('run')}
-            title="Server logs"
-          >
-            📋 logs
-          </button>
-        </div>
+        {/* The pipeline params + server logs live inline on the Run
+            view (see App.tsx run-view section) — no header buttons
+            here. The browse view shouldn't surface pipeline chrome at
+            all; the Run tab in .view-tabs is how you get there. */}
       </hgroup>
       {/* Compact status on browse (just a badge + ETA), full status
           (with stage bar + legend) on run. LegendBar lives only on
