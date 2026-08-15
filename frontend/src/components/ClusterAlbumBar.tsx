@@ -1,0 +1,97 @@
+import { useEffect, useState } from 'react';
+import { listClusterAlbums, deleteClusterAlbum, previewClusterAlbum } from '../api/endpoints';
+import type { ClusterAlbumMapping } from '../api/types';
+import { useApp, useFilters } from '../state/AppContext';
+import { useToasts } from './ToastProvider';
+
+export function ClusterAlbumBar() {
+  const filters = useFilters();
+  const { dispatch } = useApp();
+  const push = useToasts();
+  const [albums, setAlbums] = useState<ClusterAlbumMapping[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  // Only render when a cluster pill is active.
+  if (filters.group_by !== 'cluster' || filters.cluster_id == null) return null;
+  const clusterId = filters.cluster_id;
+
+  useEffect(() => {
+    let cancelled = false;
+    listClusterAlbums()
+      .then(r => { if (!cancelled) setAlbums(r.albums); })
+      .catch(() => { /* leave null */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const album = albums?.find(a => a.cluster_id === clusterId) ?? null;
+  const [deleteRemote, setDeleteRemote] = useState(false);
+
+  const handleSync = async () => {
+    // Confirm via preview (avoid spawning jobs on a no-op cluster).
+    try {
+      const prev = await previewClusterAlbum(clusterId);
+      if (!prev.n_assets) {
+        push({ kind: 'info', message: `Cluster #${clusterId} has no assets` }, 3000);
+        return;
+      }
+      dispatch({ type: 'OPEN_JOB', kind: 'cluster', payload: { clusterId } });
+    } catch (e) {
+      push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!album) return;
+    if (!confirm(`Drop mapping for cluster #${clusterId}?`)) return;
+    setBusy(true);
+    try {
+      const r = await deleteClusterAlbum(clusterId, deleteRemote);
+      setAlbums(prev => (prev ?? []).filter(a => a.cluster_id !== clusterId));
+      push({
+        kind: 'success',
+        message: deleteRemote
+          ? 'Mapping dropped · Immich album deleted'
+              + (r.remote_deleted ? '' : ' (was already gone)')
+              : 'Mapping dropped',
+      }, 3000);
+    } catch (e) {
+      push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <nav className="cluster-album-bar">
+      <div className="cluster-album-controls">
+        <strong>Cluster #{clusterId}</strong>
+        {album ? (
+          <>
+            <span className="muted">Album:</span>
+            <a href={album.album_url} target="_blank" rel="noopener noreferrer">
+              {album.album_id.slice(0, 8)}…
+            </a>
+            <small className="muted">({album.n_assets} photos{album.reused_existing ? ', reused' : ''})</small>
+            <button type="button" className="secondary outline" onClick={handleSync}>↻ Re-sync</button>
+            <label className="muted" style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+              <input
+                type="checkbox"
+                checked={deleteRemote}
+                onChange={e => setDeleteRemote(e.target.checked)}
+              />
+              also delete in Immich
+            </label>
+            <button type="button" className="secondary outline" onClick={handleDelete} disabled={busy}>
+              Delete mapping
+            </button>
+          </>
+        ) : (
+          <>
+            <span className="muted">No Immich album yet.</span>
+            <button type="button" className="secondary outline" onClick={handleSync}>+ Sync this cluster as album</button>
+          </>
+        )}
+      </div>
+    </nav>
+  );
+}

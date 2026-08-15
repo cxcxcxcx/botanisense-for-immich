@@ -1,0 +1,207 @@
+// TS interfaces matching the JSON shapes from app.py. Names + nesting match
+// the backend 1:1 — when in doubt, copy the response of a curl against the
+// endpoint, don't guess.
+
+export interface Prediction {
+  species: string;
+  common_name: string | null;
+  score: number;
+  kingdom: string | null;
+  family: string | null;
+  genus: string | null;
+}
+
+export interface Detection {
+  id: number;
+  label: string;
+  score: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  bbox_predictions?: Prediction[];
+}
+
+export interface NearDup {
+  asset_id: string;
+  original_file_name: string | null;
+}
+
+export interface KnnNeighbor {
+  species: string;
+  common_name: string | null;
+  sim: number;
+}
+
+export interface KnnRow {
+  top_species: string;
+  common_name: string | null;
+  score: number;
+  kingdom: string | null;
+  family: string | null;
+  genus: string | null;
+  neighbors: KnnNeighbor[];
+  index_version: string;
+  k: number;
+  computed_at: string;
+}
+
+export interface ResultRow {
+  asset_id: string;
+  original_file_name: string;
+  original_url: string;
+  thumbnail_url: string;
+  cluster_id: number | null;
+  rank: number | null;
+  top_predictions: Prediction[];
+  taxon_scores: Record<string, number>;
+  detections: Detection[];
+  near_dups?: NearDup[];
+  knn?: KnnRow | null;
+}
+
+export interface Pagination {
+  page: number;
+  page_size: number;
+  total: number;
+  total_pages: number;
+}
+
+export interface TaxonomyEntry {
+  name: string;
+  n: number;
+}
+
+export interface Taxonomy {
+  species: TaxonomyEntry[];
+  genus: TaxonomyEntry[];
+  family: TaxonomyEntry[];
+}
+
+export interface ResultsResponse {
+  scope: 'all';
+  n_clusters: number;
+  plantae_green: number;
+  plantae_yellow: number;
+  results: ResultRow[];
+  pagination: Pagination;
+  taxonomy: Taxonomy;
+}
+
+export interface LibraryNeighbor {
+  asset_id: string;
+  original_file_name: string | null;
+  thumbnail_url: string;
+  cluster_id: number | null;
+  similarity: number;
+}
+
+export interface AssetDetail {
+  asset_id: string;
+  original_file_name: string;
+  original_url: string;
+  thumbnail_url: string;
+  cluster_id: number | null;
+  top_predictions: Prediction[];
+  taxon_scores: Record<string, number>;
+  detections: Detection[];
+  library_neighbors: LibraryNeighbor[];
+  knn: KnnRow | null;
+}
+
+export interface ClusterSummary {
+  cluster_id: number;
+  n: number;
+  name: string;
+  top_species: { species: string; common_name: string | null; count: number }[];
+  top_genus: { genus: string; count: number }[];
+}
+
+export interface ClustersResponse {
+  clusters: ClusterSummary[];
+}
+
+export interface KnnStatus {
+  inventory_dir: string;
+  index_built: boolean;
+  version: string | null;
+  n_rows: number;
+  dim: number;
+  by_kingdom: Record<string, number>;
+  k_default: number;
+  cached_assets: number;
+  cached_versions?: { index_version: string; k: number; n: number }[];
+}
+
+export interface PipelineStatus {
+  status: 'idle' | 'running' | 'done' | 'error';
+  stage: string | null;
+  chunk_idx: number | null;
+  chunk_total: number | null;
+  eta_seconds: number | null;
+  rate: number | null;
+  stage_times: Record<string, number>;
+  stage_t0: number | null;
+  last_error: string | null;
+}
+
+export interface JobPreview {
+  n_assets: number;
+  n_chunks?: number;
+  saved_album_id?: string | null;
+  cluster_id?: number;
+  kingdom?: string;
+  min_score?: number;
+}
+
+export interface JobStart {
+  job_id: string;
+  n_assets?: number;
+  n_chunks?: number;
+  saved_album_id?: string | null;
+  cluster_id?: number;
+  kingdom?: string;
+  min_score?: number;
+}
+
+export interface JobSnapshot {
+  status: 'running' | 'done' | 'error';
+  // Per-flow shape — concrete fields are read in JobPanel configs.
+  [k: string]: unknown;
+}
+
+export interface ClusterAlbumMapping {
+  cluster_id: number;
+  cluster_name: string;
+  album_id: string;
+  album_url: string;
+  n_assets: number;
+  reused_existing: boolean;
+  last_synced_at: string;
+}
+
+export interface PlantsAlbumStatus {
+  exists: boolean;
+  kingdom?: string;
+  album_id?: string;
+  album_url?: string;
+  n_assets?: number;
+  min_score?: number;
+}
+
+export interface ResultsQuery {
+  page?: number;
+  page_size?: number;
+  cluster_id?: number | undefined;
+  species?: string | undefined;
+  genus?: string | undefined;
+  family?: string | undefined;
+  [k: string]: string | number | undefined;
+}
+
+export interface RunParams {
+  query?: string | null;
+  n_samples?: number | null;
+  top_k?: number | null;
+  batch_size?: number | null;
+}

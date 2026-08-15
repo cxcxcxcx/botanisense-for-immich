@@ -26,10 +26,9 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
 import storage
@@ -77,9 +76,9 @@ KNN_K = int(os.environ.get("KNN_K", "10"))
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY missing in .env / environment")
 
-# Jinja2 templates for the HTMX-rendered HTML partials. The shell
-# (base.html) is served by GET /; everything below it is a fragment.
-templates = Jinja2Templates(directory="templates")
+# React SPA mount. After `npm run build` writes frontend/dist/, FastAPI
+# serves it at /. Dev mode uses Vite on :5173 with proxy → :8765.
+FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 storage.init_db(DB_PATH)
 # Persist pipeline logs to a file so the web UI can show them after the
@@ -331,7 +330,11 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Immich × BioCLIP", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Serve the React SPA at /. Only mounts when frontend/dist/ exists (i.e.
+# someone has run `npm run build`). The mount happens at the very end of
+# this file — AFTER all the @app.get/@app.post routes — so it doesn't
+# shadow them. See the block at the bottom.
 
 
 class RunParams(BaseModel):
@@ -1765,274 +1768,6 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
     )
 
 
-# ---- HTMX HTML partials --------------------------------------------------
-# The page shell (templates/base.html) is served by GET /. Sub-endpoints
-# return HTML fragments swapped into the DOM by HTMX.
-#
-# Important: ALL filter/pagination swaps target #grid-pane, NOT #root —
-# the toolbar lives outside #grid-pane so it survives every grid swap.
-
-def _grid_cache_key(
-    cluster_id, species, genus, family, sort: str | None
-) -> str:
-    return (
-        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:sort={sort or 'rank'}"
-        if any(v is not None for v in (cluster_id, species, genus, family))
-        else f"all:sort={sort or 'rank'}"
-    )
-
-
-def _ensure_results_cached(
-    cluster_id, species, genus, family, sort: str | None, cache_key: str
-) -> None:
-    with _results_lock:
-        if cache_key in _results_cache:
-            return
-    # Cache miss: build from SQLite. The 'sort' is applied client-side
-    # after the cache; we store unsorted so the same cache serves both.
-    with storage.connect(DB_PATH) as conn:
-        results, _total = storage.get_all_results(
-            conn, page=0, page_size=10_000_000,
-            cluster_id=cluster_id, species=species, genus=genus, family=family,
-        )
-        taxonomy = storage.get_global_taxonomy_summary(conn)
-    payload = {
-        "results": results,
-        "taxonomy": taxonomy,
-        "scope": "all",
-        "n_clusters": N_CLUSTERS_DEFAULT,
-        "plantae_green": PLANTAE_GREEN,
-        "plantae_yellow": PLANTAE_YELLOW,
-    }
-    with _results_lock:
-        if cache_key not in _results_cache:
-            _results_cache[cache_key] = payload
-
-
-def _apply_sort(results: list, sort: str) -> list:
-    if sort == "plantae":
-        return sorted(results, key=lambda r: (
-            -(r.get("taxon_scores") or {}).get("Plantae", -1)
-        ))
-    if sort == "score":
-        return sorted(results, key=lambda r: -(
-            (r.get("top_predictions") or [{}])[0].get("score", 0)
-        ))
-    return results  # rank = server order
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request) -> Response:
-    """Outer shell. Toolbar + grid-pane + modal + job-panel. Pills and
-    grid are HTMX-loaded by the page (hx-trigger=load once)."""
-    return templates.TemplateResponse(
-        request, "base.html",
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-def _int_or_none(v):
-    try:
-        return int(v) if v is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _filters_context(group_by, cluster_id, species, genus, family, q, sort):
-    """Build the context dict for _toolbar.html. Used by the /filters
-    endpoint so it renders identically across callers."""
-    entries = []
-    total_count = 0
-    active = None
-    if group_by == "cluster":
-        with storage.connect(DB_PATH) as conn:
-            rows = storage.cluster_summary(conn)
-            names = storage.ensure_cluster_names(conn)
-        for r in rows:
-            cid = r["cluster_id"]
-            info = names.get(cid, {})
-            entries.append({
-                "key": cid,
-                "label": info.get("name") or f"cluster #{cid}",
-                "count": r["n"],
-                "tooltip": info.get("name") or "",
-            })
-            total_count += r["n"]
-        active = cluster_id
-    else:
-        cache_key = _grid_cache_key(None, None, None, None, "rank")
-        _ensure_results_cached(None, None, None, None, "rank", cache_key)
-        with _results_lock:
-            cached = _results_cache.get(cache_key) or {}
-        tax = (cached.get("taxonomy") or {}).get(group_by) or []
-        for row in tax[:50]:
-            entries.append({
-                "key": row["name"], "label": row["name"],
-                "count": row["n"], "tooltip": row["name"],
-            })
-            total_count += row["n"]
-        active = {"species": species, "genus": genus, "family": family}.get(group_by)
-    qsuffix = ""
-    for k, v in (("q", q), ("sort", sort)):
-        if v is not None:
-            qsuffix += f"&{k}={v}"
-    return {
-        "entries": entries, "active": active, "group_by": group_by,
-        "total_count": total_count, "qsuffix": qsuffix,
-    }
-
-
-@app.get("/grid", response_class=HTMLResponse)
-async def grid_partial(
-    request: Request,
-    page: int = Query(default=0, ge=0),
-    page_size: int = Query(default=60, ge=1, le=300),
-    cluster_id: int | None = Query(default=None),
-    species: str | None = Query(default=None),
-    genus: str | None = Query(default=None),
-    family: str | None = Query(default=None),
-    group_by: str | None = Query(default=None),  # ignored by /grid itself
-    sort: str | None = Query(default=None),
-    q: str | None = Query(default=None),
-) -> Response:
-    """Photo grid + pagination. SWAP TARGET = #grid-pane (toolbar survives)."""
-    cache_key = _grid_cache_key(cluster_id, species, genus, family, sort)
-    _ensure_results_cached(cluster_id, species, genus, family, sort, cache_key)
-    with _results_lock:
-        cached = _results_cache.get(cache_key) or {}
-    all_results = cached.get("results", [])
-    all_results = _apply_sort(all_results, sort or "rank")
-    total = len(all_results)
-    start = page * page_size
-    end = start + page_size
-    pagination = {
-        "page": page,
-        "page_size": page_size,
-        "total": total,
-        "total_pages": (total + page_size - 1) // page_size if total else 0,
-    }
-    qsuffix = ""
-    for k, v in (("q", q), ("cluster_id", cluster_id), ("species", species),
-                  ("genus", genus), ("family", family), ("sort", sort)):
-        if v is not None:
-            qsuffix += f"&{k}={v}"
-    return templates.TemplateResponse(
-        request, "_grid.html",
-        {
-            "results": all_results[start:end],
-            "pagination": pagination,
-            "qsuffix": qsuffix,
-            "plantae_green": cached.get("plantae_green", PLANTAE_GREEN),
-            "plantae_yellow": cached.get("plantae_yellow", PLANTAE_YELLOW),
-        },
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/filters", response_class=HTMLResponse)
-async def filters_partial(
-    request: Request,
-    group_by: str = Query(default="cluster"),
-    cluster_id: int | None = Query(default=None),
-    species: str | None = Query(default=None),
-    genus: str | None = Query(default=None),
-    family: str | None = Query(default=None),
-    q: str | None = Query(default=None),
-) -> Response:
-    """Cluster / taxonomy pills. SWAP TARGET = #cluster-pills."""
-    return templates.TemplateResponse(
-        request, "_toolbar.html",
-        _filters_context(group_by, cluster_id, species, genus, family,
-                         q, request.query_params.get("sort") or "rank"),
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/asset/{asset_id}", response_class=HTMLResponse)
-async def asset_partial(request: Request, asset_id: str) -> Response:
-    """Modal body. SWAP TARGET = #modal-body."""
-    with storage.connect(DB_PATH) as conn:
-        row = conn.execute(
-            """SELECT asset_id, original_file_name, original_url,
-                      thumbnail_url, cluster_id
-               FROM assets WHERE asset_id = ?""",
-            (asset_id,),
-        ).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="asset not found")
-        asset = dict(row)
-        asset["top_predictions"] = storage.fetch_predictions(
-            conn, asset_id=asset_id, rank="species"
-        )
-        ts_map = storage.fetch_taxon_scores(
-            conn, asset_ids=[asset_id], rank="kingdom"
-        )
-        asset["taxon_scores"] = ts_map.get(asset_id) or {}
-        asset["detections"] = storage.fetch_detections(
-            conn, asset_id=asset_id, min_score=0.10, rank="species"
-        )
-        asset["library_neighbors"] = storage.find_library_neighbors(
-            conn, asset_id=asset_id, k=12
-        )
-        versions = storage.list_knn_versions(conn)
-        knn_payload = None
-        if versions:
-            top_version = max(versions, key=lambda v: v.get("n", 0))
-            knn_map = storage.fetch_knn_predictions(
-                conn, asset_ids=[asset_id],
-                index_version=top_version["index_version"],
-                k=top_version["k"],
-            )
-            if asset_id in knn_map:
-                knn_row = knn_map[asset_id]
-                knn_payload = {
-                    "top_species": knn_row["top_species"],
-                    "common_name": knn_row["common_name"],
-                    "score": knn_row["score"],
-                    "kingdom": knn_row["kingdom"],
-                    "family": knn_row["family"],
-                    "genus": knn_row["genus"],
-                    "neighbors": knn_row["neighbors"],
-                    "index_version": top_version["index_version"],
-                    "k": top_version["k"],
-                    "computed_at": knn_row["computed_at"],
-                }
-        asset["knn"] = knn_payload
-    return templates.TemplateResponse(
-        request, "_asset.html", {"asset": asset},
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
-@app.get("/cluster-album-controls", response_class=HTMLResponse)
-async def cluster_album_controls_partial(
-    request: Request,
-    cluster_id: int = Query(...),
-) -> Response:
-    """Per-cluster sync/delete UI. Loaded into #cluster-album-bar when a
-    cluster pill is clicked. Shows existing album chip OR sync button."""
-    album_row = None
-    cluster_name = f"cluster #{cluster_id}"
-    with storage.connect(DB_PATH) as conn:
-        row = storage.get_cluster_album(conn, cluster_id)
-        if row:
-            album_row = {
-                "album_id": row["album_id"],
-                "album_url": row["album_url"],
-                "n_assets": row["n_assets"],
-            }
-        # Human-readable name from cluster_names cache (same source as pills).
-        names = storage.ensure_cluster_names(conn)
-        info = names.get(cluster_id, {})
-        cluster_name = info.get("name") or cluster_name
-    return templates.TemplateResponse(
-        request, "_cluster_album_controls.html",
-        {"cluster_id": cluster_id, "album": album_row,
-         "cluster_name": cluster_name},
-        headers={"Cache-Control": "no-cache"},
-    )
-
-
 # ---- bbox-index reclassify (YOLO per-crop) -------------------------------
 # The /asset/.../modal page has a "Reclassify crop" button per detection
 # that posts {asset_id, bbox_index}. Currently we delegate to the
@@ -2058,7 +1793,7 @@ async def reclassify_bbox(params: ReclassifyBboxParams) -> dict:
 # ---- reclassify visible (bulk) -------------------------------------------
 # The legend-bar button posts here without args. We reclassify every asset
 # currently shown on the page, identified by asset_ids in the request body
-# (the JS reads them from #grid-pane). If the body is empty, we reclassify
+# (the JS reads them from #grid-pane). If the body is empty, we reclass
 # the current page's assets from a server-side cache lookup.
 
 class ReclassifyVisibleParams(BaseModel):
@@ -2069,24 +1804,27 @@ class ReclassifyVisibleParams(BaseModel):
 
 @app.post("/api/reclassify-visible")
 async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
+    """KNN reclassify every visible asset. The React frontend posts the
+    asset_ids it currently has rendered; we then spawn a worker thread
+    that runs the KNN reclassify for each one. If asset_ids is omitted,
+    we reclassify the first page of results from a fresh DB read.
+    """
+    ids: list[str]
     if params.asset_ids:
-        ids = params.asset_ids
+        ids = list(params.asset_ids)
     else:
-        # No IDs supplied — use the current first page of the default cache.
-        cache_key = _grid_cache_key(None, None, None, None, "rank")
-        _ensure_results_cached(None, None, None, None, "rank", cache_key)
-        with _results_lock:
-            cached = _results_cache.get(cache_key) or {}
-        ids = [r["asset_id"] for r in (cached.get("results") or [])[:60]]
+        # No IDs supplied — pull the first page from a fresh DB read.
+        with storage.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT asset_id FROM assets ORDER BY rowid LIMIT 60"
+            ).fetchall()
+        ids = [r["asset_id"] for r in rows]
     if not ids:
         return {"queued": 0}
-    # Spawn a thread that runs reclassify for each id.
     import threading
     def _worker():
         for aid in ids:
             try:
-                with storage.connect(DB_PATH) as conn:
-                    storage.fetch_predictions(conn, asset_id=aid)
                 # KNN reclassify runs via the existing pipeline helper.
                 from pipeline import run_knn_reclassify
                 run_knn_reclassify([aid])
@@ -2094,6 +1832,21 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
                 pass
     threading.Thread(target=_worker, daemon=True).start()
     return {"queued": len(ids)}
+
+
+# ---- SPA mount (LAST) ---------------------------------------------------
+# Mount the React build output. This must come after all @app routes so
+# the StaticFiles handler doesn't shadow /api/* or /thumb/*. `html=True`
+# makes it serve index.html for any unknown extensionless path so deep
+# links (?cluster_id=5&page=2) work on reload.
+if FRONTEND_DIST.exists():
+    @app.get("/", include_in_schema=False)
+    async def spa_root() -> FileResponse:
+        return FileResponse(FRONTEND_DIST / "index.html",
+                            headers={"Cache-Control": "no-cache"})
+
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True),
+              name="frontend")
 
 
 if __name__ == "__main__":

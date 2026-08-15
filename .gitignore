@@ -18,3 +18,7 @@ lock_wal.db
 .vscode/
 .idea/
 .DS_Store
+
+# React frontend (Vite)
+frontend/node_modules/
+frontend/dist/
