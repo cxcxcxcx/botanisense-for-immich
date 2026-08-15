@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useFilters, type GroupBy, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { useDebounce } from '../hooks/useDebounce';
@@ -10,10 +10,14 @@ export function Toolbar() {
   const debouncedQ = useDebounce(filters.q, 300);
   const [q, setQ] = useState(filters.q);
 
-  // Push debounced q into the URL state.
-  if (debouncedQ !== filters.q) {
-    setFilters({ q: debouncedQ, page: 0 });
-  }
+  // Push the debounced value into URL state. We use an effect (not a
+  // render-time setState) to avoid the "setState during render" warning
+  // and to batch the dispatch with any other pending state.
+  useEffect(() => {
+    if (debouncedQ !== filters.q) {
+      setFilters({ q: debouncedQ, page: 0 });
+    }
+  }, [debouncedQ, filters.q, setFilters]);
 
   return (
     <form className="toolbar" onSubmit={e => e.preventDefault()}>

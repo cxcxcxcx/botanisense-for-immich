@@ -8,12 +8,12 @@ export function ClusterAlbumBar() {
   const filters = useFilters();
   const { dispatch } = useApp();
   const push = useToasts();
+
+  // All hooks MUST be called unconditionally — early return would change
+  // the hook count between renders and React would throw #310.
   const [albums, setAlbums] = useState<ClusterAlbumMapping[] | null>(null);
   const [busy, setBusy] = useState(false);
-
-  // Only render when a cluster pill is active.
-  if (filters.group_by !== 'cluster' || filters.cluster_id == null) return null;
-  const clusterId = filters.cluster_id;
+  const [deleteRemote, setDeleteRemote] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -23,11 +23,13 @@ export function ClusterAlbumBar() {
     return () => { cancelled = true; };
   }, []);
 
+  // Render nothing when no cluster pill is active.
+  if (filters.group_by !== 'cluster' || filters.cluster_id == null) return null;
+  const clusterId = filters.cluster_id;
+
   const album = albums?.find(a => a.cluster_id === clusterId) ?? null;
-  const [deleteRemote, setDeleteRemote] = useState(false);
 
   const handleSync = async () => {
-    // Confirm via preview (avoid spawning jobs on a no-op cluster).
     try {
       const prev = await previewClusterAlbum(clusterId);
       if (!prev.n_assets) {
@@ -50,9 +52,9 @@ export function ClusterAlbumBar() {
       push({
         kind: 'success',
         message: deleteRemote
-          ? 'Mapping dropped · Immich album deleted'
-              + (r.remote_deleted ? '' : ' (was already gone)')
-              : 'Mapping dropped',
+        && r.remote_deleted ? 'Mapping dropped · Immich album deleted'
+          : deleteRemote ? 'Mapping dropped · (Immich album was already gone)'
+          : 'Mapping dropped',
       }, 3000);
     } catch (e) {
       push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
