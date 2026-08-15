@@ -133,18 +133,46 @@ nav.legend-bar, .legend-bar {
 .plantae-legend { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; }
 .plantae-legend .swatch { width: 8px; height: 8px; border-radius: 2px; }
 
-/* ---- Toolbar + pills ---- */
+/* ---- Toolbar + filter cards ---- */
 .toolbar {
   display: flex; flex-direction: column; gap: 0.5rem;
   padding: 0.5rem 1.5rem; border-bottom: 1px solid #2a2a2a;
 }
-.toolbar-fieldset { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: end;
-  border: 0; padding: 0; margin: 0; }
+.toolbar-fieldset {
+  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+  border: 0; padding: 0; margin: 0;
+}
+
+/* Group-by radio cards: choose the bucketing strategy (cluster /
+   species / genus / family). Same visual language as the filter
+   cards below but smaller and pill-shaped. */
+.group-by-cards {
+  display: inline-flex; gap: 4px; padding: 4px;
+  background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
+}
+.group-by-card {
+  background: transparent; color: #aaa; border: 1px solid transparent;
+  padding: 4px 12px; font-size: 0.8rem; border-radius: 6px; cursor: pointer;
+  font: inherit; text-transform: lowercase;
+}
+.group-by-card:hover { color: #fff; border-color: #444; }
+.group-by-card.active {
+  background: #2c8a4a; color: #fff; border-color: #5cc078;
+}
+
+.toolbar-sort { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; font-size: 0.8rem; }
 .toolbar select, .toolbar input[type=search] {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
   padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
 }
-.toolbar input[type=search] { min-width: 200px; }
+
+/* Filter search input — a sub-filter of the selected group_by, not a
+   primary selector. Smaller and below the cards. */
+.filter-search-input {
+  background: #1a1a1a; color: #eee; border: 1px solid #333;
+  padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
+  min-width: 200px; max-width: 320px;
+}
 
 /* ---- Filter cards (replaces cluster-pills) ----
    Each card is a square: photo fills it with label + count overlaid
@@ -226,6 +254,19 @@ nav.legend-bar, .legend-bar {
   font: 600 11px/1 ui-monospace, monospace;
   color: #ccc;
 }
+
+/* "All" card — the unfiltered-option card. Distinct placeholder
+   (gradient backdrop + asterisk glyph) so users can pick it out of
+   the grid at a glance. */
+.filter-card-all .thumb-all {
+  background: linear-gradient(135deg, #1a2a1a 0%, #142420 50%, #1a1a3a 100%);
+}
+.filter-card-all .placeholder-all {
+  font-size: 3rem; font-weight: 700;
+  color: #5cc078; opacity: 0.5;
+  text-shadow: 0 0 12px rgba(92, 192, 120, 0.4);
+}
+.filter-card-all.on .placeholder-all { opacity: 1; }
 
 /* The collapsed active-bar — single tile + meta + buttons. */
 .filter-active-bar {

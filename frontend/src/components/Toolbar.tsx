@@ -4,6 +4,13 @@ import { useUrlFilters } from '../hooks/useUrlFilters';
 import { useDebounce } from '../hooks/useDebounce';
 import { FilterCards } from './FilterCards';
 
+const GROUP_BY_CARDS: { value: GroupBy; label: string }[] = [
+  { value: 'cluster', label: 'cluster' },
+  { value: 'species', label: 'species' },
+  { value: 'genus', label: 'genus' },
+  { value: 'family', label: 'family' },
+];
+
 export function Toolbar() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
@@ -22,18 +29,21 @@ export function Toolbar() {
   return (
     <form className="toolbar" onSubmit={e => e.preventDefault()}>
       <fieldset role="group" className="toolbar-fieldset">
-        <label>group by
-          <select
-            value={filters.group_by}
-            onChange={e => setFilters({ group_by: e.target.value as GroupBy, page: 0 })}
-          >
-            <option value="species">species</option>
-            <option value="genus">genus</option>
-            <option value="family">family</option>
-            <option value="cluster">cluster (HDBSCAN)</option>
-          </select>
-        </label>
-        <label>sort
+        <div className="group-by-cards" role="radiogroup" aria-label="Group by">
+          {GROUP_BY_CARDS.map(g => (
+            <button
+              key={g.value}
+              type="button"
+              role="radio"
+              aria-checked={filters.group_by === g.value}
+              className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
+              onClick={() => setFilters({ group_by: g.value, page: 0 })}
+            >
+              {g.label}
+            </button>
+          ))}
+        </div>
+        <label className="toolbar-sort">sort
           <select
             value={filters.sort}
             onChange={e => setFilters({ sort: e.target.value as SortMode })}
@@ -43,15 +53,17 @@ export function Toolbar() {
             <option value="score">top-1 score</option>
           </select>
         </label>
-        <input
-          type="search"
-          placeholder="search filters…"
-          autoComplete="off"
-          value={q}
-          onChange={e => setQ(e.target.value)}
-        />
       </fieldset>
       <FilterCards />
+      <input
+        type="search"
+        className="filter-search-input"
+        placeholder="search filters…"
+        autoComplete="off"
+        value={q}
+        onChange={e => setQ(e.target.value)}
+        title="Filter the visible cards by name"
+      />
     </form>
   );
 }

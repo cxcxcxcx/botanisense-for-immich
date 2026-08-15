@@ -204,7 +204,7 @@ export function FilterCards() {
             className="secondary outline"
             onClick={toggleForceShow}
           >
-            show all {allCards.length} filters
+            show all {allCards.length + 1} filters
           </button>
         </div>
       </div>
@@ -223,14 +223,7 @@ export function FilterCards() {
             {SORTS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
           </select>
         </label>
-        <button
-          type="button"
-          className={`secondary outline filter-card-all-btn ${activeKey == null ? 'on' : ''}`}
-          onClick={clearFilter}
-        >
-          all ({total.toLocaleString()})
-        </button>
-        <span className="filter-count">{visibleCards.length} shown</span>
+        <span className="filter-count">{visibleCards.length} of {allCards.length} filters</span>
         {activeCard && (
           <button
             type="button"
@@ -243,6 +236,15 @@ export function FilterCards() {
       </div>
 
       <div className="filter-cards">
+        {/* "All" card: special — no thumbnail, no filter active, total
+            count of assets. Always shown first so the user sees it as
+            the "unfiltered" option. */}
+        <FilterAllCard
+          total={total}
+          groupBy={filters.group_by}
+          active={activeKey == null}
+          onClick={clearFilter}
+        />
         {stickyActive && (
           <FilterCardTile
             card={stickyActive}
@@ -278,6 +280,36 @@ interface TileProps {
   active: boolean;
   pinned?: boolean;
   onClick: () => void;
+}
+
+interface AllCardProps {
+  total: number;
+  groupBy: GroupBy;
+  active: boolean;
+  onClick: () => void;
+}
+
+// "All" card — special placeholder that represents the unfiltered
+// view. Always present so users have a one-click way to clear the
+// active filter without hunting for an "all" button. Visually a
+// card so it sits in the same grid as the rest.
+function FilterAllCard({ total, groupBy, active, onClick }: AllCardProps) {
+  return (
+    <button
+      type="button"
+      className={`filter-card filter-card-all ${active ? 'on' : ''}`}
+      onClick={onClick}
+      title={`Show all ${total.toLocaleString()} assets (clear ${groupBy} filter)`}
+    >
+      <div className="thumb thumb-all">
+        <span className="placeholder-all">∗</span>
+      </div>
+      <div className="overlay">
+        <span className="overlay-label">all</span>
+        <span className="overlay-count">{total.toLocaleString()}</span>
+      </div>
+    </button>
+  );
 }
 
 function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
