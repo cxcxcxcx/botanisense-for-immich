@@ -8,14 +8,25 @@ import { AssetDetail } from './components/AssetDetail';
 import { ParamsForm } from './components/ParamsForm';
 import { LogTail } from './components/LogTail';
 import { JobPanel } from './components/JobPanel';
-import { useApp, useModal } from './state/AppContext';
+import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute } from './hooks/useRoute';
 
 export function App() {
   const { dispatch } = useApp();
   const modal = useModal();
+  const filters = useFilters();
   const view = useRoute();
+
+  // Browse home: only filter cards. Once a cluster/taxon filter is
+  // active, swap to the photo grid with a back affordance. This keeps
+  // the first paint lightweight (no per-asset fetches) and lets the
+  // user choose what subset of photos to render.
+  const hasActiveFilter =
+    filters.cluster_id != null ||
+    !!filters.species ||
+    !!filters.genus ||
+    !!filters.family;
 
   // On mount, hydrate the reducer from URL (and fall back to localStorage).
   useEffect(() => {
@@ -65,11 +76,15 @@ export function App() {
       <Header view={view} />
       <main className={`app-main view-${view}`}>
         {view === 'browse' ? (
-          <>
+          hasActiveFilter ? (
+            <>
+              <Toolbar />
+              <ClusterAlbumBar />
+              <Grid />
+            </>
+          ) : (
             <Toolbar />
-            <ClusterAlbumBar />
-            <Grid />
-          </>
+          )
         ) : (
           <section className="run-view">
             <ParamsForm />

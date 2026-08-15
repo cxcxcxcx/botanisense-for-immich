@@ -303,6 +303,20 @@ nav.legend-bar, .legend-bar {
 /* ---- Grid + cards ---- */
 .grid-pane { padding: 1rem 1.5rem; }
 
+/* Slim row above the photo grid: a back-to-filters button (clears the
+   active cluster/taxon filter) plus a "showing X" reminder. The
+   FilterCards active-bar carries the same info, but a dedicated bar
+   here means the user can navigate back even after scrolling past it. */
+.grid-toolbar {
+  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+  padding: 0.25rem 0 0.75rem;
+  border-bottom: 1px solid #2a2a2a;
+  margin-bottom: 0.75rem;
+}
+.grid-toolbar .back-to-filters { font-size: 0.85rem; }
+.grid-active-label { color: #aaa; font-size: 0.85rem; }
+.grid-active-label strong { color: #eee; }
+
 .photo-grid {
   display: grid;
   /* Fixed 2-column grid for the photo browsing view — each card is
