@@ -11,6 +11,15 @@ const GROUP_BY_CARDS: { value: GroupBy; label: string }[] = [
   { value: 'family', label: 'family' },
 ];
 
+// Sort options for the photo grid. The label is the user-facing phrase;
+// the hint is shown beneath it (or in a tooltip on narrow screens) so
+// users understand what each sort actually does without trying it.
+const SORT_CARDS: { value: SortMode; label: string; hint: string }[] = [
+  { value: 'rank',    label: 'default',        hint: 'order returned by the server' },
+  { value: 'plantae', label: 'plants first',   hint: 'highest Plantae confidence on top' },
+  { value: 'score',   label: 'most confident', hint: 'highest BioCLIP top-1 score on top' },
+];
+
 export function Toolbar() {
   const filters = useFilters();
   const { state } = useApp();
@@ -28,52 +37,71 @@ export function Toolbar() {
   }, [debouncedQ, filters.q, setFilters]);
 
   // When a filter is active and FilterCards is showing only the
-  // collapsed active-bar, hide the group-by card row too — the
-  // active-bar already carries the cluster/taxon identity, so
-  // showing "cluster" highlighted AND a cluster active-bar at the
-  // same time reads as a duplicate.
+  // collapsed active-bar, hide the group-by card row + sort row too —
+  // the active-bar already carries the cluster/taxon identity, so
+  // showing the chrome at the same time reads as duplicate UI.
   const collapsed = state.filtersCollapsed;
 
   return (
     <form className="toolbar" onSubmit={e => e.preventDefault()}>
       {!collapsed && (
         <fieldset role="group" className="toolbar-fieldset">
-          <div className="group-by-cards" role="radiogroup" aria-label="Group by">
-            {GROUP_BY_CARDS.map(g => (
-              <button
-                key={g.value}
-                type="button"
-                role="radio"
-                aria-checked={filters.group_by === g.value}
-                className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
-                onClick={() => setFilters({ group_by: g.value, page: 0 })}
-              >
-                {g.label}
-              </button>
-            ))}
+          <div className="toolbar-control">
+            <div className="toolbar-control-label">group by</div>
+            <div className="group-by-cards" role="radiogroup" aria-label="Group by">
+              {GROUP_BY_CARDS.map(g => (
+                <button
+                  key={g.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={filters.group_by === g.value}
+                  className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
+                  onClick={() => setFilters({ group_by: g.value, page: 0 })}
+                  title={`Bucket photos by ${g.label}`}
+                >
+                  {g.label}
+                </button>
+              ))}
+            </div>
           </div>
-          <label className="toolbar-sort">sort
-            <select
-              value={filters.sort}
-              onChange={e => setFilters({ sort: e.target.value as SortMode })}
-            >
-              <option value="rank">search rank</option>
-              <option value="plantae">plantae confidence</option>
-              <option value="score">top-1 score</option>
-            </select>
-          </label>
+          <div className="toolbar-control">
+            <div className="toolbar-control-label">sort photos by</div>
+            <div className="sort-cards" role="radiogroup" aria-label="Sort photos by">
+              {SORT_CARDS.map(s => (
+                <button
+                  key={s.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={filters.sort === s.value}
+                  className={`sort-card ${filters.sort === s.value ? 'active' : ''}`}
+                  onClick={() => setFilters({ sort: s.value })}
+                  title={s.hint}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+          </div>
         </fieldset>
       )}
       <FilterCards />
-      <input
-        type="search"
-        className="filter-search-input"
-        placeholder="search filters…"
-        autoComplete="off"
-        value={q}
-        onChange={e => setQ(e.target.value)}
-        title="Filter the visible cards by name"
-      />
+      {!collapsed && (
+        <div className="filter-search-row">
+          <input
+            type="search"
+            className="filter-search-input"
+            placeholder="filter cards by name…"
+            autoComplete="off"
+            value={q}
+            onChange={e => setQ(e.target.value)}
+            title="Hide cards whose label doesn't match (sub-filter; doesn't change the active filter)"
+          />
+          <small className="filter-search-hint">
+            Filters the visible cards by name — your active {filters.group_by} filter is unchanged.
+            Use the ✕ on the active card or the <em>back to filters</em> button to clear it.
+          </small>
+        </div>
+      )}
     </form>
   );
 }

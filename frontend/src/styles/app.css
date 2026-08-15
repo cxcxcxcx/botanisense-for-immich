@@ -160,6 +160,33 @@ nav.legend-bar, .legend-bar {
   background: #2c8a4a; color: #fff; border-color: #5cc078;
 }
 
+/* Sort photo-grid radio cards: same shape as group-by but visually
+   distinct (slate accent) so the two strips don't read as a single
+   repeated control. Tooltip carries the explanation on hover. */
+.sort-cards {
+  display: inline-flex; gap: 4px; padding: 4px;
+  background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
+}
+.sort-card {
+  background: transparent; color: #aaa; border: 1px solid transparent;
+  padding: 4px 12px; font-size: 0.8rem; border-radius: 6px; cursor: pointer;
+  font: inherit;
+}
+.sort-card:hover { color: #fff; border-color: #444; }
+.sort-card.active {
+  background: #2a5a8a; color: #fff; border-color: #5c93c0;
+}
+
+/* Each toolbar row carries a tiny label above the controls so users
+   know which dimension they're picking without hovering. */
+.toolbar-control {
+  display: inline-flex; flex-direction: column; gap: 2px;
+}
+.toolbar-control-label {
+  font-size: 0.7rem; color: #888; padding-left: 6px;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+
 .toolbar-sort { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; font-size: 0.8rem; }
 .toolbar select, .toolbar input[type=search] {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
@@ -167,11 +194,24 @@ nav.legend-bar, .legend-bar {
 }
 
 /* Filter search input — a sub-filter of the selected group_by, not a
-   primary selector. Smaller and below the cards. */
+   primary selector. Smaller and below the cards. The hint line makes
+   the distinction explicit so users don't mistake it for a search
+   over all photos. */
+.filter-search-row {
+  display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center;
+  padding: 0.25rem 0 0.5rem;
+}
 .filter-search-input {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
   padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
   min-width: 200px; max-width: 320px;
+}
+.filter-search-hint {
+  color: #888; font-size: 0.75rem;
+  flex: 1 1 200px;
+}
+.filter-search-hint em {
+  color: #ccc; font-style: normal; font-weight: 500;
 }
 
 /* ---- Filter cards (replaces cluster-pills) ----
