@@ -141,15 +141,16 @@
            @input.debounce.300ms="if (ready) localStorage.setItem('q', $event.target.value)">
   </fieldset>
 
-  {# Cluster / taxonomy pills. HTMX-loaded on page load; client-refreshed #}
-  {# on group_by change. Single source of truth — no SSR'd duplicates. #}
-  <div id="cluster-pills"
+  {# Cluster / taxonomy pills. Same element is both the swap target and #}
+  {# the styled container — single-level wrapping, no placeholder, no #}
+  {# SSR'd duplicates. #}
+  {# `changed` modifier suppresses HTMX re-fetch when x-init sets the #}
+  {# select's value from localStorage (a native change event fires then). #}
+  <div id="cluster-pills" class="cluster-pills"
        hx-get="/filters"
-       hx-trigger="load once, change from:#group-by"
+       hx-trigger="load once, change from:#group-by changed"
        hx-include="#toolbar"
-       hx-swap="innerHTML">
-    <div class="empty" style="padding: 1rem;">Loading pills…</div>
-  </div>
+       hx-swap="innerHTML"></div>
 </form>
 
 {# ----- Cluster album bar — appears only when a cluster pill is clicked. #}
