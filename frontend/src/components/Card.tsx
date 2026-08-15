@@ -58,23 +58,33 @@ export function Card({ row, onUpdated }: Props) {
 
       <div className="meta-card">
         <div className="name">{row.original_file_name}</div>
-        <div>
-          <span className="badge">{fullTop1?.kingdom || '?'}</span>
-          <span className="badge">{fullTop1?.family || '?'}</span>
-          <span className="badge">{fullTop1?.genus || '?'}</span>
-          {row.taxon_scores && (
-            <small className="muted">
-              {Object.entries(row.taxon_scores)
-                .filter(([k]) => k !== 'Plantae')
-                .sort((a, b) => b[1] - a[1])
-                .map(([k, v], i, arr) => (
-                  <span key={k}>
-                    {i > 0 ? ' · ' : ''}{k}={(v * 100).toFixed(0)}
-                  </span>
-                ))}
-            </small>
+        <nav className="taxon-row compact" aria-label="taxonomy">
+          {fullTop1?.kingdom && <span className="taxon-rank kingdom">{fullTop1.kingdom}</span>}
+          {fullTop1?.family && (
+            <>
+              <span className="taxon-sep">›</span>
+              <span className="taxon-rank family">{fullTop1.family}</span>
+            </>
           )}
-        </div>
+          {fullTop1?.genus && (
+            <>
+              <span className="taxon-sep">›</span>
+              <span className="taxon-rank genus">{fullTop1.genus}</span>
+            </>
+          )}
+        </nav>
+        {row.taxon_scores && (
+          <small className="muted">
+            {Object.entries(row.taxon_scores)
+              .filter(([k]) => k !== 'Plantae')
+              .sort((a, b) => b[1] - a[1])
+              .map(([k, v], i, arr) => (
+                <span key={k}>
+                  {i > 0 ? ' · ' : ''}{k}={(v * 100).toFixed(0)}
+                </span>
+              ))}
+          </small>
+        )}
         <div className="urls">
           <a href={row.original_url} target="_blank" rel="noopener noreferrer">original →</a>
           <a href={row.thumbnail_url} target="_blank" rel="noopener noreferrer">thumb →</a>

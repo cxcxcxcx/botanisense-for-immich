@@ -1746,8 +1746,21 @@ async def clustering_status() -> dict:
     }
 
 
+# Immich only recognises these thumbnail sizes. Anything else (e.g. a
+# frontend asking for "fullsize") returns 500 from Immich and we want to
+# fall back to the largest valid size instead of bubbling that 500.
+_ALLOWED_SIZES = {"preview", "thumbnail"}
+_FULLSIZE_ALIASES = {"fullsize", "original", "full"}
+
+
 @app.get("/thumb/{asset_id}")
 async def thumb(asset_id: str, size: str = "preview") -> Response:
+    # Coerce fullsize-ish aliases down to the largest valid Immich size.
+    if size in _FULLSIZE_ALIASES:
+        size = "preview"  # "preview" is the closest to full-quality Immich serves here
+    if size not in _ALLOWED_SIZES:
+        size = "preview"
+
     async with httpx.AsyncClient(timeout=30.0) as c:
         r = await c.get(
             f"{BASE_URL}/api/assets/{asset_id}/thumbnail",
@@ -1755,7 +1768,12 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
             headers={"x-api-key": API_KEY},
         )
     if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, text=r.text)
+        # HTTPException uses `detail`, not `text`. Preserve the upstream
+        # error body in the message so the frontend can surface it.
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=f"immich thumbnail {asset_id}/{size}: {r.text[:200]}",
+        )
     # Long-lived cache: thumbnails are content-addressable by asset_id and
     # don't change unless the underlying photo is replaced in Immich.
     return Response(

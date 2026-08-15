@@ -55,8 +55,22 @@ export function AssetDetail({ assetId }: Props) {
 
   return (
     <div>
-      <figure>
-        <img src={thumbUrl(data.asset_id, 'fullsize')} alt={data.original_file_name} style={{ width: '100%', height: 'auto' }} />
+      <figure className="hero-photo">
+        <img
+          src={thumbUrl(data.asset_id, 'fullsize')}
+          alt={data.original_file_name}
+          loading="eager"
+          decoding="async"
+          onError={e => {
+            // Fall back to preview if fullsize is rejected (rare — Immich
+            // is supposed to support it, but some assets 404).
+            const img = e.currentTarget;
+            if (!img.dataset.fallback) {
+              img.dataset.fallback = '1';
+              img.src = thumbUrl(data.asset_id, 'preview');
+            }
+          }}
+        />
       </figure>
 
       <p>
@@ -64,16 +78,35 @@ export function AssetDetail({ assetId }: Props) {
         {data.cluster_id != null && <small> · cluster {data.cluster_id}</small>}
       </p>
 
-      <p>
-        <span className="badge">{fullTop1?.kingdom || '?'}</span>
-        <span className="badge">{fullTop1?.family || '?'}</span>
-        <span className="badge">{fullTop1?.genus || '?'}</span>
+      <nav className="taxon-row" aria-label="taxonomy hierarchy">
+        {fullTop1?.kingdom && <span className="taxon-rank kingdom">{fullTop1.kingdom}</span>}
+        {fullTop1?.family && (
+          <>
+            <span className="taxon-sep">›</span>
+            <span className="taxon-rank family">{fullTop1.family}</span>
+          </>
+        )}
+        {fullTop1?.genus && (
+          <>
+            <span className="taxon-sep">›</span>
+            <span className="taxon-rank genus">{fullTop1.genus}</span>
+          </>
+        )}
+        {fullTop1?.species && (
+          <>
+            <span className="taxon-sep">›</span>
+            <span className="taxon-rank species">{fullTop1.species}</span>
+          </>
+        )}
         {plantaeScore != null && (
-          <span className={`plantae ${plantaeTier}`} style={{ position: 'static', display: 'inline-block', marginLeft: '0.5rem' }}>
+          <span
+            className={`plantae ${plantaeTier}`}
+            style={{ position: 'static', display: 'inline-block', marginLeft: 'auto' }}
+          >
             Plantae {(plantaeScore * 100).toFixed(1)}%
           </span>
         )}
-      </p>
+      </nav>
 
       <LibraryNeighbors items={data.library_neighbors} />
 
