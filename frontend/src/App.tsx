@@ -10,7 +10,7 @@ import { LogTail } from './components/LogTail';
 import { JobPanel } from './components/JobPanel';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
-import { useRoute } from './hooks/useRoute';
+import { useRoute, navigate } from './hooks/useRoute';
 
 export function App() {
   const { dispatch } = useApp();
@@ -18,10 +18,9 @@ export function App() {
   const filters = useFilters();
   const view = useRoute();
 
-  // Browse home: only filter cards. Once a cluster/taxon filter is
-  // active, swap to the photo grid with a back affordance. This keeps
-  // the first paint lightweight (no per-asset fetches) and lets the
-  // user choose what subset of photos to render.
+  // Whether the current URL filters narrow to a specific subset of
+  // assets. This is the trigger for switching from the list view
+  // (filter cards, full-height) to the content view (photo grid).
   const hasActiveFilter =
     filters.cluster_id != null ||
     !!filters.species ||
@@ -51,10 +50,24 @@ export function App() {
   // Ensure a stable hash on first load so back/forward always works
   // and the URL bar shows the current view.
   useEffect(() => {
-    if (!window.location.hash || window.location.hash === '#') {
+    const h = window.location.hash.replace(/^#/, '').trim();
+    if (h !== 'browse' && h !== 'browse/content' && h !== 'run') {
       window.location.hash = '#browse';
     }
   }, []);
+
+  // Keep the route aligned with the filter state.
+  //   - filters active  → must be on #browse/content
+  //   - filters cleared → must be on #browse
+  // This way the URL is always the source of truth and deep-links work.
+  useEffect(() => {
+    const h = window.location.hash.replace(/^#/, '').trim();
+    if (hasActiveFilter && h !== 'browse/content') {
+      navigate('browse-content');
+    } else if (!hasActiveFilter && h === 'browse/content') {
+      navigate('browse-list');
+    }
+  }, [hasActiveFilter]);
 
   // Close the modal on Escape (the dialog handles this natively, but we
   // also need to flip the React state).
@@ -75,21 +88,21 @@ export function App() {
     <>
       <Header view={view} />
       <main className={`app-main view-${view}`}>
-        {view === 'browse' ? (
-          hasActiveFilter ? (
-            <>
-              <Toolbar />
-              <ClusterAlbumBar />
-              <Grid />
-            </>
-          ) : (
-            <Toolbar />
-          )
-        ) : (
+        {view === 'run' ? (
           <section className="run-view">
             <ParamsForm />
             <LogTail active={true} />
           </section>
+        ) : view === 'browse-content' ? (
+          <>
+            <Toolbar />
+            <ClusterAlbumBar />
+            <Grid />
+          </>
+        ) : (
+          // browse-list — full-height filter cards. Toolbar is the
+          // owner of FilterCards and supplies the sort/group-by chrome.
+          <Toolbar />
         )}
       </main>
       <Modal

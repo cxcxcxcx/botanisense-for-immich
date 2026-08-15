@@ -10,6 +10,12 @@
   --pico-primary-inverse: #fff;
 }
 body { background: #111; }
+/* Flex column at the body level so #root → header + main can split the
+   viewport. The browse-list main then uses the leftover height for
+   its full-height filter cards. */
+html, body, #root { min-height: 100dvh; }
+body { display: flex; flex-direction: column; }
+#root { display: flex; flex-direction: column; flex: 1 1 auto; }
 
 /* Alpine x-cloak — hide elements until Alpine has initialized. */
 [x-cloak] { display: none !important; }
@@ -238,11 +244,35 @@ nav.legend-bar, .legend-bar {
   padding: 3px 8px; border-radius: 4px; font-size: 0.85rem;
 }
 
+/* On the list view (no active filter, full-height browse), the cards
+   should fill the rest of the viewport so the user can scroll through
+   dozens of clusters/taxa without a tiny inner scrollbox. The flex
+   chain (body → #root → main → filter-cards-wrap) lets each child
+   absorb the leftover height of its parent. */
+.app-main.view-browse-list {
+  display: flex; flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.app-main.view-browse-list .toolbar { flex: 0 0 auto; }
+.app-main.view-browse-list .filter-cards-wrap {
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column;
+}
+
 .filter-cards {
   display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 10px; padding: 0.5rem 0;
-  max-height: 360px; overflow-y: auto;
+  overflow-y: auto;
   scrollbar-width: thin;
+  /* In the list view the parent flex gives us a real height; in the
+     content view the cards collapse to the active-bar so the cap is
+     effectively a no-op. */
+  max-height: 360px;
+}
+.app-main.view-browse-list .filter-cards {
+  max-height: none;
+  flex: 1 1 auto;
 }
 .filter-cards::-webkit-scrollbar { width: 8px; }
 .filter-cards::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }

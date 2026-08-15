@@ -1,16 +1,39 @@
-// Minimal hash-route hook. We don't need a full router — only two
-// views (browse / run) — and we want the back/forward buttons to work
-// naturally. `window.location.hash` is browser-native, fires
-// `hashchange` for free, and shares the same history entry lifecycle
-// as the filter query string.
+// Minimal hash-route hook. We don't need a full router — three views
+// (browse-list / browse-content / run) — and we want the back/forward
+// buttons to work naturally. `window.location.hash` is browser-native,
+// fires `hashchange` for free, and shares the same history entry
+// lifecycle as the filter query string.
+//
+//   #browse            → list of clusters / species / genus / family
+//                        (filter cards, full-height)
+//   #browse/content    → photo grid for the currently active filter
+//                        (a cluster/taxon was selected on the list)
+//   #run               → params + status + logs (pipeline)
 
 import { useEffect, useState } from 'react';
 
-export type View = 'browse' | 'run';
+export type View = 'browse-list' | 'browse-content' | 'run';
 
+export type BrowseTab = 'browse-list' | 'browse-content';
+
+/**
+ * Parse the hash into a structured view.
+ * `#browse/content` → 'browse-content'
+ * `#browse`         → 'browse-list'
+ * `#run`            → 'run'
+ * anything else     → 'browse-list' (default)
+ */
 export function parseHashRoute(hash: string = window.location.hash): View {
   const h = hash.replace(/^#/, '').trim();
-  return h === 'run' ? 'run' : 'browse';
+  if (h === 'run') return 'run';
+  if (h === 'browse/content' || h === 'browse/content/') return 'browse-content';
+  return 'browse-list';
+}
+
+/** Top-level view for the header tab strip. */
+export function topLevel(view: View): BrowseTab | 'run' {
+  if (view === 'run') return 'run';
+  return 'browse-list';
 }
 
 export function useRoute(): View {
@@ -25,6 +48,16 @@ export function useRoute(): View {
 
 export function navigate(view: View): void {
   if (parseHashRoute() === view) return;
+  const next = view === 'browse-list' ? '#browse'
+             : view === 'browse-content' ? '#browse/content'
+             : '#run';
   // Setting hash fires hashchange synchronously; useRoute picks it up.
-  window.location.hash = `#${view}`;
+  window.location.hash = next;
 }
+
+/**
+ * Convenience navigation from the FilterCards → Grid transition.
+ * Used by the back-to-filters button too.
+ */
+export function goToBrowseList(): void { navigate('browse-list'); }
+export function goToBrowseContent(): void { navigate('browse-content'); }
