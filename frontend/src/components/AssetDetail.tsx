@@ -54,7 +54,7 @@ export function AssetDetail({ assetId }: Props) {
   const plantaeTier = plantaeColorClass(plantaeScore);
 
   return (
-    <div>
+    <div className="asset-detail">
       <figure className="hero-photo">
         <img
           src={thumbUrl(data.asset_id, 'fullsize')}

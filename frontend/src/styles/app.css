@@ -209,15 +209,35 @@ nav.legend-bar, .legend-bar {
 .photo-grid {
   display: grid;
   /* 160px floor so we always get ≥2 columns on a 360px+ phone; bumps
-     to 3-4 as the viewport widens. Was 280px which forced 1-col mobile. */
-  grid-template-columns: repeat(auto-fill, minmax(min(160px, 100%), 1fr));
-  gap: 12px; align-items: start;
+     to 3-4 as the viewport widens. */
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
+  gap: 10px; align-items: start;
 }
 
 .card {
   background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
+  position: relative;
 }
+.card.zoomed {
+  cursor: default;
+  max-width: 1000px; margin: 0 auto;
+  border-color: #444;
+}
+
+/* Zoom-in pane — replaces the grid entirely while zoomed. */
+.zoomed-pane {
+  padding-top: 0.5rem;
+}
+
+.card-back-btn {
+  position: absolute; top: 8px; left: 8px; z-index: 5;
+  background: rgba(0,0,0,0.7); color: #eee; border: 1px solid #444;
+  padding: 4px 10px; border-radius: 4px; cursor: pointer;
+  font: 12px ui-monospace, monospace;
+}
+.card-back-btn:hover { background: rgba(0,0,0,0.9); }
+
 .img-wrap { position: relative; background: #000; }
 .img-wrap img { width: 100%; height: auto; display: block; }
 .img-wrap svg.bbox { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -250,6 +270,38 @@ nav.legend-bar, .legend-bar {
 .plantae.green  { background: #1a3a1a; color: #6f6; }
 .plantae.yellow { background: #3a3a1a; color: #ff6; }
 .plantae.red    { background: #3a1a1a; color: #f88; }
+
+/* Image overlay: species + score + per-kingdom chips, pinned to the
+   bottom of the photo with a translucent dark gradient so the card
+   stays compact (no separate meta-card block in grid mode). */
+.img-overlay {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 22px 8px 8px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,0.85) 100%);
+  color: #eee; display: flex; flex-direction: column; gap: 3px;
+  pointer-events: none;
+}
+.img-overlay .overlay-top {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+}
+.img-overlay .overlay-species {
+  font: italic 600 13px/1.2 system-ui, sans-serif;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.img-overlay .overlay-score {
+  font: 600 12px/1 ui-monospace, monospace;
+  background: #2c8a4a; color: #fff;
+  padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
+}
+.img-overlay .overlay-scores {
+  display: flex; flex-wrap: wrap; gap: 4px;
+}
+.img-overlay .overlay-score-chip {
+  font: 10px ui-monospace, monospace;
+  background: rgba(255,255,255,0.12); color: #ccc;
+  padding: 1px 5px; border-radius: 3px;
+}
 
 .meta-card { padding: 10px 12px; font-size: 13px; }
 .meta-card .name { font-weight: 600; margin-bottom: 4px; word-break: break-all; }
@@ -296,17 +348,23 @@ nav.legend-bar, .legend-bar {
   user-select: none;
 }
 
-/* ---- Hero photo in modal ---- */
+/* ---- Hero photo in modal ----
+   Smaller than before — the modal is for inspecting metadata, library
+   neighbors, KNN, etc. The grid card (with its overlay) is for
+   looking at the photo itself. */
 .hero-photo {
-  margin: 0 0 0.75rem; background: #0a0a0a; border-radius: 6px;
+  margin: 0 0 0.5rem; background: #0a0a0a; border-radius: 6px;
   overflow: hidden; border: 1px solid #222;
   display: flex; align-items: center; justify-content: center;
-  min-height: 200px;
+  min-height: 120px; max-height: 220px;
 }
 .hero-photo img {
-  display: block; max-width: 100%; max-height: 70vh;
+  display: block; max-width: 100%; max-height: 220px;
   width: auto; height: auto; object-fit: contain;
 }
+
+.asset-detail { font-size: 13px; }
+.asset-detail h5 { margin: 0.75rem 0 0.4rem; font-size: 0.9rem; color: #ad9; }
 
 .preds { padding: 0 12px 12px; }
 .pred {

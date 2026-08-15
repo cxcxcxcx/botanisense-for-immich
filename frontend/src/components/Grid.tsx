@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getResults } from '../api/endpoints';
 import type { ResultRow, ResultsResponse } from '../api/types';
-import { useFilters } from '../state/AppContext';
+import { useApp, useFilters, useZoom } from '../state/AppContext';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 
@@ -17,6 +17,8 @@ function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score'): Result
 
 export function Grid() {
   const filters = useFilters();
+  const zoomedAid = useZoom();
+  const { dispatch } = useApp();
   const [data, setData] = useState<ResultsResponse | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
@@ -57,6 +59,46 @@ export function Grid() {
     // slow down rapid button clicks; keep it simple.
     void assetId;
   };
+
+  // Escape closes the zoomed card.
+  useEffect(() => {
+    if (!zoomedAid) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') dispatch({ type: 'ZOOM_OUT' });
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [zoomedAid, dispatch]);
+
+  // When the filter scope changes (page, sort, taxon pill), the zoomed
+  // aid may no longer be in the visible page. Reset it so the grid
+  // doesn't render a phantom "not found" state.
+  useEffect(() => {
+    if (!zoomedAid || !data) return;
+    if (!sortedRows.some(r => r.asset_id === zoomedAid)) {
+      dispatch({ type: 'ZOOM_OUT' });
+    }
+  }, [zoomedAid, sortedRows, data, dispatch]);
+
+  // Zoomed-in mode: hide the grid and show only the active card at
+  // near-fullscreen size, with a back button. We don't gate on data
+  // here — if the page is mid-fetch we fall through to loading.
+  if (zoomedAid && data) {
+    const row = sortedRows.find(r => r.asset_id === zoomedAid);
+    if (row) {
+      return (
+        <div className="grid-pane zoomed-pane">
+          <Card
+            key={row.asset_id}
+            row={row}
+            zoomed
+            onZoomOut={() => dispatch({ type: 'ZOOM_OUT' })}
+            onUpdated={handleRowUpdated}
+          />
+        </div>
+      );
+    }
+  }
 
   if (loading && !data) {
     return (
