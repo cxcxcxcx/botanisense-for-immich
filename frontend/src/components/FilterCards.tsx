@@ -10,7 +10,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
 import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
-import { useFilters, type GroupBy } from '../state/AppContext';
+import { useApp, useFilters, type GroupBy } from '../state/AppContext';
 import { useDebounce } from '../hooks/useDebounce';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { thumbUrl } from '../lib/thumb';
@@ -39,6 +39,7 @@ function readSort(g: GroupBy): CardSort {
 export function FilterCards() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
+  const { dispatch } = useApp();
   const debouncedQ = useDebounce(filters.q, 300);
 
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
@@ -148,6 +149,14 @@ export function FilterCards() {
   useEffect(() => {
     setForceShow(localStorage.getItem(COLLAPSE_KEY(filters.group_by)) === '1');
   }, [filters.group_by]);
+
+  // Publish the effective collapsed state (activeCard != null && !forceShow)
+  // to the reducer so ClusterAlbumBar can hide when the active-bar
+  // already shows the cluster identity.
+  useEffect(() => {
+    const collapsed = activeCard != null && !forceShow;
+    dispatch({ type: 'SET_FILTERS_COLLAPSED', collapsed });
+  }, [activeCard, forceShow, dispatch]);
 
   const toggleForceShow = () => {
     const next = !forceShow;

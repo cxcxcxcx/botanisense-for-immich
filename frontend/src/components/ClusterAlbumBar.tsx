@@ -6,7 +6,7 @@ import { useToasts } from './ToastProvider';
 
 export function ClusterAlbumBar() {
   const filters = useFilters();
-  const { dispatch } = useApp();
+  const { dispatch, state } = useApp();
   const push = useToasts();
 
   // All hooks MUST be called unconditionally — early return would change
@@ -25,6 +25,10 @@ export function ClusterAlbumBar() {
 
   // Render nothing when no cluster pill is active.
   if (filters.group_by !== 'cluster' || filters.cluster_id == null) return null;
+  // Skip when FilterCards is collapsed — the active-bar already shows
+  // "Cluster #N · count · group_by" with a ✕ to clear, so this bar
+  // would duplicate the cluster identity.
+  if (state.filtersCollapsed) return null;
   const clusterId = filters.cluster_id;
 
   const album = albums?.find(a => a.cluster_id === clusterId) ?? null;

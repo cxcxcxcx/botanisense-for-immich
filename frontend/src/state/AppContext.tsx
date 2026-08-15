@@ -67,12 +67,17 @@ export interface AppState {
   filters: Filters;
   modal: ModalState;
   job: JobPanelState;
+  // When a filter is active, FilterCards collapses by default behind a
+  // single active-bar. ClusterAlbumBar reads this so it doesn't
+  // duplicate the cluster identity shown in that bar.
+  filtersCollapsed: boolean;
 }
 
 export type Action =
   | { type: 'SET_FILTERS'; patch: Partial<Filters> }
   | { type: 'OPEN_MODAL'; assetId: string }
   | { type: 'CLOSE_MODAL' }
+  | { type: 'SET_FILTERS_COLLAPSED'; collapsed: boolean }
   | { type: 'OPEN_JOB'; kind: Exclude<JobKind, 'idle'>; payload: { clusterId?: number; kingdom?: string } }
   | { type: 'JOB_PREVIEW_OK'; total: number }
   | { type: 'JOB_PREVIEW_ERR'; errorMsg: string }
@@ -100,6 +105,7 @@ const INITIAL: AppState = {
   filters: DEFAULT_FILTERS,
   modal: { open: false, kind: null, assetId: null },
   job: defaultJob(),
+  filtersCollapsed: false,
 };
 
 // ---- Reducer -------------------------------------------------------------
@@ -128,6 +134,8 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, modal: { open: true, kind: 'asset', assetId: action.assetId } };
     case 'CLOSE_MODAL':
       return { ...state, modal: { open: false, kind: null, assetId: null } };
+    case 'SET_FILTERS_COLLAPSED':
+      return { ...state, filtersCollapsed: action.collapsed };
     case 'OPEN_JOB':
       return {
         ...state,
