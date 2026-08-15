@@ -95,8 +95,11 @@ export function useUrlFilters() {
     }
     writePersisted(next);
     const qs = buildUrl(next).slice(1); // strip leading '?'
-    const url = qs ? `?${qs}` : window.location.pathname;
-    window.history.pushState(null, '', url);
+    const search = qs ? `?${qs}` : '';
+    // Preserve the route hash so filter changes inside #run / #browse
+    // don't reset the user's current view.
+    const hash = window.location.hash;
+    window.history.pushState(null, '', `${window.location.pathname}${search}${hash}`);
   }, [dispatch]);
 
   return setFilters;

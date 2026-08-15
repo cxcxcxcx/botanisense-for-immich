@@ -38,8 +38,24 @@ progress { width: 100%; height: 6px; }
 .app-header hgroup { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
 .app-header hgroup h1 { margin: 0; font-size: 1.25rem; }
 
-/* Header buttons (open params / logs modal). Sit on the right of the
-   hgroup row next to the KNN pill so they don't take their own strip. */
+/* View tabs (Browse | Run) at the top-left of the header. */
+.view-tabs {
+  display: inline-flex; gap: 4px; padding: 4px;
+  background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
+  margin-bottom: 0.5rem;
+}
+.view-tab {
+  background: transparent; color: #aaa; border: 1px solid transparent;
+  padding: 4px 14px; font-size: 0.85rem; border-radius: 6px; cursor: pointer;
+  font: inherit;
+}
+.view-tab:hover { color: #fff; border-color: #444; }
+.view-tab.active {
+  background: #2c8a4a; color: #fff; border-color: #5cc078;
+}
+
+/* Header buttons (jump to #run). Sit on the right of the hgroup row
+   next to the KNN pill so they don't take their own strip. */
 .header-buttons { display: inline-flex; gap: 0.5rem; margin-left: auto; }
 .header-btn { font-size: 0.8rem; padding: 4px 10px; }
 
@@ -48,6 +64,15 @@ progress { width: 100%; height: 6px; }
   padding: 0.5rem 0; border-top: 1px solid #222; border-bottom: 1px solid #222;
   font: 12px/1.6 ui-monospace, monospace;
 }
+/* Compact status (browse view). One-line badge + ETA only — hides
+   the progress bar, stage-time bar, and stage legend. */
+.status-panel.status-compact {
+  border-top: none; border-bottom: none;
+  padding: 0.25rem 0; font-size: 11px; gap: 0.5rem;
+}
+.status-panel.status-compact progress,
+.status-panel.status-compact .stage-time-bar,
+.status-panel.status-compact .stage-time-legend { display: none; }
 .status-panel progress { width: 200px; flex-shrink: 0; }
 .status-panel .stage-time-bar { display: flex; height: 6px; flex: 1 1 200px;
   border-radius: 3px; overflow: hidden; background: #222; }
@@ -250,24 +275,15 @@ nav.legend-bar, .legend-bar {
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
   position: relative;
 }
-.card.zoomed {
-  cursor: default;
-  max-width: 1000px; margin: 0 auto;
-  border-color: #444;
-}
 
-/* Zoom-in pane — replaces the grid entirely while zoomed. */
-.zoomed-pane {
-  padding-top: 0.5rem;
+/* ---- Run view (#run) ----
+   The body of the run view: stacked params + logs, centered at 1100px. */
+.run-view {
+  display: flex; flex-direction: column; gap: 1rem;
+  max-width: 1100px; margin: 0 auto; padding: 1rem 1.5rem;
 }
-
-.card-back-btn {
-  position: absolute; top: 8px; left: 8px; z-index: 5;
-  background: rgba(0,0,0,0.7); color: #eee; border: 1px solid #444;
-  padding: 4px 10px; border-radius: 4px; cursor: pointer;
-  font: 12px ui-monospace, monospace;
-}
-.card-back-btn:hover { background: rgba(0,0,0,0.9); }
+.run-view .log-pre { max-height: 30vh; }
+.app-main.view-run { padding-bottom: 2rem; }
 
 .img-wrap { position: relative; background: #000; }
 .img-wrap img { width: 100%; height: auto; display: block; }

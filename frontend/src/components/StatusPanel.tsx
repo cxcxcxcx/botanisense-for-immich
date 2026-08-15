@@ -13,7 +13,15 @@ const STAGE_COLORS: Record<string, string> = {
   'bbox-bioclip': 'stage-bbox-bioclip',
 };
 
-export function StatusPanel() {
+interface Props {
+  /** When true, render only the badge + eta (used in the browse-view
+   *  header where the full stage bar would be noise). The CSS class
+   *  .status-compact hides the progress bar, stage-time bar, and
+   *  stage legend. */
+  compact?: boolean;
+}
+
+export function StatusPanel({ compact = false }: Props = {}) {
   const { data } = usePolling<PipelineStatus>(() => getStatus(), { intervalMs: 1000 });
   const [stageTotals, setStageTotals] = useState<Record<string, number>>({});
   const prevStatusRef = useRef<string>('idle');
@@ -61,7 +69,7 @@ export function StatusPanel() {
     : [];
 
   return (
-    <aside className="status-panel">
+    <aside className={`status-panel${compact ? ' status-compact' : ''}`}>
       <span className={cls('badge', `status-${status}`)}>{badgeText}</span>
       <progress
         style={{ display: status === 'running' ? 'block' : 'none' }}

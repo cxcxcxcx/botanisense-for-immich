@@ -35,10 +35,10 @@ export interface Filters {
 
 export interface ModalState {
   open: boolean;
-  // Which dialog is currently mounted. `asset` is the photo detail;
-  // `params` and `logs` are the new modal-launched forms. Only one is
-  // open at a time (a single <Modal> slot is reused).
-  kind: 'asset' | 'params' | 'logs' | null;
+  // The modal slot only carries the asset detail popup (the photo +
+  // library_neighbors + KNN + detections). Pipeline params and server
+  // logs live on the #run view, not in a modal.
+  kind: 'asset' | null;
   assetId: string | null;
 }
 
@@ -67,20 +67,12 @@ export interface AppState {
   filters: Filters;
   modal: ModalState;
   job: JobPanelState;
-  // Inline zoom-in mode: when set, the grid hides and the corresponding
-  // card expands to a near-fullscreen overlay with photo + predictions.
-  // Distinct from the asset modal (which carries library_neighbors).
-  zoomedAid: string | null;
 }
 
 export type Action =
   | { type: 'SET_FILTERS'; patch: Partial<Filters> }
   | { type: 'OPEN_MODAL'; assetId: string }
-  | { type: 'OPEN_PARAMS_MODAL' }
-  | { type: 'OPEN_LOGS_MODAL' }
   | { type: 'CLOSE_MODAL' }
-  | { type: 'ZOOM_IN'; aid: string }
-  | { type: 'ZOOM_OUT' }
   | { type: 'OPEN_JOB'; kind: Exclude<JobKind, 'idle'>; payload: { clusterId?: number; kingdom?: string } }
   | { type: 'JOB_PREVIEW_OK'; total: number }
   | { type: 'JOB_PREVIEW_ERR'; errorMsg: string }
@@ -108,7 +100,6 @@ const INITIAL: AppState = {
   filters: DEFAULT_FILTERS,
   modal: { open: false, kind: null, assetId: null },
   job: defaultJob(),
-  zoomedAid: null,
 };
 
 // ---- Reducer -------------------------------------------------------------
@@ -135,16 +126,8 @@ function reducer(state: AppState, action: Action): AppState {
     }
     case 'OPEN_MODAL':
       return { ...state, modal: { open: true, kind: 'asset', assetId: action.assetId } };
-    case 'OPEN_PARAMS_MODAL':
-      return { ...state, modal: { open: true, kind: 'params', assetId: null } };
-    case 'OPEN_LOGS_MODAL':
-      return { ...state, modal: { open: true, kind: 'logs', assetId: null } };
     case 'CLOSE_MODAL':
       return { ...state, modal: { open: false, kind: null, assetId: null } };
-    case 'ZOOM_IN':
-      return { ...state, zoomedAid: action.aid };
-    case 'ZOOM_OUT':
-      return { ...state, zoomedAid: null };
     case 'OPEN_JOB':
       return {
         ...state,
@@ -219,7 +202,4 @@ export function useModal() {
 }
 export function useJob() {
   return useApp().state.job;
-}
-export function useZoom() {
-  return useApp().state.zoomedAid;
 }
