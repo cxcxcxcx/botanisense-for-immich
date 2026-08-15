@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useApp, useFilters, type GroupBy, type SortMode } from '../state/AppContext';
+import { useApp, useFilters, type GroupBy } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { useDebounce } from '../hooks/useDebounce';
 import { FilterCards } from './FilterCards';
@@ -11,15 +11,9 @@ const GROUP_BY_CARDS: { value: GroupBy; label: string }[] = [
   { value: 'family', label: 'family' },
 ];
 
-// Sort options for the photo grid. The label is the user-facing phrase;
-// the hint is shown beneath it (or in a tooltip on narrow screens) so
-// users understand what each sort actually does without trying it.
-const SORT_CARDS: { value: SortMode; label: string; hint: string }[] = [
-  { value: 'rank',    label: 'default',        hint: 'order returned by the server' },
-  { value: 'plantae', label: 'plants first',   hint: 'highest Plantae confidence on top' },
-  { value: 'score',   label: 'most confident', hint: 'highest BioCLIP top-1 score on top' },
-];
-
+// Toolbar owns the cluster/taxon list view chrome. Photo-sort and
+// pagination live with the photo grid (Grid.tsx) — they're irrelevant
+// when the user is choosing a filter.
 export function Toolbar() {
   const filters = useFilters();
   const { state } = useApp();
@@ -64,24 +58,6 @@ export function Toolbar() {
               ))}
             </div>
           </div>
-          <div className="toolbar-control">
-            <div className="toolbar-control-label">sort photos by</div>
-            <div className="sort-cards" role="radiogroup" aria-label="Sort photos by">
-              {SORT_CARDS.map(s => (
-                <button
-                  key={s.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={filters.sort === s.value}
-                  className={`sort-card ${filters.sort === s.value ? 'active' : ''}`}
-                  onClick={() => setFilters({ sort: s.value })}
-                  title={s.hint}
-                >
-                  {s.label}
-                </button>
-              ))}
-            </div>
-          </div>
         </fieldset>
       )}
       <FilterCards />
@@ -98,7 +74,7 @@ export function Toolbar() {
           />
           <small className="filter-search-hint">
             Filters the visible cards by name — your active {filters.group_by} filter is unchanged.
-            Use the ✕ on the active card or the <em>back to filters</em> button to clear it.
+            Click a card's ✕ or the <em>back</em> link in the photo grid to clear it.
           </small>
         </div>
       )}

@@ -169,23 +169,6 @@ nav.legend-bar, .legend-bar {
   background: #2c8a4a; color: #fff; border-color: #5cc078;
 }
 
-/* Sort photo-grid radio cards: same shape as group-by but visually
-   distinct (slate accent) so the two strips don't read as a single
-   repeated control. Tooltip carries the explanation on hover. */
-.sort-cards {
-  display: inline-flex; gap: 4px; padding: 4px;
-  background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
-}
-.sort-card {
-  background: transparent; color: #aaa; border: 1px solid transparent;
-  padding: 4px 12px; font-size: 0.8rem; border-radius: 6px; cursor: pointer;
-  font: inherit;
-}
-.sort-card:hover { color: #fff; border-color: #444; }
-.sort-card.active {
-  background: #2a5a8a; color: #fff; border-color: #5c93c0;
-}
-
 /* Each toolbar row carries a tiny label above the controls so users
    know which dimension they're picking without hovering. */
 .toolbar-control {
@@ -196,7 +179,6 @@ nav.legend-bar, .legend-bar {
   text-transform: uppercase; letter-spacing: 0.04em;
 }
 
-.toolbar-sort { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; font-size: 0.8rem; }
 .toolbar select, .toolbar input[type=search] {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
   padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
@@ -235,6 +217,22 @@ nav.legend-bar, .legend-bar {
   padding: 0.25rem 0 0.5rem; font-size: 0.8rem; color: #888;
 }
 .filter-cards-header .filter-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* Filter-card sort chips — same breadcrumb style as the photo grid. */
+.filter-cards-sort {
+  display: inline-flex; align-items: center; gap: 0.25rem;
+}
+.filter-cards-sort-label { color: #888; margin-right: 0.15rem; }
+.filter-cards-sort-group { display: inline-flex; align-items: center; gap: 0.25rem; }
+.filter-cards-sort-sep { color: #444; }
+.filter-cards-sort-chip {
+  background: transparent; color: #aaa; border: 0; padding: 0;
+  cursor: pointer; font: inherit;
+}
+.filter-cards-sort-chip:hover { color: #fff; }
+.filter-cards-sort-chip.active {
+  color: #5cc078; font-weight: 500;
+}
 .filter-card-all-btn { font-size: 0.8rem; padding: 4px 10px; }
 .filter-card-all-btn.on {
   background: #2c8a4a; border-color: #5cc078; color: #fff;
@@ -353,19 +351,36 @@ nav.legend-bar, .legend-bar {
 /* ---- Grid + cards ---- */
 .grid-pane { padding: 1rem 1.5rem; }
 
-/* Slim row above the photo grid: a back-to-filters button (clears the
-   active cluster/taxon filter) plus a "showing X" reminder. The
-   FilterCards active-bar carries the same info, but a dedicated bar
-   here means the user can navigate back even after scrolling past it. */
-.grid-toolbar {
-  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
-  padding: 0.25rem 0 0.75rem;
-  border-bottom: 1px solid #2a2a2a;
-  margin-bottom: 0.75rem;
+/* Breadcrumb above the photo grid: one tight strip with back link,
+   active-filter scope, count, and inline sort chips. No big button,
+   no border competing with the photos below. */
+.grid-breadcrumb {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem 0.5rem;
+  padding: 0.25rem 0 0.6rem;
+  color: #aaa; font-size: 0.85rem;
 }
-.grid-toolbar .back-to-filters { font-size: 0.85rem; }
-.grid-active-label { color: #aaa; font-size: 0.85rem; }
-.grid-active-label strong { color: #eee; }
+.crumb-back {
+  background: transparent; color: #5cc078; border: 0; padding: 0;
+  cursor: pointer; font: inherit;
+}
+.crumb-back:hover { color: #6fd089; text-decoration: underline; }
+.crumb-sep { color: #444; }
+.crumb-scope strong { color: #eee; }
+.crumb-count { font-variant-numeric: tabular-nums; }
+.crumb-sort {
+  display: inline-flex; align-items: center; gap: 0.25rem;
+}
+.crumb-sort-label { color: #888; }
+.crumb-sort-group { display: inline-flex; align-items: center; gap: 0.25rem; }
+.crumb-sort-sep { color: #444; }
+.crumb-sort-chip {
+  background: transparent; color: #aaa; border: 0; padding: 0;
+  cursor: pointer; font: inherit;
+}
+.crumb-sort-chip:hover { color: #fff; }
+.crumb-sort-chip.active {
+  color: #5c93c0; font-weight: 500;
+}
 
 .photo-grid {
   display: grid;

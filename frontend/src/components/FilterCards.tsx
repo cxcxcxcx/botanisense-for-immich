@@ -16,10 +16,10 @@ import { useUrlFilters } from '../hooks/useUrlFilters';
 import { thumbUrl } from '../lib/thumb';
 
 export type CardSort = 'alpha' | 'size' | 'id';
-const SORTS: { value: CardSort; label: string }[] = [
-  { value: 'size', label: 'size' },
-  { value: 'alpha', label: 'A→Z' },
-  { value: 'id', label: 'id' },
+const SORTS: { value: CardSort; label: string; hint: string }[] = [
+  { value: 'size',  label: 'size',  hint: 'largest cluster/taxon first' },
+  { value: 'alpha', label: 'A→Z',   hint: 'alphabetical by label' },
+  { value: 'id',    label: 'id',    hint: 'internal cluster id order (cluster only)' },
 ];
 
 interface Card {
@@ -200,15 +200,24 @@ export function FilterCards() {
   return (
     <div className="filter-cards-wrap">
       <div className="filter-cards-header">
-        <label>
-          sort cards{' '}
-          <select
-            value={sortMode}
-            onChange={e => setSortMode(e.target.value as CardSort)}
-          >
-            {SORTS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
-          </select>
-        </label>
+        <span className="filter-cards-sort" role="radiogroup" aria-label="Sort filter cards">
+          <span className="filter-cards-sort-label">sort</span>
+          {SORTS.map((s, i) => (
+            <span key={s.value} className="filter-cards-sort-group">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={sortMode === s.value}
+                className={`filter-cards-sort-chip ${sortMode === s.value ? 'active' : ''}`}
+                onClick={() => setSortMode(s.value)}
+                title={s.hint}
+              >
+                {s.label}
+              </button>
+              {i < SORTS.length - 1 && <span className="filter-cards-sort-sep">/</span>}
+            </span>
+          ))}
+        </span>
         <span className="filter-count">{visibleCards.length} of {allCards.length} filters</span>
         {activeCard && (
           <button

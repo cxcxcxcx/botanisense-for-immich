@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getResults } from '../api/endpoints';
 import type { ResultRow, ResultsResponse } from '../api/types';
-import { useFilters } from '../state/AppContext';
+import { useFilters, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
+
+// Photo-sort radio chips — live here (with the grid they sort) instead
+// of in the Toolbar (which sits on the cluster/taxon list view).
+const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
+  { value: 'rank',    label: 'default',        hint: 'order returned by the server' },
+  { value: 'plantae', label: 'plants first',   hint: 'highest Plantae confidence on top' },
+  { value: 'score',   label: 'most confident', hint: 'highest BioCLIP top-1 score on top' },
+];
 
 function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score'): ResultRow[] {
   if (sort === 'plantae') {
@@ -24,11 +32,8 @@ export function Grid() {
   const [loading, setLoading] = useState(true);
   const reqIdRef = useRef(0);
 
-  // The filter-card active-bar (in the Toolbar) is the source of truth
-  // for which subset is loaded, but a dedicated back button here makes
-  // the navigation obvious even when the user has scrolled past the
-  // bar. Clicking it clears whichever cluster/taxon filter is set and
-  // returns to the filter-cards home.
+  // Which subset is loaded. The grid toolbar carries the only
+  // navigation affordance — clicking it returns to the filter cards.
   const activeFilterLabel: string | null = (() => {
     const g = filters.group_by;
     if (g === 'cluster') return filters.cluster_id != null ? `cluster #${filters.cluster_id}` : null;
@@ -71,7 +76,6 @@ export function Grid() {
     return sortRows(data.results, filters.sort);
   }, [data, filters.sort]);
 
-  // After a per-card reclassify, refetch only that one row's KNN.
   const handleRowUpdated = async (assetId: string) => {
     // Optimistic: leave the row alone — the user can re-run if they want
     // to see fresh KNN. We could call /api/asset/{id} here but it would
@@ -79,80 +83,78 @@ export function Grid() {
     void assetId;
   };
 
-  if (loading && !data) {
-    return (
-      <div className="grid-pane">
-        <GridToolbar activeFilterLabel={activeFilterLabel} onBack={clearActiveFilter} groupBy={filters.group_by} />
-        <div className="empty">Loading…</div>
-      </div>
-    );
-  }
-
-  if (error && !data) {
-    return (
-      <div className="grid-pane">
-        <GridToolbar activeFilterLabel={activeFilterLabel} onBack={clearActiveFilter} groupBy={filters.group_by} />
-        <div className="empty error">Failed to load: {error.message}</div>
-      </div>
-    );
-  }
-
-  if (!data || data.results.length === 0) {
-    return (
-      <div className="grid-pane">
-        <GridToolbar activeFilterLabel={activeFilterLabel} onBack={clearActiveFilter} groupBy={filters.group_by} />
-        <div className="empty">No results in this view.</div>
-      </div>
-    );
-  }
-
   return (
     <div className="grid-pane">
-      <GridToolbar
-        activeFilterLabel={activeFilterLabel}
-        total={data.pagination.total}
-        onBack={clearActiveFilter}
+      <Breadcrumb
         groupBy={filters.group_by}
+        activeFilterLabel={activeFilterLabel}
+        total={data?.pagination.total ?? null}
+        onBack={clearActiveFilter}
+        sort={filters.sort}
+        onSortChange={s => setFilters({ sort: s })}
       />
-      <div className="photo-grid">
-        {sortedRows.map(r => (
-          <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
-        ))}
-      </div>
-      <Pagination data={data.pagination} />
+      {loading && !data ? (
+        <div className="empty">Loading…</div>
+      ) : error && !data ? (
+        <div className="empty error">Failed to load: {error.message}</div>
+      ) : !data || data.results.length === 0 ? (
+        <div className="empty">No results in this view.</div>
+      ) : (
+        <>
+          <div className="photo-grid">
+            {sortedRows.map(r => (
+              <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
+            ))}
+          </div>
+          <Pagination data={data.pagination} />
+        </>
+      )}
     </div>
   );
 }
 
-// Slim nav strip above the photo grid: back-to-filters button + (in the
-// populated state) a "showing X" reminder. The FilterCards active-bar in
-// the Toolbar carries the same info, but the user can scroll past it; a
-// dedicated bar here keeps the back affordance always reachable.
-interface GridToolbarProps {
-  activeFilterLabel: string | null;
-  total?: number;
-  onBack: () => void;
+// Breadcrumb above the photo grid:
+//   ← back · species: Rosa canina · 142 assets · [sort: default | plants first | most confident]
+// One tight strip, no big button, no bottom border. Hover the sort
+// chips for the explanation.
+interface BreadcrumbProps {
   groupBy: string;
+  activeFilterLabel: string | null;
+  total: number | null;
+  onBack: () => void;
+  sort: SortMode;
+  onSortChange: (s: SortMode) => void;
 }
-function GridToolbar({ activeFilterLabel, total, onBack, groupBy }: GridToolbarProps) {
+function Breadcrumb({ groupBy, activeFilterLabel, total, onBack, sort, onSortChange }: BreadcrumbProps) {
   return (
-    <div className="grid-toolbar">
-      <button
-        type="button"
-        className="secondary outline back-to-filters"
-        onClick={onBack}
-        title={`Clear ${groupBy} filter and return to filter cards`}
-      >
-        ← back to filters
+    <nav className="grid-breadcrumb" aria-label="Photo grid context">
+      <button type="button" className="crumb-back" onClick={onBack} title={`Clear ${groupBy} filter`}>
+        ← back
       </button>
-      {activeFilterLabel && (
-        <span className="grid-active-label">
-          showing <strong>{activeFilterLabel}</strong>
-          {total != null && (
-            <> ({total.toLocaleString()} asset{total === 1 ? '' : 's'})</>
-          )}
-        </span>
-      )}
-    </div>
+      <span className="crumb-sep">·</span>
+      <span className="crumb-scope">
+        {activeFilterLabel
+          ? <><strong>{activeFilterLabel}</strong>{total != null && <> · <span className="crumb-count">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>
+          : <>all photos{total != null && <> · <span className="crumb-count">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>}
+      </span>
+      <span className="crumb-sep">·</span>
+      <span className="crumb-sort">
+        <span className="crumb-sort-label">sort:</span>
+        {SORT_OPTIONS.map((s, i) => (
+          <span key={s.value} className="crumb-sort-group">
+            <button
+              type="button"
+              className={`crumb-sort-chip ${sort === s.value ? 'active' : ''}`}
+              onClick={() => onSortChange(s.value)}
+              title={s.hint}
+              aria-pressed={sort === s.value}
+            >
+              {s.label}
+            </button>
+            {i < SORT_OPTIONS.length - 1 && <span className="crumb-sort-sep">/</span>}
+          </span>
+        ))}
+      </span>
+    </nav>
   );
 }
