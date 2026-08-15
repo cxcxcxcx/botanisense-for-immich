@@ -40,23 +40,20 @@ export function Toolbar() {
     <form className="toolbar" onSubmit={e => e.preventDefault()}>
       {!collapsed && (
         <fieldset role="group" className="toolbar-fieldset">
-          <div className="toolbar-control">
-            <div className="toolbar-control-label">group by</div>
-            <div className="group-by-cards" role="radiogroup" aria-label="Group by">
-              {GROUP_BY_CARDS.map(g => (
-                <button
-                  key={g.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={filters.group_by === g.value}
-                  className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
-                  onClick={() => setFilters({ group_by: g.value, page: 0 })}
-                  title={`Bucket photos by ${g.label}`}
-                >
-                  {g.label}
-                </button>
-              ))}
-            </div>
+          <div className="group-by-cards" role="radiogroup" aria-label="Group by">
+            {GROUP_BY_CARDS.map(g => (
+              <button
+                key={g.value}
+                type="button"
+                role="radio"
+                aria-checked={filters.group_by === g.value}
+                className={`group-by-card ${filters.group_by === g.value ? 'active' : ''}`}
+                onClick={() => setFilters({ group_by: g.value, page: 0 })}
+                title={`Bucket photos by ${g.label}`}
+              >
+                {g.label}
+              </button>
+            ))}
           </div>
         </fieldset>
       )}

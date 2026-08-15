@@ -34,7 +34,6 @@ progress { width: 100%; height: 6px; }
 
 /* ---- Header / status / params / logs / legend ---- */
 
-.app-header { display: block; padding: 0.75rem 1.5rem; border-bottom: 1px solid #222; }
 /* Pin the header so the cluster/taxon cards (which can be hundreds)
    can page-scroll naturally without the header floating off as the
    user scrolls deep into the list. */
@@ -43,7 +42,7 @@ progress { width: 100%; height: 6px; }
   /* One tight row instead of three. View-tabs + hgroup + status live
      side-by-side; the page area gets the rest of the viewport. */
   display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem;
-  padding: 0.4rem 1.5rem; border-bottom: 1px solid #222;
+  padding: 0.4rem 1rem; border-bottom: 1px solid #222;
 }
 .app-header hgroup { display: flex; align-items: center; gap: 0.5rem; margin: 0; }
 .app-header hgroup h1 { margin: 0; font-size: 1.1rem; }
@@ -142,26 +141,33 @@ nav.legend-bar, .legend-bar {
 .plantae-legend { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; }
 .plantae-legend .swatch { width: 8px; height: 8px; border-radius: 2px; }
 
-/* ---- Toolbar + filter cards ---- */
+/* ---- Toolbar + filter cards ----
+   The toolbar holds the cluster/taxon list-view chrome:
+     - group-by chips
+     - FilterCards grid
+     - search sub-filter input + hint
+   Photo-sort and pagination live with the photo grid (Grid.tsx). */
 .toolbar {
-  display: flex; flex-direction: column; gap: 0.5rem;
-  padding: 0.5rem 1.5rem; border-bottom: 1px solid #2a2a2a;
+  display: flex; flex-direction: column; gap: 0.75rem;
+  padding: 0.5rem 1rem; border-bottom: 1px solid #2a2a2a;
 }
 .toolbar-fieldset {
-  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
   border: 0; padding: 0; margin: 0;
 }
 
 /* Group-by radio cards: choose the bucketing strategy (cluster /
    species / genus / family). Same visual language as the filter
-   cards below but smaller and pill-shaped. */
+   cards below but smaller and pill-shaped. Self-explanatory
+   (cluster | species | genus | family), no separate label needed. */
 .group-by-cards {
   display: inline-flex; gap: 4px; padding: 4px;
   background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
 }
 .group-by-card {
   background: transparent; color: #aaa; border: 1px solid transparent;
-  padding: 4px 12px; font-size: 0.8rem; border-radius: 6px; cursor: pointer;
+  padding: 5px 12px; font-size: 0.85rem; line-height: 1.2;
+  border-radius: 6px; cursor: pointer;
   font: inherit; text-transform: lowercase;
 }
 .group-by-card:hover { color: #fff; border-color: #444; }
@@ -169,19 +175,10 @@ nav.legend-bar, .legend-bar {
   background: #2c8a4a; color: #fff; border-color: #5cc078;
 }
 
-/* Each toolbar row carries a tiny label above the controls so users
-   know which dimension they're picking without hovering. */
-.toolbar-control {
-  display: inline-flex; flex-direction: column; gap: 2px;
-}
-.toolbar-control-label {
-  font-size: 0.7rem; color: #888; padding-left: 6px;
-  text-transform: uppercase; letter-spacing: 0.04em;
-}
-
 .toolbar select, .toolbar input[type=search] {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
-  padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
+  padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
+  line-height: 1.2;
 }
 
 /* Filter search input — a sub-filter of the selected group_by, not a
@@ -228,6 +225,7 @@ nav.legend-bar, .legend-bar {
 .filter-cards-sort-chip {
   background: transparent; color: #aaa; border: 0; padding: 0;
   cursor: pointer; font: inherit;
+  font-size: 0.8rem; line-height: 1.2;
 }
 .filter-cards-sort-chip:hover { color: #fff; }
 .filter-cards-sort-chip.active {
@@ -342,14 +340,14 @@ nav.legend-bar, .legend-bar {
 
 /* ---- Cluster album bar ---- */
 .cluster-album-bar {
-  padding: 0.5rem 1.5rem; border-bottom: 1px solid #2a2a2a;
+  padding: 0.5rem 1rem; border-bottom: 1px solid #2a2a2a;
   font-size: 0.85rem;
 }
 .cluster-album-controls { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .cluster-album-controls .muted { color: #888; }
 
 /* ---- Grid + cards ---- */
-.grid-pane { padding: 1rem 1.5rem; }
+.grid-pane { padding: 0.5rem 1rem; }
 
 /* Breadcrumb above the photo grid: one tight strip with back link,
    active-filter scope, count, and inline sort chips. No big button,
@@ -392,9 +390,12 @@ nav.legend-bar, .legend-bar {
 }
 
 .card {
-  background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 10px;
+  /* No border — the gap between grid columns already provides visual
+     separation, and the photo itself fills edge-to-edge. */
+  background: #000;
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
   position: relative;
+  border-radius: 0;
   /* Reserve vertical space so the layout doesn't jump as lazy-loaded
      thumbnails stream in (cards are roughly square; on narrow
      viewports a single column makes each card close to full-width). */
