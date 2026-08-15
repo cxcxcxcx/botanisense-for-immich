@@ -95,7 +95,6 @@ export function App() {
           </section>
         ) : view === 'browse-content' ? (
           <>
-            <Toolbar />
             <ClusterAlbumBar />
             <Grid />
           </>

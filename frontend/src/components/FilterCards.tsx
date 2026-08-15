@@ -189,35 +189,12 @@ export function FilterCards() {
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
-  // Collapsed view: just the active-bar with sample thumb + label +
-  // count + clear/show buttons.
+  // Collapsed (content view): nothing here. The Grid's own toolbar
+  // carries the only "← back to filters" affordance — having both an
+  // active-bar � and the Grid toolbar button duplicates the same
+  // "clear the active filter" action.
   if (collapsed && activeCard) {
-    return (
-      <div className="filter-cards-wrap">
-        <div className="filter-active-bar">
-          <button
-            type="button"
-            className={`filter-card filter-active-card ${filters.group_by}`}
-            onClick={clearFilter}
-            title={`${activeCard.label} · ${activeCard.count} asset${activeCard.count === 1 ? '' : 's'} — click to clear`}
-          >
-            <FilterCardOverlay card={activeCard} />
-            <span className="filter-clear-x">✕</span>
-          </button>
-          <div className="filter-active-meta">
-            <strong>{activeCard.label}</strong>
-            <small>{activeCard.count.toLocaleString()} asset{activeCard.count === 1 ? '' : 's'} · {filters.group_by}</small>
-          </div>
-          <button
-            type="button"
-            className="secondary outline"
-            onClick={toggleForceShow}
-          >
-            show all {allCards.length + 1} filters
-          </button>
-        </div>
-      </div>
-    );
+    return null;
   }
 
   return (
