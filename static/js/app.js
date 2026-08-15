@@ -141,11 +141,15 @@ document.addEventListener('alpine:init', () => {
       } catch (e) { /* keep defaults */ }
     },
     html() {
-      const g = (this.green ?? 0.60).toFixed(2);
-      const y = (this.yellow ?? 0.35).toFixed(2);
-      return `Plantae <span class="swatch" style="background:#1a3a1a"></span>≥${g} ` +
-             `<span class="swatch" style="background:#3a3a1a"></span>≥${y} ` +
-             `<span class="swatch" style="background:#3a1a1a"></span>&lt;${y}`;
+      // Coerce to String to defend against any reactive glitch that
+      // produces undefined / null before the first /api/results response.
+      const g = String((this.green ?? 0.60).toFixed(2));
+      const y = String((this.yellow ?? 0.35).toFixed(2));
+      return String(
+        `Plantae <span class="swatch" style="background:#1a3a1a"></span>≥${g} ` +
+        `<span class="swatch" style="background:#3a3a1a"></span>≥${y} ` +
+        `<span class="swatch" style="background:#3a1a1a"></span>&lt;${y}`
+      );
     },
   }));
 });

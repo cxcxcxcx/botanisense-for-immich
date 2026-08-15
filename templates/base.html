@@ -75,7 +75,10 @@
 
   {# Legend bar — Plantae legend + album buttons. #}
   <nav id="legend-bar" x-data="plantaeLegend()" x-init="refresh()">
-    <span id="plantae-legend" x-html="html()"></span>
+    {# noscript fallback so the legend is visible even if Alpine fails. #}
+    <span id="plantae-legend"
+          x-html="html()"
+          x-cloak>Plantae ≥0.60 ≥0.35 &lt;0.35</span>
     <button class="secondary outline" id="sync-all-clusters-btn"
             @click="$dispatch('open-job-panel', {kind:'sync-all'})">
       ⟳ Sync all clusters as albums

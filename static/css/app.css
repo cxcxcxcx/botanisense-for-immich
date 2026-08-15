@@ -8,6 +8,9 @@
 }
 body { background: #111; }
 
+/* Alpine x-cloak — hide elements until Alpine has initialized. */
+[x-cloak] { display: none !important; }
+
 * { box-sizing: border-box; }
 
 /* Override Pico's <details>/<dialog>/<progress> styles to fit the dark tool look. */
