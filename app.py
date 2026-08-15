@@ -1823,26 +1823,10 @@ def _apply_sort(results: list, sort: str) -> list:
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request) -> Response:
-    """Outer shell. Toolbar + grid-pane + modal + job-panel. The toolbar
-    pills are server-rendered (so they're visible on first paint); the
-    grid-pane hydrates via hx-get=/grid on load."""
-    # Server-render the cluster pills with default group_by=cluster so the
-    # user sees them immediately, without depending on a separate HTMX
-    # fetch that may race with the grid load.
-    qs = request.query_params
-    group_by = qs.get("group_by") or "cluster"
-    cluster_id = _int_or_none(qs.get("cluster_id"))
-    species = qs.get("species")
-    genus = qs.get("genus")
-    family = qs.get("family")
-    q = qs.get("q")
-    sort = qs.get("sort") or "rank"
-    pills_html = templates.get_template("_toolbar.html").render(
-        _filters_context(group_by, cluster_id, species, genus, family, q, sort)
-    )
+    """Outer shell. Toolbar + grid-pane + modal + job-panel. Pills and
+    grid are HTMX-loaded by the page (hx-trigger=load once)."""
     return templates.TemplateResponse(
         request, "base.html",
-        {"pills_html": pills_html},
         headers={"Cache-Control": "no-cache"},
     )
 
@@ -1855,8 +1839,8 @@ def _int_or_none(v):
 
 
 def _filters_context(group_by, cluster_id, species, genus, family, q, sort):
-    """Build the context dict for _toolbar.html. Used by both the
-    /filters endpoint and the / page (so they render identically)."""
+    """Build the context dict for _toolbar.html. Used by the /filters
+    endpoint so it renders identically across callers."""
     entries = []
     total_count = 0
     active = None

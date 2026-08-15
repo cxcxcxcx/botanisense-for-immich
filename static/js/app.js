@@ -318,6 +318,20 @@ window.Alpine?.data('jobPanel', () => ({
   },
 }));
 
+// ---- HTMX ↔ Alpine bridge ------------------------------------------------
+// HTMX swaps server-rendered HTML into the DOM. After a swap, Alpine needs
+// to scan the new subtree for x-data / @click / etc. directives so they
+// become reactive. Without this, swapped-in @click handlers stay dead.
+
+document.body.addEventListener('htmx:afterSwap', (e) => {
+  if (window.Alpine && window.Alpine.initTree) {
+    window.Alpine.initTree(e.target);
+  }
+});
+
+// HTMX also processes new content for its own triggers. We rely on Alpine
+// initTree to handle the directives; HTMX's own scan is harmless overlap.
+
 // ---- Fallback: if Alpine already initialized before our module ran, -----
 // manually process the data-pending elements. This handles the rare case
 // where Alpine boots faster than our module (e.g. cached module load).

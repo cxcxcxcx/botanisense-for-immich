@@ -141,14 +141,15 @@
            @input.debounce.300ms="if (ready) localStorage.setItem('q', $event.target.value)">
   </fieldset>
 
-  {# Cluster / taxonomy pills. Server-rendered on initial load; client-#}
-  {# refreshed on group_by change. We render at SSR time so the user #}
-  {# sees pills immediately, without waiting for a separate HTMX fetch. #}
+  {# Cluster / taxonomy pills. HTMX-loaded on page load; client-refreshed #}
+  {# on group_by change. Single source of truth — no SSR'd duplicates. #}
   <div id="cluster-pills"
        hx-get="/filters"
-       hx-trigger="change from:#group-by"
+       hx-trigger="load once, change from:#group-by"
        hx-include="#toolbar"
-       hx-swap="innerHTML">{{ pills_html|safe }}</div>
+       hx-swap="innerHTML">
+    <div class="empty" style="padding: 1rem;">Loading pills…</div>
+  </div>
 </form>
 
 {# ----- Cluster album bar — appears only when a cluster pill is clicked. #}
