@@ -106,15 +106,18 @@
 
 {# ----- Toolbar (filters + cluster pills) ----- #}
 {# OUTSIDE #root. Survives every grid swap. #}
+{# The `changed` modifier on `change` ensures we only submit when the #}
+{# user actually changes the value — not on programmatic value sets #}
+{# from x-init reading localStorage. #}
 <form id="toolbar" hx-get="/grid" hx-target="#grid-pane"
-      hx-trigger="change from:#sort-mode, input changed delay:300ms from:input[type=search], search from:input[type=search]"
+      hx-trigger="change from:#sort-mode changed, input changed delay:300ms from:input[type=search], search from:input[type=search]"
       hx-push-url="true">
   <fieldset role="group">
     <label>group by
       <select id="group-by" name="group_by"
-              x-data="{ v: $el.value }"
-              x-init="$nextTick(() => { const saved = localStorage.getItem('groupBy') || 'cluster'; if ($el.value !== saved) { v = saved; $el.value = saved; } })"
-              @change="v = $event.target.value; localStorage.setItem('groupBy', v);">
+              x-data="{ ready: false }"
+              x-init="$nextTick(() => { const saved = localStorage.getItem('groupBy') || 'cluster'; if ($el.value !== saved) $el.value = saved; ready = true; })"
+              @change="if (ready) localStorage.setItem('groupBy', $event.target.value);">
         <option value="species">species</option>
         <option value="genus">genus</option>
         <option value="family">family</option>
@@ -123,9 +126,9 @@
     </label>
     <label>sort
       <select id="sort-mode" name="sort"
-              x-data="{ v: $el.value }"
-              x-init="$nextTick(() => { const saved = localStorage.getItem('sortMode') || 'rank'; if ($el.value !== saved) { v = saved; $el.value = saved; } })"
-              @change="v = $event.target.value; localStorage.setItem('sortMode', v);">
+              x-data="{ ready: false }"
+              x-init="$nextTick(() => { const saved = localStorage.getItem('sortMode') || 'rank'; if ($el.value !== saved) $el.value = saved; ready = true; })"
+              @change="if (ready) localStorage.setItem('sortMode', $event.target.value);">
         <option value="rank">search rank</option>
         <option value="plantae">plantae confidence</option>
         <option value="score">top-1 score</option>
@@ -133,8 +136,9 @@
     </label>
     <input id="cluster-search" name="q" type="search"
            placeholder="search species…" autocomplete="off"
-           x-data x-init="if(localStorage.getItem('q')) { $el.value = localStorage.getItem('q'); $dispatch('input'); }"
-           @input.debounce.300ms="localStorage.setItem('q', $event.target.value)">
+           x-data="{ ready: false }"
+           x-init="$nextTick(() => { const saved = localStorage.getItem('q') || ''; if (saved && $el.value !== saved) $el.value = saved; ready = true; })"
+           @input.debounce.300ms="if (ready) localStorage.setItem('q', $event.target.value)">
   </fieldset>
 
   {# Cluster / taxonomy pills. Server-rendered on initial load; client-#}
