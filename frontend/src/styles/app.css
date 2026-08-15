@@ -572,8 +572,9 @@ h5 { margin: 1rem 0 0.5rem; font-size: 0.95rem; color: #ad9; }
 /* ---- Mobile ---- */
 @media (max-width: 600px) {
   .app-header, .toolbar, .cluster-album-bar, .grid-pane { padding-left: 0.75rem; padding-right: 0.75rem; }
-  /* Keep ≥2 columns even on phones — the card meta is small enough to fit. */
-  .photo-grid { grid-template-columns: 1fr; gap: 8px; }
+  /* Keep the 2-column grid even on narrow phones — the photo + overlay
+     design is compact enough to fit two per row. */
+  .photo-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
   dialog.detail-dialog { max-width: 100vw; max-height: 100vh; border-radius: 0; }
   .params-details input[type=text] { min-width: 0; width: 100%; }
   .params-details input[type=number] { width: 80px; }
