@@ -7,7 +7,8 @@
 
 <div class="cluster-pills">
   {# "All" pill — clears any active filter. #}
-  <button class="cluster-pill {{ 'on' if active is none else '' }}"
+  {# `type="button"` so the click doesn't submit the parent form. #}
+  <button type="button" class="cluster-pill {{ 'on' if active is none else '' }}"
           @click="
             $dispatch('cluster-pill-clicked', {id: null});
             htmx.ajax('GET', '/grid?sort=rank', {target: '#grid-pane', swap: 'outerHTML'});
@@ -19,7 +20,7 @@
 
   {% for entry in entries %}
     {% set is_active = (active == entry.key) %}
-    <button class="cluster-pill {{ 'on' if is_active else '' }}"
+    <button type="button" class="cluster-pill {{ 'on' if is_active else '' }}"
             title="{{ entry.tooltip or '' }}"
             @click="
               const id = {{ entry.key if group_by == 'cluster' else 'null' }};
