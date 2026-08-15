@@ -29,7 +29,11 @@ export function Modal({ open, onClose, title, children }: Props) {
     >
       <article>
         <header>
-          <button className="close" rel="prev" aria-label="Close" onClick={onClose}>✕</button>
+          {/* Pico.css paints the X via `background-image: var(--pico-icon-close)`
+             on any .close / [rel=prev] inside <dialog><article>. The button
+             must therefore have empty content; a literal "✕" would stack on
+             top of the SVG and render the close glyph twice. */}
+          <button className="close" rel="prev" aria-label="Close" onClick={onClose} />
           <h3>{title || 'Asset detail'}</h3>
         </header>
         <div className="modal-body">{children}</div>

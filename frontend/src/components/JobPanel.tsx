@@ -213,7 +213,10 @@ export function JobPanel() {
       <article>
         <header>
           <h4>{cfg.title()}</h4>
-          <button className="close" rel="prev" aria-label="Close" onClick={hide}>✕</button>
+          {/* Pico.css paints the X via `background-image: var(--pico-icon-close)`
+             on any .close / [rel=prev] inside <dialog><article>. Empty content
+             avoids the text "✕" stacking on top of the SVG X. */}
+          <button className="close" rel="prev" aria-label="Close" onClick={hide} />
         </header>
 
         {active.state === 'confirm' && (
