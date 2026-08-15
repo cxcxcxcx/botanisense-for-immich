@@ -402,13 +402,8 @@ nav.legend-bar, .legend-bar {
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
   position: relative;
   border-radius: 0;
-  /* Reserve vertical space so the layout doesn't jump as lazy-loaded
-     thumbnails stream in (cards are roughly square; on narrow
-     viewports a single column makes each card close to full-width). */
-  min-height: 320px;
-}
-@media (max-width: 720px) {
-  .card { min-height: 220px; }
+  /* No min-height: the .img-wrap's aspect-ratio: 1 / 1 already reserves
+     the box, so the grid is stable before lazy-loaded images arrive. */
 }
 
 /* ---- Run view (#run) ----
@@ -420,8 +415,17 @@ nav.legend-bar, .legend-bar {
 .run-view .log-pre { max-height: 30vh; }
 .app-main.view-run { padding-bottom: 2rem; }
 
-.img-wrap { position: relative; background: #000; }
-.img-wrap img { width: 100%; height: auto; display: block; }
+.img-wrap {
+  position: relative; background: #000;
+  /* Fixed aspect ratio so cards line up regardless of the photo's
+     natural shape. The photo uses object-fit: cover to fill it. */
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+}
+.img-wrap img {
+  width: 100%; height: 100%; display: block;
+  object-fit: cover; object-position: center;
+}
 .img-wrap svg.bbox { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
 .img-wrap .bbox rect { fill: none; stroke: #5f5; stroke-width: 2; vector-effect: non-scaling-stroke; }
 .img-wrap .bbox text { fill: #5f5; font: 11px/1 ui-monospace, monospace;
