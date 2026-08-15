@@ -1,7 +1,6 @@
 import { useEffect } from 'react';
 import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
-import { FilterCards } from './components/FilterCards';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
 import { Modal } from './components/Modal';
@@ -68,7 +67,6 @@ export function App() {
         {view === 'browse' ? (
           <>
             <Toolbar />
-            <FilterCards />
             <ClusterAlbumBar />
             <Grid />
           </>
