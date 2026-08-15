@@ -37,23 +37,27 @@ export function LegendBar() {
 
   return (
     <nav className="legend-bar">
-      <span className="plantae-legend" title="Plantae confidence tiers">
-        Plantae <span className="swatch" style={{ background: '#1a3a1a' }}></span>≥{plantae.green.toFixed(2)}{' '}
-        <span className="swatch" style={{ background: '#3a3a1a' }}></span>≥{plantae.yellow.toFixed(2)}{' '}
-        <span className="swatch" style={{ background: '#3a1a1a' }}></span>&lt;{plantae.yellow.toFixed(2)}
-      </span>
-      <button className="secondary outline" onClick={handleSyncAll}>
-        ⟳ Sync all clusters as albums
-      </button>
-      <button className="secondary outline" onClick={handlePlants}>
-        Tag as Plants album
-      </button>
-      <button className="secondary outline" onClick={handleFungi}>
-        Tag as Fungi album
-      </button>
-      <button className="secondary outline" onClick={handleReclassifyVisible}>
-        Reclassify visible with KNN
-      </button>
+      <div className="legend-bar-row">
+        <span className="plantae-legend" title="Plantae confidence tiers">
+          Plantae <span className="swatch" style={{ background: '#1a3a1a' }}></span>≥{plantae.green.toFixed(2)}{' '}
+          <span className="swatch" style={{ background: '#3a3a1a' }}></span>≥{plantae.yellow.toFixed(2)}{' '}
+          <span className="swatch" style={{ background: '#3a1a1a' }}></span>&lt;{plantae.yellow.toFixed(2)}
+        </span>
+      </div>
+      <div className="legend-bar-actions">
+        <button className="secondary outline" onClick={handleSyncAll}>
+          ⟳ Sync all clusters as albums
+        </button>
+        <button className="secondary outline" onClick={handlePlants}>
+          Tag as Plants album
+        </button>
+        <button className="secondary outline" onClick={handleFungi}>
+          Tag as Fungi album
+        </button>
+        <button className="secondary outline" onClick={handleReclassifyVisible}>
+          Reclassify visible with KNN
+        </button>
+      </div>
     </nav>
   );
 }

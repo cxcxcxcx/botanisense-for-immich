@@ -35,8 +35,13 @@ progress { width: 100%; height: 6px; }
 /* ---- Header / status / params / logs / legend ---- */
 
 .app-header { display: block; padding: 0.75rem 1.5rem; border-bottom: 1px solid #222; }
-.app-header hgroup { display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem; }
+.app-header hgroup { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem; flex-wrap: wrap; }
 .app-header hgroup h1 { margin: 0; font-size: 1.25rem; }
+
+/* Header buttons (open params / logs modal). Sit on the right of the
+   hgroup row next to the KNN pill so they don't take their own strip. */
+.header-buttons { display: inline-flex; gap: 0.5rem; margin-left: auto; }
+.header-btn { font-size: 0.8rem; padding: 4px 10px; }
 
 #status-panel, .status-panel {
   display: flex; flex-wrap: wrap; align-items: center; gap: 0.75rem;
@@ -70,33 +75,33 @@ progress { width: 100%; height: 6px; }
 .stage-yolo         { background: #e74c3c; }
 .stage-bbox-bioclip { background: #1abc9c; }
 
-/* Pipeline params (collapsed <details>). */
-#params-details, .params-details { padding: 0.5rem 0; border-bottom: 1px solid #222; }
-.params-details summary { font-size: 0.85rem; cursor: pointer; padding: 0.25rem 0; }
-.params-details fieldset { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: start; border: 0; padding: 0; margin: 0; }
-.params-details label { color: #888; font-size: 0.8rem; display: flex; flex-direction: column; gap: 0.15rem; min-width: 180px; }
-.params-details label > small { color: #777; font-size: 0.7rem; line-height: 1.35; max-width: 220px; }
-.params-details input { background: #222; color: #eee; border: 1px solid #444;
+/* Pipeline params form (lives inside the params modal). */
+.params-form { padding: 0; }
+.params-form fieldset { display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; align-items: start; border: 0; padding: 0; margin: 0; }
+.params-form label { color: #888; font-size: 0.8rem; display: flex; flex-direction: column; gap: 0.15rem; min-width: 220px; flex: 1 1 220px; }
+.params-form label > small { color: #777; font-size: 0.72rem; line-height: 1.4; }
+.params-form input { background: #222; color: #eee; border: 1px solid #444;
   padding: 5px 9px; border-radius: 6px; font-family: ui-monospace, monospace; }
-.params-details input[type=text] { min-width: 220px; width: 100%; }
-.params-details input[type=number] { width: 110px; }
-.params-details small { color: #888; }
-.params-details button[type=submit] { min-width: 80px; }
+.params-form input[type=text] { min-width: 220px; width: 100%; }
+.params-form input[type=number] { width: 110px; }
+.params-form small { color: #888; }
+.params-form button[type=submit] { min-width: 80px; }
 
-/* Logs. */
-details.log-tail { padding: 0.5rem 0; border-bottom: 1px solid #2a2a2a; }
-details.log-tail summary { font-size: 0.85rem; cursor: pointer; padding: 0.25rem 0; color: #888; }
-details.log-tail pre {
-  margin: 0.5rem 0 0; padding: 8px 16px; background: #0a0a0a; color: #bcb;
+/* Logs (rendered inside the logs modal). */
+.log-pre {
+  margin: 0; padding: 8px 16px; background: #0a0a0a; color: #bcb;
   font: 11px/1.4 ui-monospace, monospace;
-  max-height: 160px; overflow: auto; white-space: pre;
+  max-height: 60vh; overflow: auto; white-space: pre;
+  border: 1px solid #2a2a2a; border-radius: 4px;
 }
 
 /* Legend bar. */
 nav.legend-bar, .legend-bar {
-  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  display: flex; flex-direction: column; gap: 0.25rem;
   padding: 0.5rem 0; border-bottom: 1px solid #222; font-size: 0.85rem;
 }
+.legend-bar-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.legend-bar-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .legend-bar button { font-size: 0.8rem; }
 
 /* Plantae legend chip. */
@@ -116,26 +121,79 @@ nav.legend-bar, .legend-bar {
 }
 .toolbar input[type=search] { min-width: 200px; }
 
-.cluster-pills {
-  max-height: 220px; overflow-y: auto; padding: 6px 8px;
-  border: 1px solid #2a2a2a; border-radius: 6px; background: #161616;
-  display: flex; flex-wrap: wrap; gap: 4px; align-content: flex-start;
+/* ---- Filter cards (replaces cluster-pills) ----
+   Each card is a square: thumb on top, label + count strip on bottom.
+   Grid auto-fills with 140px+ columns and caps at 360px tall (scroll
+   for more). Active card has a green outline; sticky-active card is
+   pinned at the top when the search filter hides it. */
+.filter-cards-header {
+  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
+  padding: 0.25rem 0 0.5rem; font-size: 0.8rem; color: #888;
 }
-.cluster-pills::-webkit-scrollbar { width: 8px; }
-.cluster-pills::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+.filter-cards-header .filter-count { margin-left: auto; font-variant-numeric: tabular-nums; }
+.filter-card-all-btn { font-size: 0.8rem; padding: 4px 10px; }
+.filter-card-all-btn.on {
+  background: #2c8a4a; border-color: #5cc078; color: #fff;
+}
+.filter-card-all-btn:hover { border-color: #5cc078; }
+.filter-cards-wrap { padding-top: 0.25rem; }
+.filter-cards-wrap label { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; }
+.filter-cards-wrap label select {
+  background: #1a1a1a; color: #eee; border: 1px solid #333;
+  padding: 3px 8px; border-radius: 4px; font-size: 0.85rem;
+}
 
-.cluster-pill {
-  background: #1a4a2a; color: #e8f5e9;
-  padding: 4px 11px; border-radius: 12px; cursor: pointer;
-  user-select: none; font-size: 12px; border: 1px solid #2c6a3f;
-  transition: background 0.12s, border-color 0.12s;
+.filter-cards {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 10px; padding: 0.5rem 0;
+  max-height: 360px; overflow-y: auto;
+  scrollbar-width: thin;
 }
-.cluster-pill:hover { background: #225e36; border-color: #3a8a52; }
-.cluster-pill.on {
-  background: #2c8a4a; color: #fff; border-color: #5cc078;
-  box-shadow: 0 0 0 1px #5cc078;
+.filter-cards::-webkit-scrollbar { width: 8px; }
+.filter-cards::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
+
+.filter-card {
+  aspect-ratio: 1 / 1;
+  background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
+  overflow: hidden; cursor: pointer;
+  display: flex; flex-direction: column;
+  transition: border-color 0.12s, transform 0.12s;
 }
-.cluster-pill small { margin-left: 0.3rem; opacity: 0.8; }
+.filter-card:hover { border-color: #3a8a52; transform: translateY(-1px); }
+.filter-card.on {
+  border-color: #5cc078; box-shadow: 0 0 0 1px #5cc078;
+}
+.filter-card.pinned { border-color: #5cc078; }
+
+.filter-card .thumb {
+  flex: 1 1 auto; min-height: 0; background: #0a0a0a;
+  display: flex; align-items: center; justify-content: center;
+  overflow: hidden; position: relative;
+}
+.filter-card .thumb img {
+  width: 100%; height: 100%; object-fit: cover;
+}
+.filter-card .thumb .placeholder {
+  color: #444; font-size: 1.75rem; font-weight: 600;
+  text-transform: uppercase;
+}
+.filter-card .meta {
+  padding: 6px 8px; background: #1a1a1a; border-top: 1px solid #2a2a2a;
+  display: flex; flex-direction: column; gap: 1px;
+}
+.filter-card .meta .label {
+  font-size: 11px; font-weight: 600; color: #eee;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.filter-card .meta .count {
+  font-size: 10px; color: #888; font-family: ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+}
+.filter-card.pinned .meta .label::before { content: '✕ '; color: #f88; }
+.filter-card.cluster .meta .label { font-style: normal; }
+.filter-card.species .meta .label,
+.filter-card.genus .meta .label,
+.filter-card.family .meta .label { font-style: italic; }
 
 /* ---- Cluster album bar ---- */
 .cluster-album-bar {

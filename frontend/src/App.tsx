@@ -5,6 +5,8 @@ import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
 import { Modal } from './components/Modal';
 import { AssetDetail } from './components/AssetDetail';
+import { ParamsForm } from './components/ParamsForm';
+import { LogTail } from './components/LogTail';
 import { JobPanel } from './components/JobPanel';
 import { useApp, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters, useUrlFilters } from './hooks/useUrlFilters';
@@ -23,7 +25,6 @@ export function App() {
   useEffect(() => {
     const onPop = () => {
       const next = parseUrlFilters();
-      // Reset the reducer to the URL's state.
       dispatch({ type: 'SET_FILTERS', patch: { ...next } });
     };
     window.addEventListener('popstate', onPop);
@@ -41,9 +42,15 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [modal.open, dispatch]);
 
-  // Touch `setFilters` so eslint doesn't flag unused (the hook is here for
-  // the linke above).
   void setFilters;
+
+  // The Modal is a single <dialog> slot reused for three different
+  // dialogs (asset detail / params / logs) — discriminated by modal.kind.
+  const modalTitle = modal.kind === 'asset'
+    ? (modal.assetId ? `Asset ${modal.assetId.slice(0, 8)}…` : 'Asset detail')
+    : modal.kind === 'params' ? 'Pipeline parameters'
+    : modal.kind === 'logs' ? 'Server logs'
+    : '';
 
   return (
     <>
@@ -54,9 +61,11 @@ export function App() {
       <Modal
         open={modal.open}
         onClose={() => dispatch({ type: 'CLOSE_MODAL' })}
-        title={modal.assetId ? `Asset ${modal.assetId.slice(0, 8)}…` : 'Asset detail'}
+        title={modalTitle}
       >
-        {modal.assetId && <AssetDetail assetId={modal.assetId} />}
+        {modal.kind === 'asset' && modal.assetId && <AssetDetail assetId={modal.assetId} />}
+        {modal.kind === 'params' && <ParamsForm />}
+        {modal.kind === 'logs' && <LogTail active={modal.open} />}
       </Modal>
       <JobPanel />
     </>

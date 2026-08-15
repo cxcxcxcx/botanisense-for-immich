@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useFilters, type GroupBy, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { useDebounce } from '../hooks/useDebounce';
-import { Pills } from './Pills';
+import { FilterCards } from './FilterCards';
 
 export function Toolbar() {
   const filters = useFilters();
@@ -45,13 +45,13 @@ export function Toolbar() {
         </label>
         <input
           type="search"
-          placeholder="search species…"
+          placeholder="search filters…"
           autoComplete="off"
           value={q}
           onChange={e => setQ(e.target.value)}
         />
       </fieldset>
-      <Pills />
+      <FilterCards />
     </form>
   );
 }

@@ -382,13 +382,47 @@ def set_cluster_ids(
 
 
 def cluster_summary(conn: sqlite3.Connection) -> list[dict]:
+    # One SQL aggregate per cluster: count + representative sample. The
+    # representative is the asset in the cluster whose top-1 BioCLIP
+    # prediction has the highest score (tie-break by filename for
+    # deterministic ordering across reloads). The frontend renders this
+    # as a thumbnail on the cluster filter card.
     rows = conn.execute(
         """
-        SELECT cluster_id, COUNT(*) AS n
-        FROM assets
-        WHERE cluster_id IS NOT NULL
-        GROUP BY cluster_id
-        ORDER BY cluster_id ASC
+        SELECT
+          a.cluster_id,
+          COUNT(*) AS n,
+          (
+            SELECT p.asset_id
+            FROM predictions p
+            JOIN assets a2 ON a2.asset_id = p.asset_id
+            WHERE a2.cluster_id = a.cluster_id
+              AND p.rank = 'species' AND p.position = 0
+            ORDER BY p.score DESC, a2.original_file_name ASC
+            LIMIT 1
+          ) AS sample_asset_id,
+          (
+            SELECT a2.thumbnail_url
+            FROM predictions p
+            JOIN assets a2 ON a2.asset_id = p.asset_id
+            WHERE a2.cluster_id = a.cluster_id
+              AND p.rank = 'species' AND p.position = 0
+            ORDER BY p.score DESC, a2.original_file_name ASC
+            LIMIT 1
+          ) AS sample_thumbnail_url,
+          (
+            SELECT a2.original_file_name
+            FROM predictions p
+            JOIN assets a2 ON a2.asset_id = p.asset_id
+            WHERE a2.cluster_id = a.cluster_id
+              AND p.rank = 'species' AND p.position = 0
+            ORDER BY p.score DESC, a2.original_file_name ASC
+            LIMIT 1
+          ) AS sample_original_file_name
+        FROM assets a
+        WHERE a.cluster_id IS NOT NULL
+        GROUP BY a.cluster_id
+        ORDER BY a.cluster_id ASC
         """,
     ).fetchall()
     return [dict(r) for r in rows]
@@ -2080,7 +2114,10 @@ def get_global_taxonomy_summary(
 ) -> dict[str, list[dict]]:
     """Aggregate species/genus/family counts across ALL assets that have
     predictions. Database-wide — does NOT depend on any run. Used by the
-    pills in the global view so counts match the photos in the grid.
+    filter cards in the global view so counts match the photos in the
+    grid. Also picks a representative asset per (rank, name) using the
+    same heuristic as cluster_summary (highest top-1 score, filename
+    tie-break) so the cards have a thumbnail.
     """
     rows = conn.execute(
         """
@@ -2102,14 +2139,47 @@ def get_global_taxonomy_summary(
         if r["family"]:
             family[r["family"]] = family.get(r["family"], 0) + r["n"]
 
-    def sorted_dict(d: dict[str, int]) -> list[dict]:
+    # Per (rank, name): the asset with the best (score DESC, filename ASC)
+    # top-1 prediction — used as the card thumbnail.
+    sample_rows = conn.execute(
+        """
+        SELECT p.species, p.genus, p.family,
+               p.asset_id, p.score,
+               a.original_file_name, a.thumbnail_url
+        FROM predictions p
+        JOIN assets a ON a.asset_id = p.asset_id
+        WHERE p.rank = 'species' AND p.position = 0
+        """,
+    ).fetchall()
+
+    # best[rank][name] = (score, filename, asset_id, thumbnail_url).
+    # Pick highest score; tie-break by filename ASC for stability.
+    best: dict[str, dict[str, tuple]] = {"species": {}, "genus": {}, "family": {}}
+    for r in sample_rows:
+        entry = (r["score"], r["original_file_name"] or "",
+                 r["asset_id"], r["thumbnail_url"])
+        for rank, col in (("species", "species"), ("genus", "genus"), ("family", "family")):
+            name = r[col]
+            if not name:
+                continue
+            prev = best[rank].get(name)
+            if prev is None or entry > prev:
+                best[rank][name] = entry
+
+    def sorted_dict(d: dict[str, int], rank: str) -> list[dict]:
         return [
-            {"name": k, "n": v}
+            {
+                "name": k,
+                "n": v,
+                "sample_asset_id": (best[rank].get(k) or (None, None, None, None))[2],
+                "sample_thumbnail_url": (best[rank].get(k) or (None, None, None, None))[3],
+                "sample_original_file_name": (best[rank].get(k) or (None, None, None, None))[1],
+            }
             for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
         ]
 
     return {
-        "species": sorted_dict(species),
-        "genus": sorted_dict(genus),
-        "family": sorted_dict(family),
+        "species": sorted_dict(species, "species"),
+        "genus": sorted_dict(genus, "genus"),
+        "family": sorted_dict(family, "family"),
     }

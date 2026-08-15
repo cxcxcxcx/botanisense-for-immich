@@ -83,73 +83,69 @@ export function ParamsForm() {
   );
 
   return (
-    <details className="params-details">
-      <summary>Pipeline parameters</summary>
-      <form onSubmit={handleRun}>
-        <fieldset role="group">
-          <label>
-            {FIELDS.query?.label}
-            <input
-              type="text"
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              placeholder={FIELDS.query?.placeholder}
-              title={FIELDS.query?.help}
-            />
-            <HelpText k="query" />
-          </label>
+    <form onSubmit={handleRun} className="params-form">
+      <fieldset role="group">
+        <label>
+          {FIELDS.query?.label}
+          <input
+            type="text"
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            placeholder={FIELDS.query?.placeholder}
+            title={FIELDS.query?.help}
+          />
+          <HelpText k="query" />
+        </label>
 
-          <label>
-            {FIELDS.n_samples?.label}
-            <input
-              type="number"
-              value={n}
-              onChange={e => setN(e.target.value)}
-              min={FIELDS.n_samples?.min}
-              max={FIELDS.n_samples?.max}
-              placeholder={FIELDS.n_samples?.placeholder}
-              title={FIELDS.n_samples?.help}
-            />
-            <HelpText k="n_samples" />
-          </label>
+        <label>
+          {FIELDS.n_samples?.label}
+          <input
+            type="number"
+            value={n}
+            onChange={e => setN(e.target.value)}
+            min={FIELDS.n_samples?.min}
+            placeholder={FIELDS.n_samples?.placeholder}
+            title={FIELDS.n_samples?.help}
+          />
+          <HelpText k="n_samples" />
+        </label>
 
-          <label>
-            {FIELDS.top_k?.label}
-            <input
-              type="number"
-              value={topK}
-              onChange={e => setTopK(e.target.value)}
-              min={FIELDS.top_k?.min}
-              max={FIELDS.top_k?.max}
-              placeholder={FIELDS.top_k?.placeholder}
-              title={FIELDS.top_k?.help}
-            />
-            <HelpText k="top_k" />
-          </label>
+        <label>
+          {FIELDS.top_k?.label}
+          <input
+            type="number"
+            value={topK}
+            onChange={e => setTopK(e.target.value)}
+            min={FIELDS.top_k?.min}
+            max={FIELDS.top_k?.max}
+            placeholder={FIELDS.top_k?.placeholder}
+            title={FIELDS.top_k?.help}
+          />
+          <HelpText k="top_k" />
+        </label>
 
-          <label>
-            {FIELDS.batch_size?.label}
-            <input
-              type="number"
-              value={batch}
-              onChange={e => setBatch(e.target.value)}
-              min={FIELDS.batch_size?.min}
-              max={FIELDS.batch_size?.max}
-              placeholder={FIELDS.batch_size?.placeholder}
-              title={FIELDS.batch_size?.help}
-            />
-            <HelpText k="batch_size" />
-          </label>
+        <label>
+          {FIELDS.batch_size?.label}
+          <input
+            type="number"
+            value={batch}
+            onChange={e => setBatch(e.target.value)}
+            min={FIELDS.batch_size?.min}
+            max={FIELDS.batch_size?.max}
+            placeholder={FIELDS.batch_size?.placeholder}
+            title={FIELDS.batch_size?.help}
+          />
+          <HelpText k="batch_size" />
+        </label>
 
-          <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.5rem' }}>
-            <button type="submit" disabled={busy}>{busy ? 'Running…' : 'Run'}</button>
-            <button type="button" className="secondary outline" onClick={handleRefresh}>
-              ↻ Refresh (server defaults)
-            </button>
-            <small className="muted">empty fields = use server default</small>
-          </div>
-        </fieldset>
-      </form>
-    </details>
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.5rem', flexWrap: 'wrap' }}>
+          <button type="submit" disabled={busy}>{busy ? 'Running…' : 'Run'}</button>
+          <button type="button" className="secondary outline" onClick={handleRefresh}>
+            ↻ Refresh (server defaults)
+          </button>
+          <small className="muted">empty fields = use server default</small>
+        </div>
+      </fieldset>
+    </form>
   );
 }

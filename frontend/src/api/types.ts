@@ -70,6 +70,13 @@ export interface Pagination {
 export interface TaxonomyEntry {
   name: string;
   n: number;
+  // Representative asset for this taxon — used as the thumbnail on the
+  // filter card. The frontend ignores `sample_thumbnail_url` (Immich's
+  // direct URL) and uses thumbUrl(sample_asset_id) so it goes through
+  // our /thumb proxy and 24h cache.
+  sample_asset_id: string | null;
+  sample_thumbnail_url: string | null;
+  sample_original_file_name: string | null;
 }
 
 export interface Taxonomy {
@@ -115,6 +122,11 @@ export interface ClusterSummary {
   name: string;
   top_species: { species: string; common_name: string | null; count: number }[];
   top_genus: { genus: string; count: number }[];
+  // Representative asset for this cluster — used as the thumbnail on
+  // the filter card.
+  sample_asset_id: string | null;
+  sample_thumbnail_url: string | null;
+  sample_original_file_name: string | null;
 }
 
 export interface ClustersResponse {

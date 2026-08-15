@@ -1,13 +1,19 @@
 import { useEffect, useRef, useState } from 'react';
 import { getLogs } from '../api/endpoints';
 
-export function LogTail() {
-  const [open, setOpen] = useState(false);
+interface Props {
+  /** When true (modal open) the polling interval runs; when false it
+   *  cleans up. Same UX as the old <details> toggle but the visibility
+   *  comes from the modal lifecycle rather than a local <details> open. */
+  active: boolean;
+}
+
+export function LogTail({ active }: Props) {
   const [lines, setLines] = useState<string[]>([]);
   const preRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!active) return;
     let cancelled = false;
     const tick = async () => {
       try {
@@ -18,7 +24,7 @@ export function LogTail() {
     tick();
     const t = setInterval(tick, 2000);
     return () => { cancelled = true; clearInterval(t); };
-  }, [open]);
+  }, [active]);
 
   // Auto-scroll only if user is already at the bottom.
   useEffect(() => {
@@ -29,13 +35,8 @@ export function LogTail() {
   }, [lines]);
 
   return (
-    <details className="log-tail" onToggle={e => setOpen((e.target as HTMLDetailsElement).open)}>
-      <summary>{open ? '▾' : '▸'} logs (click to expand)</summary>
-      {open && (
-        <pre ref={preRef} className="log-pre">
-          {lines.join('\n')}
-        </pre>
-      )}
-    </details>
+    <pre ref={preRef} className="log-pre">
+      {lines.join('\n')}
+    </pre>
   );
 }
