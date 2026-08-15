@@ -1,7 +1,11 @@
 // Filter cards — rich square tiles that replace the old text-only
 // "cluster pills". Each card carries a sample thumbnail (the asset with
-// the highest top-1 BioCLIP score in that group), the label, and the
-// count. Sort modes (alpha / size / id) are persisted per group_by.
+// the highest top-1 BioCLIP score in that group) with the label and
+// count overlaid at the bottom of the photo.
+//
+// Once a filter is active the whole grid collapses behind a compact
+// "Active: X · n photos · show / clear" bar to make room for the grid
+// of matching photos.
 
 import { useEffect, useMemo, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
@@ -40,6 +44,12 @@ export function FilterCards() {
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
   const [resultsData, setResultsData] = useState<ResultsResponse | null>(null);
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
+
+  // Once a filter is active the grid auto-collapses; user can re-show
+  // it via a "show filters" button. We persist that toggle per
+  // group_by so switching views remembers it.
+  const [forceShow, setForceShow] = useState(false);
+  const COLLAPSE_KEY = (g: GroupBy) => `filtercards:collapsed:${g}`;
 
   // Persist sort per group_by so e.g. cluster-by-size + species-by-alpha
   // are independent.
@@ -97,16 +107,13 @@ export function FilterCards() {
     if (sortMode === 'alpha') {
       arr.sort((a, b) => a.label.localeCompare(b.label));
     } else if (sortMode === 'id' && filters.group_by === 'cluster') {
-      // Stable cluster_id sort (cluster keys are numeric strings).
       arr.sort((a, b) => Number(a.key) - Number(b.key));
     } else {
-      // 'size' (default) and fallback for non-cluster group_by.
       arr.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
     }
     return arr;
   }, [allCards, sortMode, filters.group_by]);
 
-  // Search-filter the visible cards. Empty search → show all.
   const visibleCards = useMemo<Card[]>(() => {
     const q = debouncedQ.trim().toLowerCase();
     if (!q) return sortedCards;
@@ -122,12 +129,33 @@ export function FilterCards() {
     return null;
   }, [filters.group_by, filters.cluster_id, filters.species, filters.genus, filters.family]);
 
-  // Sticky-active card when search hides it.
+  // The active card object (for the collapse bar + sticky).
+  const activeCard = useMemo<Card | null>(() => {
+    if (activeKey == null) return null;
+    return allCards.find(c => c.key === activeKey) ?? null;
+  }, [activeKey, allCards]);
+
+  // Sticky-active card when search hides it (only meaningful when the
+  // grid is visible).
   const stickyActive = useMemo<Card | null>(() => {
     if (activeKey == null) return null;
     if (visibleCards.some(c => c.key === activeKey)) return null;
     return allCards.find(c => c.key === activeKey) ?? null;
   }, [activeKey, visibleCards, allCards]);
+
+  // Auto-collapse when a filter is active; honor a user override that
+  // persists per group_by.
+  useEffect(() => {
+    setForceShow(localStorage.getItem(COLLAPSE_KEY(filters.group_by)) === '1');
+  }, [filters.group_by]);
+
+  const toggleForceShow = () => {
+    const next = !forceShow;
+    setForceShow(next);
+    localStorage.setItem(COLLAPSE_KEY(filters.group_by), next ? '1' : '0');
+  };
+
+  const collapsed = activeCard != null && !forceShow;
 
   const activeParamKey: 'cluster_id' | 'species' | 'genus' | 'family' =
     filters.group_by === 'cluster' ? 'cluster_id'
@@ -152,6 +180,37 @@ export function FilterCards() {
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
+  // Collapsed view: just the active-bar with sample thumb + label +
+  // count + clear/show buttons.
+  if (collapsed && activeCard) {
+    return (
+      <div className="filter-cards-wrap">
+        <div className="filter-active-bar">
+          <button
+            type="button"
+            className={`filter-card filter-active-card ${filters.group_by}`}
+            onClick={clearFilter}
+            title={`${activeCard.label} · ${activeCard.count} asset${activeCard.count === 1 ? '' : 's'} — click to clear`}
+          >
+            <FilterCardOverlay card={activeCard} />
+            <span className="filter-clear-x">✕</span>
+          </button>
+          <div className="filter-active-meta">
+            <strong>{activeCard.label}</strong>
+            <small>{activeCard.count.toLocaleString()} asset{activeCard.count === 1 ? '' : 's'} · {filters.group_by}</small>
+          </div>
+          <button
+            type="button"
+            className="secondary outline"
+            onClick={toggleForceShow}
+          >
+            show all {allCards.length} filters
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="filter-cards-wrap">
       <div className="filter-cards-header">
@@ -172,6 +231,15 @@ export function FilterCards() {
           all ({total.toLocaleString()})
         </button>
         <span className="filter-count">{visibleCards.length} shown</span>
+        {activeCard && (
+          <button
+            type="button"
+            className="secondary outline"
+            onClick={toggleForceShow}
+          >
+            collapse
+          </button>
+        )}
       </div>
 
       <div className="filter-cards">
@@ -213,10 +281,6 @@ interface TileProps {
 }
 
 function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
-  const [imgError, setImgError] = useState(false);
-  const showImg = card.sampleAssetId && !imgError;
-  const fallbackChar = card.label.replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
-
   const classes = [
     'filter-card',
     rank,
@@ -231,6 +295,17 @@ function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
       onClick={onClick}
       title={`${card.label} · ${card.count.toLocaleString()} asset${card.count === 1 ? '' : 's'}${pinned ? ' · click to clear' : ''}`}
     >
+      <FilterCardOverlay card={card} />
+    </button>
+  );
+}
+
+function FilterCardOverlay({ card }: { card: Card }) {
+  const [imgError, setImgError] = useState(false);
+  const showImg = card.sampleAssetId && !imgError;
+  const fallbackChar = card.label.replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
+  return (
+    <>
       <div className="thumb">
         {showImg ? (
           <img
@@ -244,10 +319,10 @@ function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
           <span className="placeholder">{fallbackChar}</span>
         )}
       </div>
-      <div className="meta">
-        <span className="label">{card.label}</span>
-        <span className="count">{card.count.toLocaleString()}</span>
+      <div className="overlay">
+        <span className="overlay-label">{card.label}</span>
+        <span className="overlay-count">{card.count.toLocaleString()}</span>
       </div>
-    </button>
+    </>
   );
 }

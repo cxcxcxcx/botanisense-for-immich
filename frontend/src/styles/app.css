@@ -122,10 +122,12 @@ nav.legend-bar, .legend-bar {
 .toolbar input[type=search] { min-width: 200px; }
 
 /* ---- Filter cards (replaces cluster-pills) ----
-   Each card is a square: thumb on top, label + count strip on bottom.
-   Grid auto-fills with 140px+ columns and caps at 360px tall (scroll
-   for more). Active card has a green outline; sticky-active card is
-   pinned at the top when the search filter hides it. */
+   Each card is a square: photo fills it with label + count overlaid
+   on a translucent gradient at the bottom (same pattern as the photo
+   grid cards). Grid auto-fills with 160px+ columns and caps at 360px
+   tall (scroll for more). When a filter is active, the grid collapses
+   into a compact "active bar" with a single sample-thumb tile + clear
+   button + "show all" toggle. */
 .filter-cards-header {
   display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
   padding: 0.25rem 0 0.5rem; font-size: 0.8rem; color: #888;
@@ -144,7 +146,7 @@ nav.legend-bar, .legend-bar {
 }
 
 .filter-cards {
-  display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
   gap: 10px; padding: 0.5rem 0;
   max-height: 360px; overflow-y: auto;
   scrollbar-width: thin;
@@ -153,10 +155,11 @@ nav.legend-bar, .legend-bar {
 .filter-cards::-webkit-scrollbar-thumb { background: #333; border-radius: 4px; }
 
 .filter-card {
+  position: relative;
   aspect-ratio: 1 / 1;
   background: #1a1a1a; border: 1px solid #2a2a2a; border-radius: 8px;
   overflow: hidden; cursor: pointer;
-  display: flex; flex-direction: column;
+  padding: 0; color: inherit;
   transition: border-color 0.12s, transform 0.12s;
 }
 .filter-card:hover { border-color: #3a8a52; transform: translateY(-1px); }
@@ -166,34 +169,62 @@ nav.legend-bar, .legend-bar {
 .filter-card.pinned { border-color: #5cc078; }
 
 .filter-card .thumb {
-  flex: 1 1 auto; min-height: 0; background: #0a0a0a;
+  position: absolute; inset: 0;
+  background: #0a0a0a;
   display: flex; align-items: center; justify-content: center;
-  overflow: hidden; position: relative;
+  overflow: hidden;
 }
 .filter-card .thumb img {
   width: 100%; height: 100%; object-fit: cover;
 }
 .filter-card .thumb .placeholder {
-  color: #444; font-size: 1.75rem; font-weight: 600;
+  color: #444; font-size: 2.25rem; font-weight: 600;
   text-transform: uppercase;
 }
-.filter-card .meta {
-  padding: 6px 8px; background: #1a1a1a; border-top: 1px solid #2a2a2a;
-  display: flex; flex-direction: column; gap: 1px;
+
+.filter-card .overlay {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 22px 8px 8px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,0.85) 100%);
+  color: #eee;
+  display: flex; flex-direction: column; gap: 3px;
+  pointer-events: none;
+  text-align: left;
 }
-.filter-card .meta .label {
-  font-size: 11px; font-weight: 600; color: #eee;
+.filter-card .overlay-label {
+  font: italic 600 13px/1.2 system-ui, sans-serif;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.filter-card .meta .count {
-  font-size: 10px; color: #888; font-family: ui-monospace, monospace;
-  font-variant-numeric: tabular-nums;
+.filter-card.cluster .overlay-label { font-style: normal; }
+.filter-card .overlay-count {
+  font: 600 11px/1 ui-monospace, monospace;
+  color: #ccc;
 }
-.filter-card.pinned .meta .label::before { content: '✕ '; color: #f88; }
-.filter-card.cluster .meta .label { font-style: normal; }
-.filter-card.species .meta .label,
-.filter-card.genus .meta .label,
-.filter-card.family .meta .label { font-style: italic; }
+
+/* The collapsed active-bar — single tile + meta + buttons. */
+.filter-active-bar {
+  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+  padding: 0.5rem 0;
+}
+.filter-active-card {
+  width: 88px; flex-shrink: 0;
+}
+.filter-active-card .filter-clear-x {
+  position: absolute; top: 4px; right: 4px;
+  background: rgba(244, 67, 54, 0.9); color: #fff;
+  font: bold 11px/1 ui-monospace, monospace;
+  padding: 2px 6px; border-radius: 3px; pointer-events: none;
+}
+.filter-active-meta {
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 0; flex: 1 1 200px;
+}
+.filter-active-meta strong {
+  font-size: 0.95rem; color: #eee;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.filter-active-meta small { color: #888; font-size: 0.75rem; }
 
 /* ---- Cluster album bar ---- */
 .cluster-album-bar {
