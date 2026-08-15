@@ -113,8 +113,8 @@
     <label>group by
       <select id="group-by" name="group_by"
               x-data="{ v: $el.value }"
-              x-init="$nextTick(() => { v = localStorage.getItem('groupBy') || 'cluster'; $el.value = v; $dispatch('change'); })"
-              @change="v = $event.target.value; localStorage.setItem('groupBy', v); $dispatch('change')">
+              x-init="$nextTick(() => { const saved = localStorage.getItem('groupBy') || 'cluster'; if ($el.value !== saved) { v = saved; $el.value = saved; } })"
+              @change="v = $event.target.value; localStorage.setItem('groupBy', v);">
         <option value="species">species</option>
         <option value="genus">genus</option>
         <option value="family">family</option>
@@ -124,8 +124,8 @@
     <label>sort
       <select id="sort-mode" name="sort"
               x-data="{ v: $el.value }"
-              x-init="$nextTick(() => { v = localStorage.getItem('sortMode') || 'rank'; $el.value = v; $dispatch('change'); })"
-              @change="v = $event.target.value; localStorage.setItem('sortMode', v); $dispatch('change')">
+              x-init="$nextTick(() => { const saved = localStorage.getItem('sortMode') || 'rank'; if ($el.value !== saved) { v = saved; $el.value = saved; } })"
+              @change="v = $event.target.value; localStorage.setItem('sortMode', v);">
         <option value="rank">search rank</option>
         <option value="plantae">plantae confidence</option>
         <option value="score">top-1 score</option>
