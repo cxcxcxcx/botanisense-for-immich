@@ -82,7 +82,7 @@ export function Card({ row, onUpdated }: Props) {
       </div>
 
       <div className="preds">
-        <Predictions items={row.top_predictions.slice(0, 5)} />
+        <Predictions items={(row.top_predictions ?? []).slice(0, 5)} />
       </div>
 
       {(row.detections ?? []).filter(d => d.score >= 0.10).length > 0 && (

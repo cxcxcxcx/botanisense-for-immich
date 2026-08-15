@@ -79,7 +79,7 @@ export function AssetDetail({ assetId }: Props) {
 
       <h5>Top-{data.top_predictions.length} predictions</h5>
       <div className="preds">
-        <Predictions items={data.top_predictions.slice(0, 5)} />
+        <Predictions items={(data.top_predictions ?? []).slice(0, 5)} />
       </div>
 
       {data.knn?.top_species ? (

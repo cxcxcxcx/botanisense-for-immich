@@ -1,8 +1,8 @@
 import { Fragment } from 'react';
 import type { Detection } from '../api/types';
 
-export function BboxOverlay({ detections }: { detections: Detection[] }) {
-  const visible = detections.filter(d => d.score >= 0.10);
+export function BboxOverlay({ detections }: { detections: Detection[] | undefined | null }) {
+  const visible = (detections ?? []).filter(d => d.score >= 0.10);
   if (visible.length === 0) return null;
   return (
     <svg className="bbox" viewBox="0 0 100 100" preserveAspectRatio="none">
