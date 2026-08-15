@@ -33,8 +33,12 @@ export function Header({ view }: Props) {
       </div>
       <hgroup>
         <h1>Immich × BioCLIP</h1>
-        <KnnPill />
       </hgroup>
+      {/* The KNN pill only matters where reclassification is exposed
+          (the Run view + per-asset reclassify buttons). On browse the
+          user is looking at already-classified photos, so the
+          "KNN: not built" state is just noise. */}
+      {active === 'run' && <KnnPill />}
       {active === 'run' ? <StatusPanel /> : <StatusPanel compact />}
       {active === 'run' && <LegendBar />}
     </header>
