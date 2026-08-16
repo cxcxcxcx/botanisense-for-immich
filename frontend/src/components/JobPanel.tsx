@@ -254,44 +254,45 @@ export function JobPanel() {
   };
 
   return (
-    <aside className="job-panel-slot">
-      <article>
-        <header>
-          <h4>{cfg.title()}</h4>
-          {/* Pico.css paints the X via `background-image: var(--pico-icon-close)`
-             on any .close / [rel=prev] inside <dialog><article>. Empty content
-             avoids the text "✕" stacking on top of the SVG X. */}
-          <button className="close" rel="prev" aria-label="Close" onClick={hide} />
+    <aside className="fixed bottom-6 right-6 z-[100] max-w-[32rem]">
+      <article className="bg-[#161616] border border-[#333] rounded-lg p-4 shadow-[0_8px_32px_rgba(0,0,0,0.6)]">
+        <header className="flex justify-between items-center mb-2 border-b border-[#222] pb-2">
+          <h4 className="m-0 text-base">{cfg.title()}</h4>
+          <button
+            className="text-fg-1 hover:text-fg text-lg leading-none px-2"
+            aria-label="Close"
+            onClick={hide}
+          >×</button>
         </header>
 
         {active.state === 'confirm' && (
           <div>
             <p>{cfg.confirmText(active.progress.total)}</p>
             {active.progress.sample.length > 0 && (
-              <ul className="purge-sample-list">
+              <ul className="list-none p-0 mt-1 mb-2 border border-[#2a2a2a] rounded bg-bg-1 max-h-40 overflow-auto text-[11px] font-mono">
                 {active.progress.sample.map(s => (
-                  <li key={s.asset_id}>
-                    <span className="purge-sample-name">{s.original_file_name}</span>
+                  <li key={s.asset_id} className="flex justify-between gap-2 py-0.5 px-2 border-t border-[#1f1f1f] first:border-t-0">
+                    <span className="text-fg overflow-hidden text-ellipsis whitespace-nowrap flex-1 min-w-0">{s.original_file_name}</span>
                     {s.cluster_id != null && (
-                      <small className="purge-sample-cluster">cluster #{s.cluster_id}</small>
+                      <small className="text-fg-1 flex-shrink-0">cluster #{s.cluster_id}</small>
                     )}
                   </li>
                 ))}
               </ul>
             )}
-            <footer>
-              <button type="button" className="secondary" onClick={hide}>Cancel</button>
-              <button type="button" onClick={start}>Confirm</button>
+            <footer className="flex gap-2 mt-2 text-right">
+              <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={hide}>Cancel</button>
+              <button type="button" className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover" onClick={start}>Confirm</button>
             </footer>
           </div>
         )}
 
         {active.state === 'preview-error' && (
           <div>
-            <p>✕ <span className="error">{active.errorMsg}</span></p>
-            <footer>
-              <button type="button" className="secondary" onClick={hide}>Dismiss</button>
-              <button type="button" onClick={() => dispatch({ type: 'JOB_PREVIEW_OK', total: 0 })}>Retry</button>
+            <p>✕ <span className="text-red-300">{active.errorMsg}</span></p>
+            <footer className="flex gap-2 mt-2 justify-end">
+              <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={hide}>Dismiss</button>
+              <button type="button" className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover" onClick={() => dispatch({ type: 'JOB_PREVIEW_OK', total: 0 })}>Retry</button>
             </footer>
           </div>
         )}
@@ -299,11 +300,11 @@ export function JobPanel() {
         {active.state === 'running' && (
           <div>
             <p>{cfg.runningText(active.progress.added, active.progress.total)}</p>
-            <progress value={active.progress.added} max={Math.max(1, active.progress.total)} />
+            <progress value={active.progress.added} max={Math.max(1, active.progress.total)} className="w-full h-1.5" />
             <p>
               <button
                 type="button"
-                className="secondary outline"
+                className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]"
                 onClick={hide}
                 title="Hide this panel — the job keeps running in the background"
               >
@@ -320,16 +321,16 @@ export function JobPanel() {
               {cfg.hasAlbumLink && active.progress.album_id && active.progress.album_url && (
                 <>
                   {' '}
-                  <a href={active.progress.album_url} target="_blank" rel="noopener noreferrer">
+                  <a href={active.progress.album_url} target="_blank" rel="noopener noreferrer" className="text-[#7ad] hover:underline">
                     {active.progress.album_id.slice(0, 8)}…
                   </a>
                 </>
               )}
-              {active.progress.reused && <small className="muted"> (reused existing album)</small>}
+              {active.progress.reused && <small className="text-fg-1"> (reused existing album)</small>}
             </p>
-            <footer>
-              <button type="button" className="secondary" onClick={hide}>Dismiss</button>
-              <button type="button" onClick={() => dispatch({ type: 'JOB_PREVIEW_OK', total: active.progress.total })}>
+            <footer className="flex gap-2 mt-2 justify-end">
+              <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={hide}>Dismiss</button>
+              <button type="button" className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover" onClick={() => dispatch({ type: 'JOB_PREVIEW_OK', total: active.progress.total })}>
                 Run again
               </button>
             </footer>
@@ -338,10 +339,10 @@ export function JobPanel() {
 
         {active.state === 'error' && (
           <div>
-            <p>✕ <span className="error">{active.errorMsg || pollError}</span></p>
-            <footer>
-              <button type="button" className="secondary" onClick={hide}>Dismiss</button>
-              <button type="button" onClick={start}>Retry</button>
+            <p>✕ <span className="text-red-300">{active.errorMsg || pollError}</span></p>
+            <footer className="flex gap-2 mt-2 justify-end">
+              <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={hide}>Dismiss</button>
+              <button type="button" className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover" onClick={start}>Retry</button>
             </footer>
           </div>
         )}

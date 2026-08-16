@@ -2,10 +2,6 @@
 // "cluster pills". Each card carries a sample thumbnail (the asset with
 // the highest top-1 BioCLIP score in that group) with the label and
 // count overlaid at the bottom of the photo.
-//
-// Once a filter is active the whole grid collapses behind a compact
-// "Active: X · n photos · show / clear" bar to make room for the grid
-// of matching photos.
 
 import { useEffect, useMemo, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
@@ -46,41 +42,23 @@ export function FilterCards() {
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
   const [resultsData, setResultsData] = useState<ResultsResponse | null>(null);
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
-
-  // Once a filter is active the grid auto-collapses; user can re-show
-  // it via a "show filters" button. We persist that toggle per
-  // group_by so switching views remembers it.
   const [forceShow, setForceShow] = useState(false);
   const COLLAPSE_KEY = (g: GroupBy) => `filtercards:collapsed:${g}`;
 
-  // Persist sort per group_by so e.g. cluster-by-size + species-by-alpha
-  // are independent.
-  useEffect(() => {
-    setSortMode(readSort(filters.group_by));
-  }, [filters.group_by]);
+  useEffect(() => { setSortMode(readSort(filters.group_by)); }, [filters.group_by]);
+  useEffect(() => { localStorage.setItem(SORT_KEY(filters.group_by), sortMode); }, [filters.group_by, sortMode]);
 
-  useEffect(() => {
-    localStorage.setItem(SORT_KEY(filters.group_by), sortMode);
-  }, [filters.group_by, sortMode]);
-
-  // Fetch cluster summary when group_by == cluster.
   useEffect(() => {
     if (filters.group_by !== 'cluster') return;
     let cancelled = false;
-    getClusters()
-      .then(j => { if (!cancelled) setClusterData(j.clusters); })
-      .catch(() => { /* keep null */ });
+    getClusters().then(j => { if (!cancelled) setClusterData(j.clusters); }).catch(() => {});
     return () => { cancelled = true; };
   }, [filters.group_by]);
 
-  // Fetch taxonomy for species / genus / family. page_size=1 is enough —
-  // the taxonomy block is global, not paginated.
   useEffect(() => {
     if (filters.group_by === 'cluster') return;
     let cancelled = false;
-    getResults({ page: 0, page_size: 1 })
-      .then(r => { if (!cancelled) setResultsData(r); })
-      .catch(() => { /* keep null */ });
+    getResults({ page: 0, page_size: 1 }).then(r => { if (!cancelled) setResultsData(r); }).catch(() => {});
     return () => { cancelled = true; };
   }, [filters.group_by]);
 
@@ -106,13 +84,9 @@ export function FilterCards() {
 
   const sortedCards = useMemo<Card[]>(() => {
     const arr = [...allCards];
-    if (sortMode === 'alpha') {
-      arr.sort((a, b) => a.label.localeCompare(b.label));
-    } else if (sortMode === 'id' && filters.group_by === 'cluster') {
-      arr.sort((a, b) => Number(a.key) - Number(b.key));
-    } else {
-      arr.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
-    }
+    if (sortMode === 'alpha') arr.sort((a, b) => a.label.localeCompare(b.label));
+    else if (sortMode === 'id' && filters.group_by === 'cluster') arr.sort((a, b) => Number(a.key) - Number(b.key));
+    else arr.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
     return arr;
   }, [allCards, sortMode, filters.group_by]);
 
@@ -122,7 +96,6 @@ export function FilterCards() {
     return sortedCards.filter(c => c.label.toLowerCase().includes(q));
   }, [sortedCards, debouncedQ]);
 
-  // Active filter key (cluster_id as string, or taxon name).
   const activeKey = useMemo<string | null>(() => {
     if (filters.group_by === 'cluster') return filters.cluster_id != null ? String(filters.cluster_id) : null;
     if (filters.group_by === 'species') return filters.species ?? null;
@@ -131,33 +104,19 @@ export function FilterCards() {
     return null;
   }, [filters.group_by, filters.cluster_id, filters.species, filters.genus, filters.family]);
 
-  // The active card object (for the collapse bar + sticky).
   const activeCard = useMemo<Card | null>(() => {
     if (activeKey == null) return null;
     return allCards.find(c => c.key === activeKey) ?? null;
   }, [activeKey, allCards]);
 
-  // Sticky-active card when search hides it (only meaningful when the
-  // grid is visible).
   const stickyActive = useMemo<Card | null>(() => {
     if (activeKey == null) return null;
     if (visibleCards.some(c => c.key === activeKey)) return null;
     return allCards.find(c => c.key === activeKey) ?? null;
   }, [activeKey, visibleCards, allCards]);
 
-  // Auto-collapse when a filter is active; honor a user override that
-  // persists per group_by.
-  useEffect(() => {
-    setForceShow(localStorage.getItem(COLLAPSE_KEY(filters.group_by)) === '1');
-  }, [filters.group_by]);
-
-  // Publish the effective collapsed state (activeCard != null && !forceShow)
-  // to the reducer so ClusterAlbumBar can hide when the active-bar
-  // already shows the cluster identity.
-  useEffect(() => {
-    const collapsed = activeCard != null && !forceShow;
-    dispatch({ type: 'SET_FILTERS_COLLAPSED', collapsed });
-  }, [activeCard, forceShow, dispatch]);
+  useEffect(() => { setForceShow(localStorage.getItem(COLLAPSE_KEY(filters.group_by)) === '1'); }, [filters.group_by]);
+  useEffect(() => { dispatch({ type: 'SET_FILTERS_COLLAPSED', collapsed: activeCard != null && !forceShow }); }, [activeCard, forceShow, dispatch]);
 
   const toggleForceShow = () => {
     const next = !forceShow;
@@ -173,25 +132,12 @@ export function FilterCards() {
     : filters.group_by === 'genus' ? 'genus'
     : 'family';
 
-  const clearFilter = () =>
-    setFilters({ [activeParamKey]: undefined, page: 0 } as Partial<typeof filters>);
+  const clearFilter = () => setFilters({ [activeParamKey]: undefined, page: 0 } as Partial<typeof filters>);
 
-  // "All" means: clear any active filter and jump to the photo grid so
-  // the user actually sees all their photos. The route-sync effect no
-  // longer auto-jumps content → list when the filter clears, so this
-  // navigation is the only thing taking the user from the filter
-  // cards view into the all-photos grid.
-  const goToAll = () => {
-    clearFilter();
-    navigate('browse-content');
-  };
+  const goToAll = () => { clearFilter(); navigate('browse-content'); };
 
   const handleClick = (card: Card) => {
-    if (card.key === activeKey) {
-      clearFilter();
-      navigate('browse-list');
-      return;
-    }
+    if (card.key === activeKey) { clearFilter(); navigate('browse-list'); return; }
     const v = activeParamKey === 'cluster_id' ? Number(card.key) : card.key;
     setFilters({ [activeParamKey]: v, page: 0 } as Partial<typeof filters>);
   };
@@ -201,40 +147,34 @@ export function FilterCards() {
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
-  // Collapsed (content view): nothing here. The Grid's own toolbar
-  // carries the only "← back to filters" affordance — having both an
-  // active-bar � and the Grid toolbar button duplicates the same
-  // "clear the active filter" action.
-  if (collapsed && activeCard) {
-    return null;
-  }
+  if (collapsed && activeCard) return null;
 
   return (
-    <div className="filter-cards-wrap">
-      <div className="filter-cards-header">
-        <span className="filter-cards-sort" role="radiogroup" aria-label="Sort filter cards">
-          <span className="filter-cards-sort-label">sort</span>
+    <div className="pt-1">
+      <div className="flex flex-wrap items-center gap-2 py-1 pb-2 text-[0.8rem] text-fg-1">
+        <span className="inline-flex items-center gap-1" role="radiogroup" aria-label="Sort filter cards">
+          <span className="text-fg-1 mr-[2px]">sort</span>
           {SORTS.map((s, i) => (
-            <span key={s.value} className="filter-cards-sort-group">
+            <span key={s.value} className="inline-flex items-center gap-1">
               <button
                 type="button"
                 role="radio"
                 aria-checked={sortMode === s.value}
-                className={`filter-cards-sort-chip ${sortMode === s.value ? 'active' : ''}`}
+                className={`bg-transparent border-0 p-0 m-0 cursor-pointer text-[0.85rem] leading-[22px] ${
+                  sortMode === s.value ? 'text-accent font-medium' : 'text-fg-0 hover:text-fg'
+                }`}
                 onClick={() => setSortMode(s.value)}
                 title={s.hint}
-              >
-                {s.label}
-              </button>
-              {i < SORTS.length - 1 && <span className="filter-cards-sort-sep">/</span>}
+              >{s.label}</button>
+              {i < SORTS.length - 1 && <span className="text-fg-3">/</span>}
             </span>
           ))}
         </span>
-        <span className="filter-count">{visibleCards.length} of {allCards.length} filters</span>
+        <span className="ml-auto tabular-nums">{visibleCards.length} of {allCards.length} filters</span>
         {activeCard && (
           <button
             type="button"
-            className="secondary outline"
+            className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.8rem] hover:bg-[#345] hover:border-accent"
             onClick={toggleForceShow}
           >
             collapse
@@ -242,10 +182,7 @@ export function FilterCards() {
         )}
       </div>
 
-      <div className="filter-cards">
-        {/* "All" card: special — no thumbnail, no filter active, total
-            count of assets. Always shown first so the user sees it as
-            the "unfiltered" option. */}
+      <div className="grid gap-2.5 py-1 grid-cols-[repeat(auto-fill,minmax(160px,1fr))]">
         <FilterAllCard
           total={total}
           groupBy={filters.group_by}
@@ -262,9 +199,9 @@ export function FilterCards() {
           />
         )}
         {isLoading && visibleCards.length === 0 && !stickyActive ? (
-          <div className="empty" style={{ gridColumn: '1 / -1' }}>Loading filters…</div>
+          <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>Loading filters…</div>
         ) : visibleCards.length === 0 && !stickyActive ? (
-          <div className="empty" style={{ gridColumn: '1 / -1' }}>No matches.</div>
+          <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>No matches.</div>
         ) : (
           visibleCards.map(c => (
             <FilterCardTile
@@ -296,41 +233,37 @@ interface AllCardProps {
   onClick: () => void;
 }
 
-// "All" card — special placeholder that represents the unfiltered
-// view. Always present so users have a one-click way to clear the
-// active filter without hunting for an "all" button. Visually a
-// card so it sits in the same grid as the rest.
 function FilterAllCard({ total, groupBy, active, onClick }: AllCardProps) {
   return (
     <button
       type="button"
-      className={`filter-card filter-card-all ${active ? 'on' : ''}`}
+      className={`filter-card relative aspect-square bg-bg-2 rounded-lg overflow-hidden cursor-pointer p-0 text-inherit border transition-colors hover:border-accent hover:-translate-y-px ${
+        active ? 'border-accent shadow-[0_0_0_1px_#5cc078]' : 'border-line2'
+      }`}
       onClick={onClick}
       title={`Show all ${total.toLocaleString()} assets (clear ${groupBy} filter)`}
     >
-      <div className="thumb thumb-all">
-        <span className="placeholder-all">∗</span>
+      <div className="absolute inset-0 bg-[#0a0a0a] flex items-center justify-center overflow-hidden" style={{ background: 'linear-gradient(135deg, #1a2a1a 0%, #142420 50%, #1a1a3a 100%)' }}>
+        <span className={`text-5xl font-bold text-accent ${active ? 'opacity-100' : 'opacity-50'}`} style={{ textShadow: '0 0 12px rgba(92,192,120,0.4)' }}>∗</span>
       </div>
-      <div className="overlay">
-        <span className="overlay-label">all</span>
-        <span className="overlay-count">{total.toLocaleString()}</span>
+      <div className="absolute left-0 right-0 bottom-0 pt-[22px] pb-2 px-2 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-[3px] pointer-events-none text-left">
+        <span className="font-semibold text-[13px]/[1.2] drop-shadow overflow-hidden text-ellipsis whitespace-nowrap">all</span>
+        <span className="font-mono font-semibold text-[11px]/[1] text-fg-0">{total.toLocaleString()}</span>
       </div>
     </button>
   );
 }
 
 function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
-  const classes = [
-    'filter-card',
-    rank,
-    active ? 'on' : '',
-    pinned ? 'pinned' : '',
-  ].filter(Boolean).join(' ');
-
+  const borderCls = pinned
+    ? 'border-accent'
+    : active
+      ? 'border-accent shadow-[0_0_0_1px_#5cc078]'
+      : 'border-line2 hover:border-accent';
   return (
     <button
       type="button"
-      className={classes}
+      className={`filter-card relative aspect-square bg-bg-2 rounded-lg overflow-hidden cursor-pointer p-0 text-inherit border transition-colors hover:border-accent hover:-translate-y-px ${borderCls}`}
       onClick={onClick}
       title={`${card.label} · ${card.count.toLocaleString()} asset${card.count === 1 ? '' : 's'}${pinned ? ' · click to clear' : ''}`}
     >
@@ -345,22 +278,23 @@ function FilterCardOverlay({ card }: { card: Card }) {
   const fallbackChar = card.label.replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
   return (
     <>
-      <div className="thumb">
+      <div className="absolute inset-0 bg-[#0a0a0a] flex items-center justify-center overflow-hidden">
         {showImg ? (
           <img
             src={thumbUrl(card.sampleAssetId as string)}
             alt={card.label}
             loading="lazy"
             decoding="async"
+            className="w-full h-full object-cover"
             onError={() => setImgError(true)}
           />
         ) : (
-          <span className="placeholder">{fallbackChar}</span>
+          <span className="text-[2.25rem] font-semibold uppercase text-[#444]">{fallbackChar}</span>
         )}
       </div>
-      <div className="overlay">
-        <span className="overlay-label">{card.label}</span>
-        <span className="overlay-count">{card.count.toLocaleString()}</span>
+      <div className="absolute left-0 right-0 bottom-0 pt-[22px] pb-2 px-2 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-[3px] pointer-events-none text-left">
+        <span className="font-semibold italic text-[13px]/[1.2] drop-shadow overflow-hidden text-ellipsis whitespace-nowrap">{card.label}</span>
+        <span className="font-mono font-semibold text-[11px]/[1] text-fg-0">{card.count.toLocaleString()}</span>
       </div>
     </>
   );

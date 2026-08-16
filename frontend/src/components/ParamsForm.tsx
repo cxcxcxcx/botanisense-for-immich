@@ -11,8 +11,6 @@ interface FieldHelp {
   step?: number;
 }
 
-// Each tunable documented for non-BioCLIP users. These appear as
-// placeholder text + a small tooltip on the right of the input.
 const FIELDS: Record<string, FieldHelp> = {
   query: {
     label: 'query',
@@ -77,18 +75,25 @@ export function ParamsForm() {
   };
 
   const HelpText = ({ k }: { k: keyof typeof FIELDS }) => (
-    <small className="muted" style={{ display: 'block', marginTop: '0.15rem', fontSize: '0.7rem' }}>
+    <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
       {FIELDS[k]?.help}
     </small>
   );
 
+  // Shared label class — vertical-stack input + help text. min-width
+  // 220px + flex: 1 lets the four fields wrap onto multiple lines on
+  // narrow viewports while sharing the row width.
+  const labelCls = 'text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]';
+  const inputCls = 'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent';
+
   return (
-    <form onSubmit={handleRun} className="params-form">
-      <fieldset role="group">
-        <label>
+    <form onSubmit={handleRun} className="p-0">
+      <fieldset role="group" className="flex flex-wrap items-start gap-x-5 gap-y-3 border-0 p-0 m-0">
+        <label className={labelCls}>
           {FIELDS.query?.label}
           <input
             type="text"
+            className={`${inputCls} min-w-[220px] w-full`}
             value={query}
             onChange={e => setQuery(e.target.value)}
             placeholder={FIELDS.query?.placeholder}
@@ -97,10 +102,11 @@ export function ParamsForm() {
           <HelpText k="query" />
         </label>
 
-        <label>
+        <label className={labelCls}>
           {FIELDS.n_samples?.label}
           <input
             type="number"
+            className={`${inputCls} w-[110px]`}
             value={n}
             onChange={e => setN(e.target.value)}
             min={FIELDS.n_samples?.min}
@@ -110,10 +116,11 @@ export function ParamsForm() {
           <HelpText k="n_samples" />
         </label>
 
-        <label>
+        <label className={labelCls}>
           {FIELDS.top_k?.label}
           <input
             type="number"
+            className={`${inputCls} w-[110px]`}
             value={topK}
             onChange={e => setTopK(e.target.value)}
             min={FIELDS.top_k?.min}
@@ -124,10 +131,11 @@ export function ParamsForm() {
           <HelpText k="top_k" />
         </label>
 
-        <label>
+        <label className={labelCls}>
           {FIELDS.batch_size?.label}
           <input
             type="number"
+            className={`${inputCls} w-[110px]`}
             value={batch}
             onChange={e => setBatch(e.target.value)}
             min={FIELDS.batch_size?.min}
@@ -138,12 +146,14 @@ export function ParamsForm() {
           <HelpText k="batch_size" />
         </label>
 
-        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center', marginTop: '0.5rem', flexWrap: 'wrap' }}>
-          <button type="submit" disabled={busy}>{busy ? 'Running…' : 'Run'}</button>
-          <button type="button" className="secondary outline" onClick={handleRefresh}>
+        <div className="flex gap-2 items-center mt-2 flex-wrap">
+          <button type="submit" disabled={busy} className="px-2.5 py-1 min-w-[80px] rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover disabled:opacity-50">
+            {busy ? 'Running…' : 'Run'}
+          </button>
+          <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345] hover:border-accent" onClick={handleRefresh}>
             ↻ Refresh (server defaults)
           </button>
-          <small className="muted">empty fields = use server default</small>
+          <small className="text-fg-1">empty fields = use server default</small>
         </div>
       </fieldset>
     </form>

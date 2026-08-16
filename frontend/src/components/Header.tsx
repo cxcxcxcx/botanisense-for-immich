@@ -12,12 +12,12 @@ export function Header({ view }: Props) {
   // still browsing; the content view is just deeper into it).
   const active = topLevel(view);
   return (
-    <header className="app-header">
-      <div className="view-tabs" role="tablist" aria-label="View">
+    <header className="sticky top-0 z-50 bg-bg flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
+      <div className="inline-flex gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
         <button
           role="tab"
           aria-selected={active === 'browse-list'}
-          className={`view-tab ${active === 'browse-list' ? 'active' : ''}`}
+          className={`bg-transparent text-fg-0 border border-transparent rounded-md cursor-pointer py-[3px] px-3 text-[0.8rem] hover:text-fg hover:border-[#444] ${active === 'browse-list' ? 'bg-accent-dark text-white border-accent' : ''}`}
           onClick={() => navigate('browse-list')}
         >
           Browse
@@ -25,19 +25,18 @@ export function Header({ view }: Props) {
         <button
           role="tab"
           aria-selected={active === 'run'}
-          className={`view-tab ${active === 'run' ? 'active' : ''}`}
+          className={`bg-transparent text-fg-0 border border-transparent rounded-md cursor-pointer py-[3px] px-3 text-[0.8rem] hover:text-fg hover:border-[#444] ${active === 'run' ? 'bg-accent-dark text-white border-accent' : ''}`}
           onClick={() => navigate('run')}
         >
           Run
         </button>
       </div>
-      <hgroup>
-        <h1>Immich × BioCLIP</h1>
+      <hgroup className="flex items-center gap-2 m-0">
+        <h1 className="m-0 text-[1.1rem]">Immich × BioCLIP</h1>
       </hgroup>
-      {/* The KNN pill only matters where reclassification is exposed
-          (the Run view + per-asset reclassify buttons). On browse the
-          user is looking at already-classified photos, so the
-          "KNN: not built" state is just noise. */}
+      {/* KNN pill + StatusPanel only on Run view; compact status in
+          browse view. LegendBar buttons (sync / backfill / purge)
+          only show on Run view. */}
       {active === 'run' && <KnnPill />}
       {active === 'run' ? <StatusPanel /> : <StatusPanel compact />}
       {active === 'run' && <LegendBar />}

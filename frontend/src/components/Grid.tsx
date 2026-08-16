@@ -27,8 +27,6 @@ function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score' | 'time'
     return [...rows].sort((a, b) => (b.top_predictions[0]?.score ?? -1) - (a.top_predictions[0]?.score ?? -1));
   }
   if (sort === 'time') {
-    // ISO 8601 strings sort lexicographically; nulls land at the end
-    // via the `?? ''` fallback that we then push to the bottom.
     return [...rows].sort((a, b) => {
       const av = a.captured_at ?? '';
       const bv = b.captured_at ?? '';
@@ -48,8 +46,6 @@ export function Grid() {
   const [loading, setLoading] = useState(true);
   const reqIdRef = useRef(0);
 
-  // Which subset is loaded. The grid toolbar carries the only
-  // navigation affordance — clicking it returns to the filter cards.
   const activeFilterLabel: string | null = (() => {
     const g = filters.group_by;
     if (g === 'cluster') return filters.cluster_id != null ? `cluster #${filters.cluster_id}` : null;
@@ -63,17 +59,9 @@ export function Grid() {
     else if (filters.group_by === 'species') setFilters({ species: undefined, page: 0 });
     else if (filters.group_by === 'genus') setFilters({ genus: undefined, page: 0 });
     else if (filters.group_by === 'family') setFilters({ family: undefined, page: 0 });
-    // Leave the photo grid and return to the filter cards view. The
-    // route-sync effect used to do this automatically when the filter
-    // cleared; that's gone now so the "All" card click can land on
-    // #browse/content without being yanked back. This is the canonical
-    // way to leave the content view.
     navigate('browse-list');
   };
 
-  // Refresh on filter change. Re-read the entire page because filters
-  // change which assets are in scope (and the server's `total` for
-  // pagination depends on the filter).
   useEffect(() => {
     const reqId = ++reqIdRef.current;
     setLoading(true);
@@ -99,14 +87,11 @@ export function Grid() {
   }, [data, filters.sort]);
 
   const handleRowUpdated = async (assetId: string) => {
-    // Optimistic: leave the row alone — the user can re-run if they want
-    // to see fresh KNN. We could call /api/asset/{id} here but it would
-    // slow down rapid button clicks; keep it simple.
     void assetId;
   };
 
   return (
-    <div className="grid-pane">
+    <div className="px-2 py-0">
       <Breadcrumb
         groupBy={filters.group_by}
         activeFilterLabel={activeFilterLabel}
@@ -116,14 +101,14 @@ export function Grid() {
         onSortChange={s => setFilters({ sort: s })}
       />
       {loading && !data ? (
-        <div className="empty">Loading…</div>
+        <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">Loading…</div>
       ) : error && !data ? (
-        <div className="empty error">Failed to load: {error.message}</div>
+        <div className="p-10 text-center text-red-300 whitespace-pre-wrap">Failed to load: {error.message}</div>
       ) : !data || data.results.length === 0 ? (
-        <div className="empty">No results in this view.</div>
+        <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">No results in this view.</div>
       ) : (
         <>
-          <div className="photo-grid">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 items-start">
             {sortedRows.map(r => (
               <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
             ))}
@@ -135,10 +120,6 @@ export function Grid() {
   );
 }
 
-// Breadcrumb above the photo grid:
-//   ← back · species: Rosa canina · 142 assets · [sort: default | plants first | most confident]
-// One tight strip, no big button, no bottom border. Hover the sort
-// chips for the explanation.
 interface BreadcrumbProps {
   groupBy: string;
   activeFilterLabel: string | null;
@@ -149,37 +130,37 @@ interface BreadcrumbProps {
 }
 function Breadcrumb({ groupBy, activeFilterLabel, total, onBack, sort, onSortChange }: BreadcrumbProps) {
   return (
-    <nav className="grid-breadcrumb" aria-label="Photo grid context">
-      <button type="button" className="crumb-back" onClick={onBack} title={`Clear ${groupBy} filter`}>
-        ← back
-      </button>
-      <span className="crumb-sep">·</span>
-      <span className="crumb-scope">
+    <nav className="flex flex-wrap items-center gap-x-2 gap-y-1 py-1 pb-2.5 text-fg-0 text-[0.85rem]" aria-label="Photo grid context">
+      <button
+        type="button"
+        className="bg-transparent text-accent border-0 p-0 cursor-pointer hover:text-accent-hover hover:underline"
+        onClick={onBack}
+        title={`Clear ${groupBy} filter`}
+      >← back</button>
+      <span className="text-fg-3">·</span>
+      <span>
         {activeFilterLabel
-          ? <><strong>{activeFilterLabel}</strong>{total != null && <> · <span className="crumb-count">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>
-          : <>all photos{total != null && <> · <span className="crumb-count">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>}
+          ? <><strong className="text-fg">{activeFilterLabel}</strong>{total != null && <> · <span className="tabular-nums">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>
+          : <>all photos{total != null && <> · <span className="tabular-nums">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>}
       </span>
-      <span className="crumb-sep">·</span>
-      <span className="crumb-sort">
-        <span className="crumb-sort-label">sort:</span>
+      <span className="text-fg-3">·</span>
+      <span className="inline-flex items-center gap-1">
+        <span className="text-fg-1">sort:</span>
         {SORT_OPTIONS.map((s, i) => (
-          <span key={s.value} className="crumb-sort-group">
+          <span key={s.value} className="inline-flex items-center gap-1">
             <button
               type="button"
-              className={`crumb-sort-chip ${sort === s.value ? 'active' : ''}`}
+              className={`bg-transparent border-0 p-0 cursor-pointer m-0 ${
+                sort === s.value ? 'text-[#5c93c0] font-medium' : 'text-fg-0 hover:text-fg'
+              }`}
               onClick={() => onSortChange(s.value)}
               title={s.hint}
               aria-pressed={sort === s.value}
-            >
-              {s.label}
-            </button>
-            {i < SORT_OPTIONS.length - 1 && <span className="crumb-sort-sep">/</span>}
+            >{s.label}</button>
+            {i < SORT_OPTIONS.length - 1 && <span className="text-fg-3">/</span>}
           </span>
         ))}
-        {/* Inline explanation of the active sort — sits right after
-            the chips so the user sees what each mode means without
-           hovering for a tooltip. */}
-        <span className="crumb-sort-desc">
+        <span className="text-fg-1 text-[0.75rem] italic ml-1">
           {SORT_OPTIONS.find(o => o.value === sort)?.hint}
         </span>
       </span>

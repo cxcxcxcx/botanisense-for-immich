@@ -34,9 +34,9 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   return (
     <Ctx.Provider value={value}>
       {children}
-      <div style={{ position: 'fixed', bottom: '1.5rem', left: '50%', transform: 'translateX(-50%)', zIndex: 1001, display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[1001] flex flex-col gap-2">
         {items.map(t => (
-          <div key={t.id} className={`toast ${t.kind}`}>{t.message}</div>
+          <div key={t.id} className={`toast-${t.kind}`}>{t.message}</div>
         ))}
       </div>
     </Ctx.Provider>

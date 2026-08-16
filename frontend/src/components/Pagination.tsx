@@ -31,25 +31,29 @@ export function Pagination({ data }: Props) {
   const pages = buildPageList(page, total);
   const goTo = (p: number) => setFilters({ page: p });
   return (
-    <nav className="pagination-bar" aria-label="Pagination">
+    <nav className="flex flex-wrap items-center gap-3 mt-4 py-2 text-fg-1 text-sm" aria-label="Pagination">
       <span>{data.total.toLocaleString()} photos · page {page + 1} / {total}</span>
-      <span className="pages">
-        <button type="button" className="pg-btn" disabled={page === 0} onClick={() => goTo(0)}>«</button>
-        <button type="button" className="pg-btn" disabled={page === 0} onClick={() => goTo(page - 1)}>‹</button>
+      <span className="flex gap-1">
+        <button type="button" className="px-2.5 py-1 rounded bg-[#234] text-fg border border-[#456] text-sm hover:bg-[#345] disabled:opacity-40 disabled:cursor-not-allowed" disabled={page === 0} onClick={() => goTo(0)}>«</button>
+        <button type="button" className="px-2.5 py-1 rounded bg-[#234] text-fg border border-[#456] text-sm hover:bg-[#345] disabled:opacity-40 disabled:cursor-not-allowed" disabled={page === 0} onClick={() => goTo(page - 1)}>‹</button>
         {pages.map((p, i) =>
           p === 'ellipsis'
-            ? <span key={`e${i}`} className="ellipsis">…</span>
+            ? <span key={`e${i}`} className="px-1 text-[#666]">…</span>
             : <button
                 key={p}
                 type="button"
-                className={`pg-btn ${p === page ? 'on' : ''}`}
+                className={`px-2.5 py-1 rounded border text-sm hover:bg-[#345] ${
+                  p === page
+                    ? 'bg-accent-dark border-accent text-white'
+                    : 'bg-[#234] border-[#456] text-fg'
+                }`}
                 onClick={() => goTo(p)}
               >
                 {p + 1}
               </button>
         )}
-        <button type="button" className="pg-btn" disabled={page >= total - 1} onClick={() => goTo(page + 1)}>›</button>
-        <button type="button" className="pg-btn" disabled={page >= total - 1} onClick={() => goTo(total - 1)}>»</button>
+        <button type="button" className="px-2.5 py-1 rounded bg-[#234] text-fg border border-[#456] text-sm hover:bg-[#345] disabled:opacity-40 disabled:cursor-not-allowed" disabled={page >= total - 1} onClick={() => goTo(page + 1)}>›</button>
+        <button type="button" className="px-2.5 py-1 rounded bg-[#234] text-fg border border-[#456] text-sm hover:bg-[#345] disabled:opacity-40 disabled:cursor-not-allowed" disabled={page >= total - 1} onClick={() => goTo(total - 1)}>»</button>
       </span>
     </nav>
   );

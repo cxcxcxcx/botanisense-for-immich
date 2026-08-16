@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getAsset, reclassifyBbox, reclassify } from '../api/endpoints';
-import type { AssetDetail } from '../api/types';
+import type { AssetDetail as AssetDetailType } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
@@ -14,7 +14,7 @@ interface Props {
 }
 
 export function AssetDetail({ assetId }: Props) {
-  const [data, setData] = useState<AssetDetail | null>(null);
+  const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const push = useToasts();
 
@@ -46,7 +46,7 @@ export function AssetDetail({ assetId }: Props) {
     }
   };
 
-  if (error) return <div className="error">Failed to load asset: {error.message}</div>;
+  if (error) return <div className="text-red-300">Failed to load asset: {error.message}</div>;
   if (!data) return <p aria-busy="true">Loading…</p>;
 
   const fullTop1 = data.top_predictions[0];
@@ -54,16 +54,15 @@ export function AssetDetail({ assetId }: Props) {
   const plantaeTier = plantaeColorClass(plantaeScore);
 
   return (
-    <div className="asset-detail">
-      <figure className="hero-photo">
+    <div className="text-[13px]">
+      <figure className="m-0 mb-2 bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] flex items-center justify-center min-h-[120px] max-h-[220px]">
         <img
           src={thumbUrl(data.asset_id, 'fullsize')}
           alt={data.original_file_name}
           loading="eager"
           decoding="async"
+          className="block max-w-full max-h-[220px] w-auto h-auto object-contain"
           onError={e => {
-            // Fall back to preview if fullsize is rejected (rare — Immich
-            // is supposed to support it, but some assets 404).
             const img = e.currentTarget;
             if (!img.dataset.fallback) {
               img.dataset.fallback = '1';
@@ -73,16 +72,13 @@ export function AssetDetail({ assetId }: Props) {
         />
       </figure>
 
-      <p>
+      <p className="mb-0.5">
         <strong>{data.original_file_name}</strong>
-        {data.cluster_id != null && <small> · cluster {data.cluster_id}</small>}
+        {data.cluster_id != null && <small className="text-fg-1"> · cluster {data.cluster_id}</small>}
       </p>
 
-      {/* EXIF time + GPS. Hidden when null (no EXIF on the asset, or
-         the backfill hasn't run yet). The maps link uses the standard
-         geo: URI scheme so the OS picks the default map app. */}
       {(data.captured_at || (data.latitude != null && data.longitude != null)) && (
-        <p className="asset-exif">
+        <p className="-mt-1 mb-2 text-[11px] text-fg-1 flex flex-wrap gap-x-4 gap-y-1">
           {data.captured_at && (
             <span title={data.captured_at}>
               🕒 {new Date(data.captured_at).toLocaleString()}
@@ -93,6 +89,7 @@ export function AssetDetail({ assetId }: Props) {
               href={`geo:${data.latitude},${data.longitude}`}
               target="_blank"
               rel="noopener noreferrer"
+              className="text-[#7ad] no-underline hover:underline"
               title={`${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`}
             >
               📍 {data.latitude.toFixed(4)}, {data.longitude.toFixed(4)}
@@ -101,31 +98,28 @@ export function AssetDetail({ assetId }: Props) {
         </p>
       )}
 
-      <nav className="taxon-row" aria-label="taxonomy hierarchy">
-        {fullTop1?.kingdom && <span className="taxon-rank kingdom">{fullTop1.kingdom}</span>}
+      <nav className="flex flex-wrap items-center gap-x-1.5 gap-y-1 py-1 mb-0.5 text-[12px] leading-[1.3]" aria-label="taxonomy hierarchy">
+        {fullTop1?.kingdom && <span className="rank-kingdom">{fullTop1.kingdom}</span>}
         {fullTop1?.family && (
           <>
-            <span className="taxon-sep">›</span>
-            <span className="taxon-rank family">{fullTop1.family}</span>
+            <span className="rank-sep">›</span>
+            <span className="rank-family">{fullTop1.family}</span>
           </>
         )}
         {fullTop1?.genus && (
           <>
-            <span className="taxon-sep">›</span>
-            <span className="taxon-rank genus">{fullTop1.genus}</span>
+            <span className="rank-sep">›</span>
+            <span className="rank-genus">{fullTop1.genus}</span>
           </>
         )}
         {fullTop1?.species && (
           <>
-            <span className="taxon-sep">›</span>
-            <span className="taxon-rank species">{fullTop1.species}</span>
+            <span className="rank-sep">›</span>
+            <span className="rank-species">{fullTop1.species}</span>
           </>
         )}
         {plantaeScore != null && (
-          <span
-            className={`plantae ${plantaeTier}`}
-            style={{ position: 'static', display: 'inline-block', marginLeft: 'auto' }}
-          >
+          <span className={`inline-block ml-auto px-2 py-0.5 rounded font-bold text-[11px] font-mono ${plantaeTier}`}>
             Plantae {(plantaeScore * 100).toFixed(1)}%
           </span>
         )}
@@ -133,47 +127,47 @@ export function AssetDetail({ assetId }: Props) {
 
       <LibraryNeighbors items={data.library_neighbors} />
 
-      <h5>Top-{data.top_predictions.length} predictions</h5>
-      <div className="preds">
+      <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">Top-{data.top_predictions.length} predictions</h5>
+      <div className="pt-0 pb-3 px-3">
         <Predictions items={(data.top_predictions ?? []).slice(0, 5)} />
       </div>
 
       {data.knn?.top_species ? (
         <>
-          <h5>KNN (re-classified)</h5>
-          <div className="knn-block" style={{ borderTop: 0, padding: 0 }}>
-            <div className="knn-header">
+          <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">KNN (re-classified)</h5>
+          <div className="px-3 pb-3 border-t border-dashed border-[#333] mt-1">
+            <div className="flex justify-between mb-1 text-[12px]">
               <span>
                 {data.knn.top_species}
                 {data.knn.common_name ? ` (${data.knn.common_name})` : ''} · {formatPct(data.knn.score)}
               </span>
-              <small>{data.knn.kingdom}{data.knn.family ? ` · ${data.knn.family}` : ''}</small>
+              <small className="text-fg-1">{data.knn.kingdom}{data.knn.family ? ` · ${data.knn.family}` : ''}</small>
             </div>
             {(data.knn.neighbors ?? []).map((n, i) => (
-              <div key={`${n.species}-${i}`} className="pred">
-                <div className="sp">
+              <div key={`${n.species}-${i}`} className="flex justify-between gap-2.5 py-1 border-t border-[#222] text-[13px] first:border-t-0">
+                <div className="flex-1">
                   {n.species}
-                  <div className="cn">{n.common_name ?? ''}</div>
+                  <div className="text-fg-1 text-[11px]">{n.common_name ?? ''}</div>
                 </div>
-                <div className="sc">{formatPct(n.sim, 1)}</div>
+                <div className="text-[#ad9] tabular-nums min-w-[56px] text-right">{formatPct(n.sim, 1)}</div>
               </div>
             ))}
           </div>
         </>
       ) : null}
-      <button type="button" className="reclassify-btn" onClick={handleReclassifyAll}>
+      <button type="button" className="bg-[#234] text-fg border border-[#456] px-2.5 py-1 rounded text-[11px] cursor-pointer hover:bg-[#345] mt-1" onClick={handleReclassifyAll}>
         Re-run KNN
       </button>
 
       {(data.detections ?? []).filter(d => d.score >= 0.10).length > 0 && (
         <>
-          <h5>YOLO detections (per-crop)</h5>
+          <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">YOLO detections (per-crop)</h5>
           {data.detections
             .filter(d => d.score >= 0.10)
             .map((d, i) => (
               <div key={d.id}>
                 <DetectionBlock det={d} fullTop1={fullTop1} />
-                <button type="button" className="reclassify-btn" onClick={() => handleReclassifyBbox(i)}>
+                <button type="button" className="bg-[#234] text-fg border border-[#456] px-2.5 py-1 rounded text-[11px] cursor-pointer hover:bg-[#345] mt-1" onClick={() => handleReclassifyBbox(i)}>
                   Reclassify crop
                 </button>
               </div>

@@ -2,22 +2,20 @@ import { useEffect, useRef, useState } from 'react';
 import { getStatus } from '../api/endpoints';
 import type { PipelineStatus } from '../api/types';
 import { usePolling } from '../hooks/usePolling';
-import { cls, fmtDuration } from '../lib/format';
+import { fmtDuration } from '../lib/format';
 
 const STAGE_COLORS: Record<string, string> = {
-  search: 'stage-search',
-  species: 'stage-species',
-  cluster: 'stage-cluster',
-  kingdom: 'stage-kingdom',
-  yolo: 'stage-yolo',
-  'bbox-bioclip': 'stage-bbox-bioclip',
+  search: 'bg-stage-search',
+  species: 'bg-stage-species',
+  cluster: 'bg-stage-cluster',
+  kingdom: 'bg-stage-kingdom',
+  yolo: 'bg-stage-yolo',
+  'bbox-bioclip': 'bg-stage-bioclip',
 };
 
 interface Props {
-  /** When true, render only the badge + eta (used in the browse-view
-   *  header where the full stage bar would be noise). The CSS class
-   *  .status-compact hides the progress bar, stage-time bar, and
-   *  stage legend. */
+  /** When true, render only the badge + eta (browse-view header).
+   *  Hides the progress bar + stage-time bar + legend. */
   compact?: boolean;
 }
 
@@ -26,7 +24,6 @@ export function StatusPanel({ compact = false }: Props = {}) {
   const [stageTotals, setStageTotals] = useState<Record<string, number>>({});
   const prevStatusRef = useRef<string>('idle');
 
-  // Reset stageTotals when a run ends so the next run doesn't show stale slices.
   useEffect(() => {
     if (!data) return;
     const cur = data.status || 'idle';
@@ -53,7 +50,6 @@ export function StatusPanel({ compact = false }: Props = {}) {
   if (data?.rate != null) etaParts.push(`${data.rate.toFixed(1)}/s`);
   if (data?.eta_seconds != null) etaParts.push(`~${Math.ceil(data.eta_seconds)}s left`);
 
-  // Compute projected bars: snapshot totals + live running stage.
   const projected: Record<string, number> = { ...stageTotals };
   if (data && data.status === 'running' && data.stage && data.stage_t0) {
     const elapsed = Math.max(0, Date.now() / 1000 - data.stage_t0);
@@ -69,22 +65,23 @@ export function StatusPanel({ compact = false }: Props = {}) {
     : [];
 
   return (
-    <aside className={`status-panel${compact ? ' status-compact' : ''}`}>
-      <span className={cls('badge', `status-${status}`)}>{badgeText}</span>
+    <aside className={`flex flex-wrap items-center gap-2 font-mono text-[12px]/[1.6] ml-auto ${compact ? 'text-[11px]' : ''}`}>
+      <span className={`status-${status}`}>{badgeText}</span>
       <progress
-        style={{ display: status === 'running' ? 'block' : 'none' }}
+        className="hidden"
+        style={{ display: status === 'running' ? 'block' : 'none', width: '200px', flexShrink: 0, height: '6px' }}
         value={data?.chunk_idx || 0}
         max={data?.chunk_total || 1}
       />
-      <small style={{ display: data?.eta_seconds != null ? 'inline' : 'none' }}>
+      <small className="text-fg-1" style={{ display: data?.eta_seconds != null ? 'inline' : 'none' }}>
         {etaParts.join(' · ')}
       </small>
       {bars.length > 0 && (
-        <div className="stage-time-bar">
+        <div className={`flex h-1.5 flex-[1_1_200px] rounded overflow-hidden bg-[#222] ${compact ? 'hidden' : ''}`}>
           {bars.map(b => (
             <span
               key={b.key}
-              className={`slice ${b.cls}`}
+              className={`h-full ${b.cls}`}
               style={{ width: `${b.pct}%` }}
               title={`${b.label}: ${fmtDuration(b.dur)}`}
             />
@@ -92,12 +89,12 @@ export function StatusPanel({ compact = false }: Props = {}) {
         </div>
       )}
       {bars.length > 0 && (
-        <small className="stage-time-legend">
+        <small className={`flex flex-wrap gap-x-4 gap-y-1 mt-1 w-full text-[10px] text-fg-0 ${compact ? 'hidden' : ''}`}>
           {bars.map(b => (
             <span key={b.key}>
-              <span className={`swatch ${b.cls}`}></span>
+              <span className={`inline-block w-2 h-2 rounded-sm mr-1 align-middle ${b.cls}`}></span>
               <span>{b.label}</span>
-              <span className="stage-sec"> {fmtDuration(b.dur)}</span>
+              <span className="text-fg-1"> {fmtDuration(b.dur)}</span>
             </span>
           ))}
         </small>

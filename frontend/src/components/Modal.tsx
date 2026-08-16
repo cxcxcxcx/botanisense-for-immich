@@ -20,23 +20,22 @@ export function Modal({ open, onClose, title, children }: Props) {
   return (
     <dialog
       ref={ref}
-      className="detail-dialog"
+      className="max-w-[min(92vw,900px)] max-h-[92vh] bg-[#161616] text-fg border border-[#333] rounded-lg p-0"
       onClose={onClose}
       onClick={e => {
-        // Click on backdrop (the dialog itself, not its children) closes.
         if (e.target === ref.current) onClose();
       }}
     >
-      <article>
-        <header>
-          {/* Pico.css paints the X via `background-image: var(--pico-icon-close)`
-             on any .close / [rel=prev] inside <dialog><article>. The button
-             must therefore have empty content; a literal "✕" would stack on
-             top of the SVG and render the close glyph twice. */}
-          <button className="close" rel="prev" aria-label="Close" onClick={onClose} />
-          <h3>{title || 'Asset detail'}</h3>
+      <article className="m-0">
+        <header className="flex items-center justify-between mb-2 border-b border-[#222] pb-2">
+          <h3 className="m-0 flex-1">{title || 'Asset detail'}</h3>
+          <button
+            className="text-fg-1 hover:text-fg text-lg leading-none px-2"
+            aria-label="Close"
+            onClick={onClose}
+          >×</button>
         </header>
-        <div className="modal-body">{children}</div>
+        <div className="overflow-auto max-h-[70vh] px-6 py-4">{children}</div>
       </article>
     </dialog>
   );

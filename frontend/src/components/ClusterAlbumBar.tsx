@@ -9,25 +9,17 @@ export function ClusterAlbumBar() {
   const { dispatch, state } = useApp();
   const push = useToasts();
 
-  // All hooks MUST be called unconditionally — early return would change
-  // the hook count between renders and React would throw #310.
   const [albums, setAlbums] = useState<ClusterAlbumMapping[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteRemote, setDeleteRemote] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    listClusterAlbums()
-      .then(r => { if (!cancelled) setAlbums(r.albums); })
-      .catch(() => { /* leave null */ });
+    listClusterAlbums().then(r => { if (!cancelled) setAlbums(r.albums); }).catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
-  // Render nothing when no cluster pill is active.
   if (filters.group_by !== 'cluster' || filters.cluster_id == null) return null;
-  // Skip when FilterCards is collapsed — the active-bar already shows
-  // "Cluster #N · count · group_by" with a ✕ to clear, so this bar
-  // would duplicate the cluster identity.
   if (state.filtersCollapsed) return null;
   const clusterId = filters.cluster_id;
 
@@ -55,8 +47,7 @@ export function ClusterAlbumBar() {
       setAlbums(prev => (prev ?? []).filter(a => a.cluster_id !== clusterId));
       push({
         kind: 'success',
-        message: deleteRemote
-        && r.remote_deleted ? 'Mapping dropped · Immich album deleted'
+        message: deleteRemote && r.remote_deleted ? 'Mapping dropped · Immich album deleted'
           : deleteRemote ? 'Mapping dropped · (Immich album was already gone)'
           : 'Mapping dropped',
       }, 3000);
@@ -67,34 +58,37 @@ export function ClusterAlbumBar() {
     }
   };
 
+  const btnCls = 'px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.8rem] hover:bg-[#345] hover:border-accent disabled:opacity-50';
+
   return (
-    <nav className="cluster-album-bar">
-      <div className="cluster-album-controls">
+    <nav className="py-1 px-4 border-b border-line2 text-[0.85rem]">
+      <div className="flex flex-wrap items-center gap-2">
         <strong>Cluster #{clusterId}</strong>
         {album ? (
           <>
-            <span className="muted">Album:</span>
-            <a href={album.album_url} target="_blank" rel="noopener noreferrer">
+            <span className="text-fg-1">Album:</span>
+            <a href={album.album_url} target="_blank" rel="noopener noreferrer" className="text-[#7ad] hover:underline">
               {album.album_id.slice(0, 8)}…
             </a>
-            <small className="muted">({album.n_assets} photos{album.reused_existing ? ', reused' : ''})</small>
-            <button type="button" className="secondary outline" onClick={handleSync}>↻ Re-sync</button>
-            <label className="muted" style={{ display: 'flex', alignItems: 'center', gap: '0.25rem' }}>
+            <small className="text-fg-1">({album.n_assets} photos{album.reused_existing ? ', reused' : ''})</small>
+            <button type="button" className={btnCls} onClick={handleSync}>↻ Re-sync</button>
+            <label className="text-fg-1 flex items-center gap-1">
               <input
                 type="checkbox"
                 checked={deleteRemote}
                 onChange={e => setDeleteRemote(e.target.checked)}
+                className="m-0"
               />
               also delete in Immich
             </label>
-            <button type="button" className="secondary outline" onClick={handleDelete} disabled={busy}>
+            <button type="button" className={btnCls} onClick={handleDelete} disabled={busy}>
               Delete mapping
             </button>
           </>
         ) : (
           <>
-            <span className="muted">No Immich album yet.</span>
-            <button type="button" className="secondary outline" onClick={handleSync}>+ Sync this cluster as album</button>
+            <span className="text-fg-1">No Immich album yet.</span>
+            <button type="button" className={btnCls} onClick={handleSync}>+ Sync this cluster as album</button>
           </>
         )}
       </div>

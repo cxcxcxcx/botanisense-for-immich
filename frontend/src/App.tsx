@@ -89,9 +89,9 @@ export function App() {
   return (
     <>
       <Header view={view} />
-      <main className={`app-main view-${view}`}>
+      <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-6' : ''}`}>
         {view === 'run' ? (
-          <section className="run-view">
+          <section className="flex flex-col gap-4">
             <ParamsForm />
             <LogTail active={true} />
           </section>
@@ -101,8 +101,6 @@ export function App() {
             <Grid />
           </>
         ) : (
-          // browse-list — full-height filter cards. Toolbar is the
-          // owner of FilterCards and supplies the sort/group-by chrome.
           <Toolbar />
         )}
       </main>

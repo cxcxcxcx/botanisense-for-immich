@@ -35,7 +35,7 @@ export function LogTail({ active }: Props) {
   }, [lines]);
 
   return (
-    <pre ref={preRef} className="log-pre">
+    <pre ref={preRef} className="m-0 p-2 px-4 bg-[#0a0a0a] text-[#bcb] text-[11px]/[1.4] font-mono max-h-[30vh] overflow-auto whitespace-pre border border-[#2a2a2a] rounded">
       {lines.join('\n')}
     </pre>
   );
