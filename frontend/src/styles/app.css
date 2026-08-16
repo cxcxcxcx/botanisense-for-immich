@@ -508,12 +508,15 @@ nav.legend-bar, .legend-bar {
 
 /* Image overlay: species + score + per-kingdom chips, pinned to the
    bottom of the photo with a translucent dark gradient so the card
-   stays compact (no separate meta block in grid mode). */
+   stays compact (no separate meta block in grid mode). Bottom padding
+   + gradient height are scaled up so the text doesn't sit flush
+   against the edge on larger cards (wide viewports → big photos → the
+   8px bottom padding looks cramped). */
 .img-overlay {
   position: absolute; left: 0; right: 0; bottom: 0;
-  padding: 22px 8px 8px;
+  padding: 32px 10px 14px;
   background: linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,0.85) 100%);
-  color: #eee; display: flex; flex-direction: column; gap: 3px;
+  color: #eee; display: flex; flex-direction: column; gap: 4px;
   pointer-events: none;
 }
 .img-overlay .overlay-top {
