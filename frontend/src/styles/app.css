@@ -148,12 +148,19 @@ nav.legend-bar, .legend-bar {
      - search sub-filter input + hint
    Photo-sort and pagination live with the photo grid (Grid.tsx). */
 .toolbar {
-  display: flex; flex-direction: column; gap: 0.75rem;
+  display: flex; flex-direction: column; gap: 0.5rem;
   padding: 0.5rem 1rem; border-bottom: 1px solid #2a2a2a;
 }
-.toolbar-fieldset {
-  display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center;
+/* Both chrome rows (group-by, search) share these baseline rules:
+   no inner padding, content vertically centered. The toolbar's
+   gap + padding handle all the spacing between rows so the two
+   rows sit on a single visual rhythm. */
+.toolbar-fieldset,
+.filter-search-row {
+  display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem;
+  align-items: center;
   border: 0; padding: 0; margin: 0;
+  min-height: 30px;
 }
 
 /* Group-by radio cards: choose the bucketing strategy (cluster /
@@ -161,48 +168,41 @@ nav.legend-bar, .legend-bar {
    cards below but smaller and pill-shaped. Self-explanatory
    (cluster | species | genus | family), no separate label needed. */
 .group-by-cards {
-  display: inline-flex; gap: 4px; padding: 0 5px;
+  display: inline-flex; gap: 3px; padding: 3px;
   background: #14181d; border: 1px solid #2a2a2a; border-radius: 8px;
-  /* Pin height to match the search input (30px = 12px padding × 2
-     + ~16px line) so the two rows align. box-sizing: border-box
-     keeps the borders inside the 30px budget. */
-  height: 30px;
   box-sizing: border-box;
   align-items: center;
 }
 .group-by-card {
-  background: transparent; color: #aaa; border: 1px solid transparent;
-  padding: 0 12px; font-size: 0.85rem; line-height: 22px;
-  border-radius: 6px; cursor: pointer;
+  background: transparent; color: #aaa; border: 0;
+  padding: 0 12px; font-size: 0.85rem;
+  border-radius: 5px; cursor: pointer;
   font: inherit; text-transform: lowercase;
+  /* Fixed-height inner so each card sits at the same baseline
+     regardless of the surrounding line-height. */
+  height: 22px; line-height: 22px;
+  display: inline-flex; align-items: center; justify-content: center;
 }
-.group-by-card:hover { color: #fff; border-color: #444; }
+.group-by-card:hover { color: #fff; }
 .group-by-card.active {
-  background: #2c8a4a; color: #fff; border-color: #5cc078;
-}
-
-.toolbar select, .toolbar input[type=search] {
-  background: #1a1a1a; color: #eee; border: 1px solid #333;
-  padding: 6px 10px; border-radius: 6px; font-size: 0.85rem;
-  line-height: 1.2;
+  background: #2c8a4a; color: #fff;
 }
 
 /* Filter search input — a sub-filter of the selected group_by, not a
-   primary selector. Smaller and below the cards. The hint line makes
-   the distinction explicit so users don't mistake it for a search
-   over all photos. */
-.filter-search-row {
-  display: flex; flex-wrap: wrap; gap: 0.5rem 0.75rem; align-items: center;
-  padding: 0.25rem 0 0.5rem;
-}
+   primary selector. Same 28px height as the group-by chip row
+   (22px content + 1px border × 2 + 4px padding) so the two chrome
+   rows share a baseline. */
 .filter-search-input {
   background: #1a1a1a; color: #eee; border: 1px solid #333;
-  padding: 5px 10px; border-radius: 6px; font-size: 0.85rem;
+  padding: 0 10px; border-radius: 6px; font-size: 0.85rem;
   min-width: 200px; max-width: 320px;
+  height: 28px; line-height: 28px;
+  box-sizing: border-box;
 }
 .filter-search-hint {
   color: #888; font-size: 0.75rem;
   flex: 1 1 200px;
+  line-height: 28px;
 }
 .filter-search-hint em {
   color: #ccc; font-style: normal; font-weight: 500;
