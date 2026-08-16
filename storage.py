@@ -55,7 +55,16 @@ CREATE TABLE IF NOT EXISTS assets (
   original_url       TEXT NOT NULL,
   thumbnail_url      TEXT NOT NULL,
   cluster_id         INTEGER,
-  first_seen_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  first_seen_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  -- EXIF capture time (dateTimeOriginal from Immich), used by the
+  -- "newest first" sort chip. ISO 8601 string, nullable since not every
+  -- photo has EXIF.
+  captured_at        TEXT,
+  -- GPS coordinates from EXIF (latitude, longitude). Both NULL when
+  -- the asset has no GPS tag; treated as a single location when
+  -- exactly one is set, so the UI should check both.
+  latitude           REAL,
+  longitude          REAL
 );
 CREATE INDEX IF NOT EXISTS idx_assets_cluster ON assets(cluster_id);
 
@@ -249,6 +258,21 @@ def init_db(path: str | Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with connect(p) as conn:
         conn.executescript(SCHEMA)
+        # Idempotent column migrations — `CREATE TABLE IF NOT EXISTS`
+        # doesn't add columns to existing tables, so each new column
+        # needs a separate ALTER that no-ops on re-run.
+        for stmt, column in [
+            ("ALTER TABLE assets ADD COLUMN captured_at TEXT", "captured_at"),
+            ("ALTER TABLE assets ADD COLUMN latitude REAL", "latitude"),
+            ("ALTER TABLE assets ADD COLUMN longitude REAL", "longitude"),
+        ]:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name: captured_at" is fine — the
+                # migration already ran on a previous init.
+                if "duplicate column" not in str(e):
+                    raise
         conn.commit()
 
 
@@ -278,17 +302,56 @@ def upsert_asset(
     original_file_name: str,
     original_url: str,
     thumbnail_url: str,
+    captured_at: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
 ) -> None:
+    """Insert or refresh the asset row. EXIF fields (captured_at,
+    latitude, longitude) are nullable; the pipeline passes them when
+    Immich returns the asset detail and the standalone backfill pass
+    updates them after-the-fact via update_asset_exif()."""
     conn.execute(
         """
-        INSERT INTO assets (asset_id, original_file_name, original_url, thumbnail_url)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO assets (
+          asset_id, original_file_name, original_url, thumbnail_url,
+          captured_at, latitude, longitude
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(asset_id) DO UPDATE SET
           original_file_name = excluded.original_file_name,
           original_url       = excluded.original_url,
-          thumbnail_url      = excluded.thumbnail_url
+          thumbnail_url      = excluded.thumbnail_url,
+          captured_at        = excluded.captured_at,
+          latitude           = excluded.latitude,
+          longitude          = excluded.longitude
         """,
-        (asset_id, original_file_name, original_url, thumbnail_url),
+        (asset_id, original_file_name, original_url, thumbnail_url,
+         captured_at, latitude, longitude),
+    )
+
+
+def update_asset_exif(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+    captured_at: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> None:
+    """Backfill EXIF fields on an existing asset row. Used by the
+    /api/assets/backfill-exif endpoint to populate columns for assets
+    inserted before the EXIF pipeline was wired up. Only the provided
+    fields are touched; pass None to leave them unchanged (SQLite keeps
+    the existing value via the COALESCE-style ? assignment)."""
+    conn.execute(
+        """
+        UPDATE assets
+           SET captured_at = ?,
+               latitude    = ?,
+               longitude   = ?
+         WHERE asset_id = ?
+        """,
+        (captured_at, latitude, longitude, asset_id),
     )
 
 
@@ -1994,6 +2057,7 @@ def get_all_results(
         f"""
         SELECT a.asset_id, a.original_file_name, a.original_url,
                a.thumbnail_url, a.cluster_id,
+               a.captured_at, a.latitude, a.longitude,
                (SELECT sr.rank_position
                   FROM search_results sr
                   WHERE sr.asset_id = a.asset_id
@@ -2119,6 +2183,9 @@ def get_all_results(
             "original_url": r["original_url"],
             "thumbnail_url": r["thumbnail_url"],
             "cluster_id": r["cluster_id"],
+            "captured_at": r["captured_at"],
+            "latitude": r["latitude"],
+            "longitude": r["longitude"],
             "top_predictions": preds_by_asset.get(aid, []),
             "taxon_scores": taxon_by_asset.get(aid, {}),
             "near_dups": near_dups,

@@ -13,14 +13,26 @@ const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
   { value: 'rank',    label: 'default',        hint: 'order returned by the server' },
   { value: 'plantae', label: 'plants first',   hint: 'highest Plantae confidence on top' },
   { value: 'score',   label: 'most confident', hint: 'highest BioCLIP top-1 score on top' },
+  { value: 'time',    label: 'newest first',   hint: 'newest EXIF capture time on top (nulls last)' },
 ];
 
-function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score'): ResultRow[] {
+function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score' | 'time'): ResultRow[] {
   if (sort === 'plantae') {
     return [...rows].sort((a, b) => (b.taxon_scores?.Plantae ?? -1) - (a.taxon_scores?.Plantae ?? -1));
   }
   if (sort === 'score') {
     return [...rows].sort((a, b) => (b.top_predictions[0]?.score ?? -1) - (a.top_predictions[0]?.score ?? -1));
+  }
+  if (sort === 'time') {
+    // ISO 8601 strings sort lexicographically; nulls land at the end
+    // via the `?? ''` fallback that we then push to the bottom.
+    return [...rows].sort((a, b) => {
+      const av = a.captured_at ?? '';
+      const bv = b.captured_at ?? '';
+      if (!av && bv) return 1;
+      if (av && !bv) return -1;
+      return bv.localeCompare(av);
+    });
   }
   return rows;
 }

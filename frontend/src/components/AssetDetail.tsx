@@ -78,6 +78,29 @@ export function AssetDetail({ assetId }: Props) {
         {data.cluster_id != null && <small> · cluster {data.cluster_id}</small>}
       </p>
 
+      {/* EXIF time + GPS. Hidden when null (no EXIF on the asset, or
+         the backfill hasn't run yet). The maps link uses the standard
+         geo: URI scheme so the OS picks the default map app. */}
+      {(data.captured_at || (data.latitude != null && data.longitude != null)) && (
+        <p className="asset-exif">
+          {data.captured_at && (
+            <span title={data.captured_at}>
+              🕒 {new Date(data.captured_at).toLocaleString()}
+            </span>
+          )}
+          {data.latitude != null && data.longitude != null && (
+            <a
+              href={`geo:${data.latitude},${data.longitude}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`}
+            >
+              📍 {data.latitude.toFixed(4)}, {data.longitude.toFixed(4)}
+            </a>
+          )}
+        </p>
+      )}
+
       <nav className="taxon-row" aria-label="taxonomy hierarchy">
         {fullTop1?.kingdom && <span className="taxon-rank kingdom">{fullTop1.kingdom}</span>}
         {fullTop1?.family && (

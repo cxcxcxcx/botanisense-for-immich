@@ -481,7 +481,8 @@ async def asset_detail(asset_id: str) -> dict:
         # 1. Asset row metadata.
         asset_row = conn.execute(
             """SELECT asset_id, original_file_name, original_url,
-                      thumbnail_url, cluster_id
+                      thumbnail_url, cluster_id,
+                      captured_at, latitude, longitude
                FROM assets WHERE asset_id = ?""",
             (asset_id,),
         ).fetchone()
@@ -1868,6 +1869,98 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
 # GET /api/assets until the trash TTL expires. We rely on the confirm
 # step in the UI to give the user a chance to back out if they just
 # trashed something.
+
+# ---- backfill EXIF (time + geo) for existing assets -------------------
+# One-shot pass that walks every row in the local DB and pulls
+# /api/assets/{id} from Immich to fill captured_at / latitude /
+# longitude. Existing rows from before the EXIF pipeline landed have
+# these as NULL — this endpoint lets the user populate them without
+# re-running the full pipeline (which would re-embed and re-cluster).
+
+@app.post("/api/assets/backfill-exif")
+async def backfill_exif() -> dict:
+    """GET /api/assets/{id} for every DB row, capture EXIF into the
+    assets table. Synchronous like purge-missing; ~30s for the user's
+    17k-row DB. Returns the count + first few samples so the UI can
+    confirm what landed."""
+    client = _immich_client()
+    try:
+        with storage.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT asset_id FROM assets ORDER BY asset_id"
+            ).fetchall()
+            asset_ids = [r["asset_id"] for r in rows]
+
+        if not asset_ids:
+            return {"updated_count": 0, "sample": []}
+
+        # Async GET per asset, 100 concurrent — same shape as the
+        # purge probe but pulls the full AssetResponseDTO (~1.7KB) so
+        # we can extract EXIF.
+        api_key = client._client.headers["x-api-key"]
+        base_url = client.base_url
+        sem = asyncio.Semaphore(100)
+
+        async def fetch_one(aid: str) -> tuple[str, dict] | None:
+            async with sem:
+                try:
+                    async with httpx.AsyncClient(
+                        base_url=base_url,
+                        headers={"x-api-key": api_key, "Accept": "application/json"},
+                        timeout=10.0,
+                        limits=httpx.Limits(max_connections=200),
+                    ) as ac:
+                        r = await ac.get(f"/api/assets/{aid}")
+                except httpx.HTTPError:
+                    return None
+                if r.status_code != 200:
+                    return None
+                return aid, r.json()
+
+        results = await asyncio.gather(*(fetch_one(a) for a in asset_ids))
+        # Filter to (aid, payload) pairs; missing assets are also
+        # candidates for the upcoming purge but we don't touch them
+        # here — backfill-exif only writes when Immich returns data.
+        parsed = [
+            (aid, ImmichClient.extract_exif(payload))
+            for aid, payload in results
+            if payload is not None
+        ]
+
+        updated = 0
+        sample: list[dict] = []
+        with storage.connect(DB_PATH) as conn:
+            for aid, exif in parsed:
+                # Skip rows that already have a captured_at — the
+                # user can re-run the pipeline to refresh stale EXIF,
+                # but the backfill shouldn't blow away existing data.
+                existing = conn.execute(
+                    "SELECT captured_at FROM assets WHERE asset_id = ?",
+                    (aid,),
+                ).fetchone()
+                if existing and existing["captured_at"]:
+                    continue
+                storage.update_asset_exif(
+                    conn,
+                    asset_id=aid,
+                    captured_at=exif["captured_at"],
+                    latitude=exif["latitude"],
+                    longitude=exif["longitude"],
+                )
+                updated += 1
+                if len(sample) < 5 and exif["captured_at"]:
+                    sample.append({
+                        "asset_id": aid,
+                        "captured_at": exif["captured_at"],
+                        "latitude": exif["latitude"],
+                        "longitude": exif["longitude"],
+                    })
+        # Invalidate results cache — sort-by-time needs captured_at.
+        _results_cache.clear()
+        return {"updated_count": updated, "sample": sample}
+    finally:
+        client.close()
+
 
 @app.post("/api/assets/purge-missing")
 async def purge_missing_assets(

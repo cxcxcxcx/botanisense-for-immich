@@ -167,3 +167,25 @@ export const purgeMissing = () =>
     method: 'POST',
     query: { dry_run: 'false' },
   });
+
+// ---- Backfill EXIF (time + geo) from Immich -------------------------
+// One-shot pass that walks every DB row and pulls /api/assets/{id} to
+// fill captured_at / latitude / longitude. Synchronous like purge
+// (~30s for a 17k-row DB). The pipeline ingest also calls Immich for
+// each new asset; this is for rows that existed before EXIF capture
+// was added.
+
+export interface BackfillExifResult {
+  updated_count: number;
+  sample: Array<{
+    asset_id: string;
+    captured_at: string | null;
+    latitude: number | null;
+    longitude: number | null;
+  }>;
+}
+
+export const backfillExif = () =>
+  fetchJson<BackfillExifResult>('/api/assets/backfill-exif', {
+    method: 'POST',
+  });

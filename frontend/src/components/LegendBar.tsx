@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getResults, reclassifyVisible } from '../api/endpoints';
+import { backfillExif, getResults, reclassifyVisible } from '../api/endpoints';
 import type { ResultsResponse } from '../api/types';
 import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
@@ -39,6 +39,25 @@ export function LegendBar() {
     }
   };
 
+  // One-shot backfill — pulls EXIF (capture time + GPS) for every
+  // DB row that doesn't have it yet. Synchronous on the server
+  // (~30s for the user's 17k-row DB), no progress bar; just a
+  // success toast when it lands.
+  const handleBackfillExif = async () => {
+    push({ kind: 'info', message: 'Backfilling EXIF from Immich — this takes ~30s for a 17k library' }, 2500);
+    try {
+      const r = await backfillExif();
+      push({
+        kind: r.updated_count > 0 ? 'success' : 'info',
+        message: r.updated_count > 0
+          ? `Backfilled EXIF on ${r.updated_count.toLocaleString()} assets`
+          : 'Nothing to backfill — every asset already has capture time',
+      }, 4000);
+    } catch (err) {
+      push({ kind: 'error', message: err instanceof Error ? err.message : String(err) }, 4000);
+    }
+  };
+
   return (
     <nav className="legend-bar">
       <div className="legend-bar-row">
@@ -63,6 +82,13 @@ export function LegendBar() {
         </button>
       </div>
       <div className="legend-bar-actions legend-bar-maintenance">
+        <button
+          className="secondary outline"
+          onClick={handleBackfillExif}
+          title="Pull EXIF capture time + GPS from Immich for every asset that doesn't have it yet. ~30s for 17k assets."
+        >
+          🕒 Backfill EXIF
+        </button>
         <button
           className="secondary outline danger"
           onClick={handlePurgeMissing}

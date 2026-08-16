@@ -169,6 +169,73 @@ class ImmichClient:
     # body). GET (with full asset JSON) is ~10× slower.
     _PROBE_CONCURRENCY = 100
 
+    # ---- per-asset EXIF --------------------------------------------------
+
+    # Cache GET /api/assets/{id} for the duration of one ingest batch.
+    # The pipeline hits this once per asset; without a cache the same
+    # asset would be re-fetched if it shows up twice (e.g. across two
+    # search pages).
+    _exif_cache: dict[str, dict] | None = None
+
+    def _exif_cache_init(self) -> None:
+        if self._exif_cache is None:
+            self._exif_cache = {}
+
+    def get_asset_metadata(self, asset_id: str) -> dict | None:
+        """GET /api/assets/{id} — return the AssetResponseDTO, or None
+        if Immich 404s. Pulled by the pipeline on ingest to extract
+        EXIF capture time + GPS for the local DB.
+
+        The full payload is large (~1.7 KB) and only a few fields are
+        needed downstream; we return the whole dict so callers can
+        extract anything else without another round-trip.
+
+        Results are cached for the lifetime of this client instance
+        (one pipeline run) so repeated lookups for the same asset
+        are free.
+        """
+        self._exif_cache_init()
+        if asset_id in self._exif_cache:
+            return self._exif_cache[asset_id]
+        try:
+            r = self._client.get(f"/api/assets/{asset_id}")
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200:
+            self._exif_cache[asset_id] = None
+            return None
+        data = r.json()
+        self._exif_cache[asset_id] = data
+        return data
+
+    @staticmethod
+    def extract_exif(asset_payload: dict | None) -> dict:
+        """Pull (captured_at, latitude, longitude) out of an
+        AssetResponseDTO. All three fields are nullable — photos
+        without EXIF or GPS return None.
+
+        `captured_at` prefers `exifInfo.dateTimeOriginal` (EXIF
+        capture time) and falls back to `fileCreatedAt` (filesystem
+        mtime) when EXIF is absent. Both arrive as ISO 8601 strings.
+        """
+        if not asset_payload:
+            return {"captured_at": None, "latitude": None, "longitude": None}
+        exif = asset_payload.get("exifInfo") or {}
+        captured_at = exif.get("dateTimeOriginal") or asset_payload.get("fileCreatedAt")
+        latitude = exif.get("latitude")
+        longitude = exif.get("longitude")
+        # Immich serializes missing GPS as 0/0 in some versions; treat
+        # (0.0, 0.0) as "no location" so the UI doesn't render a fake
+        # pin in the Atlantic.
+        if latitude == 0.0 and longitude == 0.0:
+            latitude = None
+            longitude = None
+        return {
+            "captured_at": captured_at,
+            "latitude": latitude if isinstance(latitude, (int, float)) else None,
+            "longitude": longitude if isinstance(longitude, (int, float)) else None,
+        }
+
     def probe_existing(self, asset_ids: list[str]) -> set[str]:
         """Sync wrapper around probe_existing_async(). Use from CLI
         scripts / non-async contexts."""

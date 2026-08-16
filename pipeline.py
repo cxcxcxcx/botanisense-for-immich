@@ -527,12 +527,22 @@ def discover_plantae_assets(
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
+                # Pull EXIF in the same round-trip family so the local
+                # DB has the capture time + GPS for sort-by-time and
+                # asset-detail display. Cached per-client so re-runs of
+                # the pipeline don't re-fetch.
+                exif = ImmichClient.extract_exif(
+                    client.get_asset_metadata(asset.id)
+                )
                 storage.upsert_asset(
                     conn,
                     asset_id=asset.id,
                     original_file_name=asset.original_file_name,
                     original_url=original_url,
                     thumbnail_url=thumbnail_url,
+                    captured_at=exif["captured_at"],
+                    latitude=exif["latitude"],
+                    longitude=exif["longitude"],
                 )
                 if storage.taxon_scores_have_asset(
                     conn, asset_id=asset.id, rank="kingdom"
@@ -840,12 +850,22 @@ def run_pipeline(
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
+                # Pull EXIF in the same family as the chunk loop
+                # above — same cache, same parser. Existing rows keep
+                # their previous EXIF via the ON CONFLICT clause in
+                # upsert_asset().
+                exif = ImmichClient.extract_exif(
+                    client.get_asset_metadata(asset.id)
+                )
                 storage.upsert_asset(
                     conn,
                     asset_id=asset.id,
                     original_file_name=asset.original_file_name,
                     original_url=original_url,
                     thumbnail_url=thumbnail_url,
+                    captured_at=exif["captured_at"],
+                    latitude=exif["latitude"],
+                    longitude=exif["longitude"],
                 )
 
                 cached_preds = storage.fetch_predictions(

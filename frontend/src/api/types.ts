@@ -52,6 +52,12 @@ export interface ResultRow {
   original_url: string;
   thumbnail_url: string;
   cluster_id: number | null;
+  // EXIF time + geo (from Immich's GET /api/assets/{id}). NULL until
+  // the pipeline ingest captures them, or until the user runs the
+  // one-shot /api/assets/backfill-exif.
+  captured_at: string | null;
+  latitude: number | null;
+  longitude: number | null;
   rank: number | null;
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
@@ -109,6 +115,11 @@ export interface AssetDetail {
   original_url: string;
   thumbnail_url: string;
   cluster_id: number | null;
+  // EXIF time + geo. NULL until the pipeline ingest captures them,
+  // or until /api/assets/backfill-exif populates existing rows.
+  captured_at: string | null;
+  latitude: number | null;
+  longitude: number | null;
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
   detections: Detection[];

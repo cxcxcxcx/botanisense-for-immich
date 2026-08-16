@@ -18,7 +18,9 @@ import {
 // ---- Types ---------------------------------------------------------------
 
 export type GroupBy = 'cluster' | 'species' | 'genus' | 'family';
-export type SortMode = 'rank' | 'plantae' | 'score';
+// `time` = newest captured_at first (EXIF dateTimeOriginal, falling
+// back to fileCreatedAt). Photos without captured_at sort last.
+export type SortMode = 'rank' | 'plantae' | 'score' | 'time';
 
 export interface Filters {
   group_by: GroupBy;

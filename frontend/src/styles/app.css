@@ -594,6 +594,19 @@ nav.legend-bar, .legend-bar {
 .asset-detail { font-size: 13px; }
 .asset-detail h5 { margin: 0.75rem 0 0.4rem; font-size: 0.9rem; color: #ad9; }
 
+/* EXIF row in the asset-detail modal — capture time + GPS link.
+   Both fields are optional (hidden entirely if the asset has
+   neither). Sits right under the filename, above the taxonomy row. */
+.asset-detail .asset-exif {
+  margin: -0.25rem 0 0.5rem;
+  font-size: 11px; color: #aaa;
+  display: flex; flex-wrap: wrap; gap: 0.5rem 1rem;
+}
+.asset-detail .asset-exif a {
+  color: #7ad; text-decoration: none;
+}
+.asset-detail .asset-exif a:hover { text-decoration: underline; }
+
 .preds { padding: 0 12px 12px; }
 .pred {
   display: flex; justify-content: space-between; gap: 10px;
