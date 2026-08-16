@@ -57,15 +57,17 @@ export function App() {
   }, []);
 
   // Keep the route aligned with the filter state.
-  //   - filters active  → must be on #browse/content
-  //   - filters cleared → must be on #browse
-  // This way the URL is always the source of truth and deep-links work.
+  //   - filter becomes active while on the list view → jump to content
+  //     (so deep-links like ?cluster_id=2 land on the photo grid).
+  //   - filter is cleared while on content view → STAY on content.
+  //     The user navigated there explicitly (clicked "All" or a card),
+  //     and the breadcrumb "back" link is the canonical way to leave
+  //     the content view. Auto-jumping back here would override that
+  //     and leave the "All" card click stranded on the filter cards.
   useEffect(() => {
     const h = window.location.hash.replace(/^#/, '').trim();
-    if (hasActiveFilter && h !== 'browse/content') {
+    if (hasActiveFilter && h === 'browse') {
       navigate('browse-content');
-    } else if (!hasActiveFilter && h === 'browse/content') {
-      navigate('browse-list');
     }
   }, [hasActiveFilter]);
 

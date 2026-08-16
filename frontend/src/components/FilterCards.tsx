@@ -13,6 +13,7 @@ import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/type
 import { useApp, useFilters, type GroupBy } from '../state/AppContext';
 import { useDebounce } from '../hooks/useDebounce';
 import { useUrlFilters } from '../hooks/useUrlFilters';
+import { navigate } from '../hooks/useRoute';
 import { thumbUrl } from '../lib/thumb';
 
 export type CardSort = 'alpha' | 'size' | 'id';
@@ -175,9 +176,20 @@ export function FilterCards() {
   const clearFilter = () =>
     setFilters({ [activeParamKey]: undefined, page: 0 } as Partial<typeof filters>);
 
+  // "All" means: clear any active filter and jump to the photo grid so
+  // the user actually sees all their photos. The route-sync effect no
+  // longer auto-jumps content → list when the filter clears, so this
+  // navigation is the only thing taking the user from the filter
+  // cards view into the all-photos grid.
+  const goToAll = () => {
+    clearFilter();
+    navigate('browse-content');
+  };
+
   const handleClick = (card: Card) => {
     if (card.key === activeKey) {
       clearFilter();
+      navigate('browse-list');
       return;
     }
     const v = activeParamKey === 'cluster_id' ? Number(card.key) : card.key;
@@ -238,7 +250,7 @@ export function FilterCards() {
           total={total}
           groupBy={filters.group_by}
           active={activeKey == null}
-          onClick={clearFilter}
+          onClick={goToAll}
         />
         {stickyActive && (
           <FilterCardTile
@@ -246,7 +258,7 @@ export function FilterCards() {
             rank={filters.group_by}
             active
             pinned
-            onClick={clearFilter}
+            onClick={() => { clearFilter(); navigate('browse-list'); }}
           />
         )}
         {isLoading && visibleCards.length === 0 && !stickyActive ? (

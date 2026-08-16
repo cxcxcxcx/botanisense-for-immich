@@ -3,6 +3,7 @@ import { getResults } from '../api/endpoints';
 import type { ResultRow, ResultsResponse } from '../api/types';
 import { useFilters, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
+import { navigate } from '../hooks/useRoute';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 
@@ -47,6 +48,12 @@ export function Grid() {
     else if (filters.group_by === 'species') setFilters({ species: undefined, page: 0 });
     else if (filters.group_by === 'genus') setFilters({ genus: undefined, page: 0 });
     else if (filters.group_by === 'family') setFilters({ family: undefined, page: 0 });
+    // Leave the photo grid and return to the filter cards view. The
+    // route-sync effect used to do this automatically when the filter
+    // cleared; that's gone now so the "All" card click can land on
+    // #browse/content without being yanked back. This is the canonical
+    // way to leave the content view.
+    navigate('browse-list');
   };
 
   // Refresh on filter change. Re-read the entire page because filters
