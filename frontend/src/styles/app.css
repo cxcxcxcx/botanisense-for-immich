@@ -437,11 +437,16 @@ nav.legend-bar, .legend-bar {
 }
 
 .card {
-  /* Subtle border + tiny radius. The 1px border separates cards
-     from the dark page background; the 2px radius is just enough
-     to soften the corners without competing with the photo. */
+  /* Pico.css stamps every <article> with 1rem vertical + 1.25rem
+     horizontal padding, a margin-bottom, and a default border-radius
+     + box-shadow. Reset all of those so the photo fills the card
+     edge-to-edge — on a phone where each card is half the screen,
+     that's a lot of wasted space. */
+  padding: 0; margin: 0;
+  border-radius: 2px;
+  box-shadow: none;
   background: #111;
-  border: 1px solid #2a2a2a; border-radius: 2px;
+  border: 1px solid #2a2a2a;
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
   position: relative;
   transition: border-color 0.12s;
