@@ -837,6 +837,125 @@ async def knn_status() -> dict:
     return _knn_status_dict()
 
 
+# ---- Build KNN index (FAISS) -------------------------------------------
+# Wraps `python -m knn --parquet-glob ... --tag ...` as a long-running
+# background job with a tail-the-log endpoint so the UI can show
+# progress without spawning a subprocess. Importing knn.build_faiss_index
+# directly (instead of subprocess'ing `python -m knn`) saves ~1s of
+# interpreter startup and lets us reuse the in-process FAISS installation.
+
+class KnnBuildArgs(BaseModel):
+    parquet_glob: str
+    tag: str
+    index_dir: str | None = None        # default: KNN_INVENTORY_DIR
+    kingdoms: str | None = None        # comma-separated, e.g. "Plantae,Fungi"
+    index_type: str | None = None      # "ivf" (default) or "flat"
+
+# In-memory job registry. Jobs are short-lived (~minutes-to-hours);
+# the log file outlives the process so users can grep later.
+_knn_build_jobs: dict[str, dict] = {}
+
+
+def _knn_build_worker(job_id: str, args: KnnBuildArgs) -> None:
+    """Body of the build thread. Imports knn.build_faiss_index, sets up
+    a file log handler so each chunk progress line lands in the per-job
+    log file, and tears down cleanly on success/error."""
+    import logging
+    import knn  # local module
+
+    job = _knn_build_jobs[job_id]
+    log_path = Path(job["log_path"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    knn_logger = logging.getLogger("knn")
+    handler = logging.FileHandler(log_path, mode="w")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    knn_logger.addHandler(handler)
+    knn_logger.setLevel(logging.INFO)
+    # Make sure the kNN package's _log also reaches our handler.
+    # (knn._log = logging.getLogger(__name__))
+    try:
+        index_dir = Path(args.index_dir or KNN_INVENTORY_DIR)
+        index_dir.mkdir(parents=True, exist_ok=True)
+        kingdoms = (
+            [k.strip() for k in args.kingdoms.split(",") if k.strip()]
+            if args.kingdoms else None
+        )
+        knn.build_faiss_index(
+            parquet_glob=args.parquet_glob,
+            index_path=index_dir / "tol200m_bioclip2.faiss",
+            labels_path=index_dir / "labels.parquet",
+            kingdoms=kingdoms,
+            version_tag=args.tag,
+            index_type=args.index_type or "ivf",
+        )
+        # Clear the cached in-process index so the next /api/knn-status
+        # picks up the freshly-built one.
+        global _knn_index, _knn_labels, _knn_meta
+        with _lock:
+            _knn_index = None
+            _knn_labels = None
+            _knn_meta = None
+        job["status"] = "done"
+    except Exception as e:
+        knn_logger.exception("[knn.build] failed")
+        job["status"] = "error"
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        knn_logger.removeHandler(handler)
+        handler.close()
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+@app.post("/api/knn/build")
+async def start_knn_build(args: KnnBuildArgs) -> dict:
+    """Spawn a build thread, return its job_id. The UI polls
+    /api/knn/build/job/{job_id} for status and /api/knn/build/logs for
+    the live log tail."""
+    job_id = uuid.uuid4().hex[:8]
+    log_path = Path(DB_PATH).parent / f"knn-build-{job_id}.log"
+    _knn_build_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "log_path": str(log_path),
+        "args": args.model_dump(),
+        "error": None,
+    }
+    threading.Thread(target=_knn_build_worker, args=(job_id, args), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/knn/build/job/{job_id}")
+async def poll_knn_build_job(job_id: str) -> dict:
+    job = _knn_build_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown build job")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "error": job["error"],
+    }
+
+
+@app.get("/api/knn/build/logs")
+async def get_knn_build_logs(job_id: str, tail: int = 50) -> dict:
+    """Return the last `tail` lines of the build log so the UI can show
+    progress (chunk rows / pct / IVF training time) without parsing."""
+    job = _knn_build_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown build job")
+    try:
+        with open(job["log_path"]) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    return {"job_id": job_id, "lines": [l.rstrip() for l in lines[-tail:]]}
+
+
 @app.post("/api/reclassify")
 async def reclassify(params: ReclassifyParams) -> dict:
     """KNN reclassify the given asset_ids. Skips any asset already

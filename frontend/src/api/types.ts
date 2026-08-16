@@ -156,6 +156,31 @@ export interface KnnStatus {
   cached_versions?: { index_version: string; k: number; n: number }[];
 }
 
+// Build-KNN flow. POST /api/knn/build spawns a thread that imports
+// knn.build_faiss_index() in-process, runs it, and writes its log to
+// a per-job file. The frontend polls /job/{id} for status and /logs
+// for the live tail.
+export interface KnnBuildArgs {
+  parquet_glob: string;
+  tag: string;
+  index_dir?: string | null;
+  kingdoms?: string | null;
+  index_type?: string | null;
+}
+
+export interface KnnBuildJobSnapshot {
+  job_id: string;
+  status: 'running' | 'done' | 'error';
+  started_at: string;
+  finished_at: string | null;
+  error: string | null;
+}
+
+export interface KnnBuildLogsResponse {
+  job_id: string;
+  lines: string[];
+}
+
 export interface PipelineStatus {
   status: 'idle' | 'running' | 'done' | 'error';
   stage: string | null;

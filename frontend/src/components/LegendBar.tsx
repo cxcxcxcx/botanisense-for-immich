@@ -3,11 +3,13 @@ import { backfillExif, getResults, reclassifyVisible } from '../api/endpoints';
 import type { ResultsResponse } from '../api/types';
 import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
+import { KnnBuildModal } from './KnnBuildModal';
 
 export function LegendBar() {
   const { dispatch } = useApp();
   const push = useToasts();
   const [plantae, setPlantae] = useState<{ green: number; yellow: number }>({ green: 0.60, yellow: 0.35 });
+  const [knnOpen, setKnnOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -73,6 +75,11 @@ export function LegendBar() {
       <div className="flex flex-wrap items-center gap-2 pt-1 mt-0.5 border-t border-dashed border-line2">
         <button
           className={btnCls}
+          onClick={() => setKnnOpen(true)}
+          title="Build the FAISS KNN index from TreeOfLife-200M parquet embeddings. Heavy: minutes-to-hours; logs stream into a tail viewer."
+        >🧠 Build KNN index</button>
+        <button
+          className={btnCls}
           onClick={handleBackfillExif}
           title="Pull EXIF capture time + GPS from Immich for every asset that doesn't have it yet. ~30s for 17k assets."
         >🕒 Backfill EXIF</button>
@@ -82,6 +89,7 @@ export function LegendBar() {
           title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
         >🗑 Purge assets deleted in Immich</button>
       </div>
+      <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
     </nav>
   );
 }

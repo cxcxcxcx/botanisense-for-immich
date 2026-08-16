@@ -10,6 +10,9 @@ import type {
   JobPreview,
   JobSnapshot,
   JobStart,
+  KnnBuildArgs,
+  KnnBuildJobSnapshot,
+  KnnBuildLogsResponse,
   KnnStatus,
   PipelineStatus,
   PlantsAlbumStatus,
@@ -188,4 +191,22 @@ export interface BackfillExifResult {
 export const backfillExif = () =>
   fetchJson<BackfillExifResult>('/api/assets/backfill-exif', {
     method: 'POST',
+  });
+
+// ---- Build KNN index (FAISS) ---------------------------------------
+// Long-running job spawned by the Run view "Build KNN index" button.
+// Three endpoints: start, poll-status, tail-logs.
+
+export const startKnnBuild = (args: KnnBuildArgs) =>
+  fetchJson<{ job_id: string }>('/api/knn/build', {
+    method: 'POST',
+    body: args,
+  });
+
+export const pollKnnBuildJob = (job_id: string) =>
+  fetchJson<KnnBuildJobSnapshot>(`/api/knn/build/job/${job_id}`);
+
+export const getKnnBuildLogs = (job_id: string, tail = 50) =>
+  fetchJson<KnnBuildLogsResponse>('/api/knn/build/logs', {
+    query: { job_id, tail },
   });
