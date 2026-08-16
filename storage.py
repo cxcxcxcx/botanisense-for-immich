@@ -299,6 +299,28 @@ def all_assets(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def delete_assets_by_ids(
+    conn: sqlite3.Connection, asset_ids: list[str]
+) -> int:
+    """Bulk-delete the listed asset_ids from `assets`. FK CASCADE handles
+    the seven child tables (embeddings, predictions, detections,
+    bbox_predictions, taxon_scores, knn_predictions, search_results) so
+    a single statement cleans everything keyed by the asset.
+
+    `PRAGMA foreign_keys=ON` is set on every connection via connect(),
+    so the cascades fire. Returns the rowcount from the parent delete.
+    """
+    if not asset_ids:
+        return 0
+    placeholders = ",".join("?" * len(asset_ids))
+    cur = conn.execute(
+        f"DELETE FROM assets WHERE asset_id IN ({placeholders})",
+        list(asset_ids),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
 def all_embeddings(conn: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     """Load every (asset_id, vector) pair, returning aligned lists."""
     rows = conn.execute(

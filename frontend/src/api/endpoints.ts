@@ -13,6 +13,8 @@ import type {
   KnnStatus,
   PipelineStatus,
   PlantsAlbumStatus,
+  PurgeMissingPreview,
+  PurgeMissingResult,
   ResultsQuery,
   ResultsResponse,
   RunParams,
@@ -143,3 +145,25 @@ export const startClusteringRefit = (threshold_pct?: number) =>
     '/api/clustering/refit',
     { method: 'POST', body: { threshold_pct } },
   );
+
+// ---- Purge assets deleted from Immich -----------------------------------
+// Two-phase flow: preview scans Immich and returns the count + sample;
+// purge runs the scan again and DELETEs the missing rows from the local
+// DB. Synchronous on the server (no job_id), so the UI uses JobPanel's
+// 'isSync' branch to dispatch JOB_DONE directly on success.
+
+export const previewPurgeMissing = async () => {
+  const r = await fetchJson<PurgeMissingPreview>('/api/assets/purge-missing', {
+    method: 'POST',
+    query: { dry_run: 'true' },
+  });
+  // JobPanel's preview() expects {n_assets, sample?}; map the missing
+  // count into the canonical field name so the existing UI works.
+  return { n_assets: r.missing_count, sample: r.sample };
+};
+
+export const purgeMissing = () =>
+  fetchJson<PurgeMissingResult>('/api/assets/purge-missing', {
+    method: 'POST',
+    query: { dry_run: 'false' },
+  });

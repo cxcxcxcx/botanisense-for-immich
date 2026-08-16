@@ -16,6 +16,7 @@ All endpoints accept either `x-api-key: <key>` (preferred for API keys) or
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -159,6 +160,63 @@ class ImmichClient:
             for item in items
             if item.get("type") == "IMAGE"
         ]
+
+    # ---- asset enumeration ----------------------------------------------
+
+    # How many concurrent GETs to fire at Immich when probing per-asset
+    # existence. Each call is ~30-50ms round-trip on a LAN; 100 in
+    # flight processes ~2000 assets/sec when using HEAD (no response
+    # body). GET (with full asset JSON) is ~10× slower.
+    _PROBE_CONCURRENCY = 100
+
+    def probe_existing(self, asset_ids: list[str]) -> set[str]:
+        """Sync wrapper around probe_existing_async(). Use from CLI
+        scripts / non-async contexts."""
+        return asyncio.run(self.probe_existing_async(asset_ids))
+
+    async def probe_existing_async(self, asset_ids: list[str]) -> set[str]:
+        """Probe the given asset_ids against Immich's
+        HEAD /api/assets/{id}; return the subset that exists (200).
+        Anything else (404 / network error) is treated as missing.
+
+        Used by the local DB's "purge missing" flow: assets in the
+        local DB but missing from this set are candidates for purging.
+        We don't try to enumerate the full Immich library — that would
+        require GET /api/assets (not exposed in Immich 2.7) or
+        brute-force random sampling (which doesn't converge with the
+        user's 100k+ photo library). Instead we probe only what the
+        DB knows about and report anything 404ing as missing.
+
+        Note: Immich's trash retention means trashed photos still
+        return 200 here until the trash TTL expires, so callers should
+        let users confirm before deleting anything.
+
+        Async because FastAPI runs the endpoint in an event loop;
+        calling asyncio.run() inside it would fail with
+        "asyncio.run() cannot be called from a running event loop".
+        """
+        sem = asyncio.Semaphore(self._PROBE_CONCURRENCY)
+        api_key = self._client.headers["x-api-key"]
+
+        # Reuse ONE AsyncClient across all probes + use HEAD to skip the
+        # ~1.7KB JSON body per asset. With 100 concurrency, ~17k probes
+        # complete in 10-15s on a LAN.
+        async with httpx.AsyncClient(
+            base_url=self.base_url,
+            headers={"x-api-key": api_key, "Accept": "application/json"},
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=self._PROBE_CONCURRENCY * 2),
+        ) as ac:
+            async def probe(aid: str) -> str | None:
+                async with sem:
+                    try:
+                        r = await ac.head(f"/api/assets/{aid}")
+                    except httpx.HTTPError:
+                        return None
+                    return aid if r.status_code == 200 else None
+
+            results = await asyncio.gather(*(probe(a) for a in asset_ids))
+        return {x for x in results if x is not None}
 
     def download_bytes(self, path: str) -> bytes:
         r = self._client.get(path)

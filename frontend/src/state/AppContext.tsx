@@ -42,7 +42,15 @@ export interface ModalState {
   assetId: string | null;
 }
 
-export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'cluster' | 'sync-all';
+export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'cluster' | 'sync-all' | 'purge-missing';
+
+// Up to 5 sample rows from /api/assets/purge-missing, used by the
+// confirm modal so the user can spot-check filenames before purging.
+export interface PurgeMissingSample {
+  asset_id: string;
+  original_file_name: string;
+  cluster_id: number | null;
+}
 
 export interface JobProgress {
   added: number;
@@ -50,6 +58,8 @@ export interface JobProgress {
   album_id: string | null;
   album_url: string | null;
   reused: boolean;
+  // For purge-missing: filename samples returned by the preview.
+  sample: PurgeMissingSample[];
 }
 
 export type JobPanelState =
@@ -79,7 +89,7 @@ export type Action =
   | { type: 'CLOSE_MODAL' }
   | { type: 'SET_FILTERS_COLLAPSED'; collapsed: boolean }
   | { type: 'OPEN_JOB'; kind: Exclude<JobKind, 'idle'>; payload: { clusterId?: number; kingdom?: string } }
-  | { type: 'JOB_PREVIEW_OK'; total: number }
+  | { type: 'JOB_PREVIEW_OK'; total: number; sample?: PurgeMissingSample[] }
   | { type: 'JOB_PREVIEW_ERR'; errorMsg: string }
   | { type: 'JOB_STARTED'; jobId: string; total: number }
   | { type: 'JOB_PROGRESS'; added: number; total: number }
@@ -143,14 +153,25 @@ function reducer(state: AppState, action: Action): AppState {
           kind: action.kind,
           payload: action.payload,
           state: 'confirm',
-          progress: { added: 0, total: 0, album_id: null, album_url: null, reused: false },
+          progress: { added: 0, total: 0, album_id: null, album_url: null, reused: false, sample: [] },
           jobId: null,
           errorMsg: '',
         },
       };
     case 'JOB_PREVIEW_OK':
       if (state.job.kind === 'idle') return state;
-      return { ...state, job: { ...state.job, state: 'confirm', progress: { ...state.job.progress, total: action.total } } };
+      return {
+        ...state,
+        job: {
+          ...state.job,
+          state: 'confirm',
+          progress: {
+            ...state.job.progress,
+            total: action.total,
+            sample: action.sample ?? state.job.progress.sample,
+          },
+        },
+      };
     case 'JOB_PREVIEW_ERR':
       if (state.job.kind === 'idle') return state;
       return { ...state, job: { ...state.job, state: 'preview-error', errorMsg: action.errorMsg } };

@@ -192,6 +192,29 @@ export interface ClusterAlbumMapping {
   last_synced_at: string;
 }
 
+// Purge-missing-assets flow. Matches the JSON shape of
+// POST /api/assets/purge-missing on the backend (storage.py +
+// immich_client.py + app.py).
+export interface PurgeMissingSample {
+  asset_id: string;
+  original_file_name: string;
+  cluster_id: number | null;
+}
+
+export interface PurgeMissingPreview {
+  // JobPanel's preview expects `n_assets` as the canonical count.
+  // We map missing_count → n_assets at the call site.
+  missing_count: number;
+  // Up to 5 sample rows so the confirm modal can show filenames.
+  sample: PurgeMissingSample[];
+}
+
+export interface PurgeMissingResult {
+  missing_count: number;
+  deleted_count: number;
+  sample?: PurgeMissingSample[];
+}
+
 export interface PlantsAlbumStatus {
   exists: boolean;
   kingdom?: string;

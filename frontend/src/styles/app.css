@@ -135,7 +135,40 @@ nav.legend-bar, .legend-bar {
 }
 .legend-bar-row { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
 .legend-bar-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; }
+.legend-bar-actions.legend-bar-maintenance {
+  border-top: 1px dashed #2a2a2a; padding-top: 0.4rem; margin-top: 0.25rem;
+}
 .legend-bar button { font-size: 0.8rem; }
+
+/* Destructive variant — used by Purge-missing. Red border, red text on
+   hover, normal background. The confirm modal in JobPanel is the
+   actual safety check; this just signals intent at a glance. */
+.legend-bar button.danger,
+.legend-bar-actions button.danger {
+  color: #f88; border-color: #5a3030;
+}
+.legend-bar button.danger:hover {
+  color: #fff; background: #5a3030; border-color: #f88;
+}
+
+/* Sample list inside the purge-missing confirm modal. Compact rows so
+   the user can spot-check filenames before clicking Confirm. */
+.purge-sample-list {
+  list-style: none; padding: 0; margin: 0.25rem 0 0.5rem;
+  border: 1px solid #2a2a2a; border-radius: 4px;
+  background: #14181d; max-height: 160px; overflow: auto;
+  font-size: 11px; font-family: ui-monospace, monospace;
+}
+.purge-sample-list li {
+  display: flex; justify-content: space-between; gap: 0.5rem;
+  padding: 3px 8px; border-top: 1px solid #1f1f1f;
+}
+.purge-sample-list li:first-child { border-top: 0; }
+.purge-sample-list .purge-sample-name {
+  color: #eee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
+}
+.purge-sample-list .purge-sample-cluster { color: #888; flex-shrink: 0; }
 
 /* Plantae legend chip. */
 .plantae-legend { display: inline-flex; gap: 0.4rem; align-items: center; color: #888; }

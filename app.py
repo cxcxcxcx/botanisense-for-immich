@@ -1852,6 +1852,83 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
     return {"queued": len(ids)}
 
 
+# ---- purge assets deleted from Immich -----------------------------------
+# When a photo is removed in Immich the local SQLite row stays, the
+# /thumb/{asset_id} endpoint then 404s, and the grid shows broken tiles.
+# This endpoint enumerates every asset ID in Immich and diffs against
+# our DB so the user can confirm a purge.
+#
+# Two phases, one URL:
+#   ?dry_run=true   → return the count + a small sample for the
+#                     JobPanel confirm modal; do NOT touch the DB.
+#   ?dry_run=false  → run the same diff and DELETE the missing IDs.
+#                     FK CASCADE cleans the seven child tables.
+#
+# Note: Immich's trash retention means trashed photos still appear in
+# GET /api/assets until the trash TTL expires. We rely on the confirm
+# step in the UI to give the user a chance to back out if they just
+# trashed something.
+
+@app.post("/api/assets/purge-missing")
+async def purge_missing_assets(
+    dry_run: bool = Query(default=True),
+) -> dict:
+    """Scan Immich for every asset ID, then (if dry_run=false) DELETE
+    the ones missing from Immich. Returns the preview payload either
+    way so the UI can show the same shape."""
+    client = _immich_client()
+    try:
+        with storage.connect(DB_PATH) as conn:
+            db_rows = conn.execute(
+                "SELECT asset_id, original_file_name, cluster_id "
+                "FROM assets ORDER BY asset_id"
+            ).fetchall()
+            db_ids = [r["asset_id"] for r in db_rows]
+
+        if not db_ids:
+            return {"missing_count": 0, "sample": []}
+
+        # Probe each DB asset against Immich's /api/assets/{id}; 200
+        # means it still exists, anything else (404 / network error) is
+        # treated as missing. Bounded at ~50 concurrent requests so we
+        # don't overwhelm the Immich server.
+        existing_ids = await client.probe_existing_async(db_ids)
+        missing_ids = [aid for aid in db_ids if aid not in existing_ids]
+
+        # Build a small preview sample: at most 5 entries, each with the
+        # filename + cluster so the user can spot-check before confirming.
+        sample_size = 5
+        sample: list[dict] = []
+        missing_set = set(missing_ids)
+        for r in db_rows:
+            if r["asset_id"] in missing_set:
+                sample.append({
+                    "asset_id": r["asset_id"],
+                    "original_file_name": r["original_file_name"],
+                    "cluster_id": r["cluster_id"],
+                })
+                if len(sample) >= sample_size:
+                    break
+
+        payload: dict = {
+            "missing_count": len(missing_ids),
+            "sample": sample,
+        }
+
+        if dry_run:
+            return payload
+
+        with storage.connect(DB_PATH) as conn:
+            deleted = storage.delete_assets_by_ids(conn, missing_ids)
+        payload["deleted_count"] = deleted
+        # Invalidate caches that snapshot /api/results, cluster counts,
+        # and kingdom summaries — purges can drop totals.
+        _results_cache.clear()
+        return payload
+    finally:
+        client.close()
+
+
 # ---- SPA mount (LAST) ---------------------------------------------------
 # Mount the React build output. This must come after all @app routes so
 # the StaticFiles handler doesn't shadow /api/* or /thumb/*. `html=True`

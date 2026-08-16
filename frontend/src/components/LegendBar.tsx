@@ -24,6 +24,10 @@ export function LegendBar() {
   const handleSyncAll = () => dispatch({ type: 'OPEN_JOB', kind: 'sync-all', payload: {} });
   const handlePlants  = () => dispatch({ type: 'OPEN_JOB', kind: 'plants', payload: {} });
   const handleFungi   = () => dispatch({ type: 'OPEN_JOB', kind: 'fungi', payload: {} });
+  // Maintenance op — destructive, so it sits on its own row beneath the
+  // enrichment actions. The confirm modal handles the actual safety
+  // check (Immich trash retention is not silent).
+  const handlePurgeMissing = () => dispatch({ type: 'OPEN_JOB', kind: 'purge-missing', payload: {} });
 
   const handleReclassifyVisible = async () => {
     try {
@@ -56,6 +60,15 @@ export function LegendBar() {
         </button>
         <button className="secondary outline" onClick={handleReclassifyVisible}>
           Reclassify visible with KNN
+        </button>
+      </div>
+      <div className="legend-bar-actions legend-bar-maintenance">
+        <button
+          className="secondary outline danger"
+          onClick={handlePurgeMissing}
+          title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
+        >
+          🗑 Purge assets deleted in Immich
         </button>
       </div>
     </nav>

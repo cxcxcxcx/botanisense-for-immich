@@ -6,12 +6,14 @@ import {
   previewPlantsAlbum,
   previewKingdomAlbum,
   previewClusterAlbum,
+  previewPurgeMissing,
+  purgeMissing,
   startPlantsAlbum,
   startKingdomAlbum,
   startClusterAlbumSync,
   startSyncAllClusterAlbums,
 } from '../api/endpoints';
-import type { JobSnapshot } from '../api/types';
+import type { JobSnapshot, PurgeMissingPreview, PurgeMissingResult } from '../api/types';
 import { ApiError } from '../api/client';
 import { useApp, useJob, type JobKind } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
@@ -23,8 +25,13 @@ interface JobConfig {
   doneSubject: () => string;
   hasPreview: boolean;
   hasAlbumLink: boolean;
-  preview: () => Promise<{ n_assets: number }>;
-  start: () => Promise<{ job_id: string }>;
+  // `true` for synchronous jobs (e.g. purge-missing) that complete in
+  // a single round-trip — `start()` returns the final result and we
+  // dispatch JOB_DONE directly without entering the polling loop.
+  isSync?: boolean;
+  preview: () => Promise<{ n_assets: number; sample?: PurgeMissingPreview['sample'] }>;
+  // Sync jobs return their own result shape; async jobs return {job_id}.
+  start: () => Promise<{ job_id: string } | PurgeMissingResult>;
   poll: (jobId: string) => Promise<JobSnapshot>;
   extractProgress: (snap: JobSnapshot) => { added: number; total: number };
 }
@@ -100,6 +107,21 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
         total: (snap.n_assets_total as number | undefined) ?? 0,
       }),
     },
+    'purge-missing': {
+      title: () => 'Purge assets deleted from Immich',
+      confirmText: n => `${n.toLocaleString()} assets are in the local DB but not in Immich. Delete them? (If you just trashed something in Immich, wait for the trash TTL to expire before purging.)`,
+      runningText: (added, total) => `Deleting ${added.toLocaleString()} / ${total.toLocaleString()} assets…`,
+      doneSubject: () => 'assets purged',
+      hasPreview: true,
+      hasAlbumLink: false,
+      // Synchronous job — start() returns the final result directly,
+      // no polling, no progress bar.
+      isSync: true,
+      preview: () => previewPurgeMissing(),
+      start: () => purgeMissing(),
+      poll: () => Promise.reject(new Error('not used for sync jobs')),
+      extractProgress: () => ({ added: 0, total: 0 }),
+    },
   };
 }
 
@@ -122,7 +144,7 @@ export function JobPanel() {
       .then(r => {
         if (cancelled) return;
         if (!r.n_assets) dispatch({ type: 'JOB_PREVIEW_ERR', errorMsg: 'No matching photos at the current threshold.' });
-        else dispatch({ type: 'JOB_PREVIEW_OK', total: r.n_assets });
+        else dispatch({ type: 'JOB_PREVIEW_OK', total: r.n_assets, sample: r.sample });
       })
       .catch(e => {
         if (cancelled) return;
@@ -140,6 +162,8 @@ export function JobPanel() {
     const activeJob = job;
     if (activeJob.state !== 'running' || !activeJob.jobId) return;
     const cfg = buildConfigs(activeJob.payload.clusterId)[activeJob.kind];
+    // Sync jobs complete in start() — nothing to poll.
+    if (cfg.isSync) return;
     const jobId = activeJob.jobId;
 
     const loop = async () => {
@@ -196,7 +220,28 @@ export function JobPanel() {
   const start = async () => {
     try {
       const r = await cfg.start();
-      dispatch({ type: 'JOB_STARTED', jobId: r.job_id, total: active.progress.total });
+      // Sync jobs (e.g. purge-missing) complete in this round-trip —
+      // dispatch JOB_DONE directly with the deleted count. Async jobs
+      // enter the polling loop via JOB_STARTED.
+      if (cfg.isSync) {
+        const syncResult = r as PurgeMissingResult;
+        const deleted = syncResult.deleted_count ?? 0;
+        dispatch({
+          type: 'JOB_DONE',
+          added: deleted,
+          album_id: null,
+          album_url: null,
+          reused: false,
+        });
+        push({
+          kind: deleted > 0 ? 'success' : 'info',
+          message: deleted > 0
+            ? `Purged ${deleted.toLocaleString()} deleted assets`
+            : 'Nothing to purge — local DB is in sync with Immich',
+        }, 4000);
+        return;
+      }
+      dispatch({ type: 'JOB_STARTED', jobId: (r as { job_id: string }).job_id, total: active.progress.total });
     } catch (e) {
       const msg = e instanceof ApiError ? e.detail : (e instanceof Error ? e.message : String(e));
       dispatch({ type: 'JOB_ERROR', errorMsg: msg });
@@ -222,6 +267,18 @@ export function JobPanel() {
         {active.state === 'confirm' && (
           <div>
             <p>{cfg.confirmText(active.progress.total)}</p>
+            {active.progress.sample.length > 0 && (
+              <ul className="purge-sample-list">
+                {active.progress.sample.map(s => (
+                  <li key={s.asset_id}>
+                    <span className="purge-sample-name">{s.original_file_name}</span>
+                    {s.cluster_id != null && (
+                      <small className="purge-sample-cluster">cluster #{s.cluster_id}</small>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
             <footer>
               <button type="button" className="secondary" onClick={hide}>Cancel</button>
               <button type="button" onClick={start}>Confirm</button>
