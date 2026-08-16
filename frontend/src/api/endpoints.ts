@@ -173,24 +173,40 @@ export const purgeMissing = () =>
 
 // ---- Backfill EXIF (time + geo) from Immich -------------------------
 // One-shot pass that walks every DB row and pulls /api/assets/{id} to
-// fill captured_at / latitude / longitude. Synchronous like purge
-// (~30s for a 17k-row DB). The pipeline ingest also calls Immich for
+// fill captured_at / latitude / longitude. Mirrors the KNN build
+// flow — spawns a thread, returns a job_id, UI polls status + logs.
+// ~30s for a 17k-row DB. The pipeline ingest also calls Immich for
 // each new asset; this is for rows that existed before EXIF capture
 // was added.
 
-export interface BackfillExifResult {
+export interface BackfillExifJobSnapshot {
+  job_id: string;
+  status: 'running' | 'done' | 'error';
+  started_at: string;
+  finished_at: string | null;
   updated_count: number;
-  sample: Array<{
-    asset_id: string;
-    captured_at: string | null;
-    latitude: number | null;
-    longitude: number | null;
-  }>;
+  skipped_count: number;
+  no_exif_count: number;
+  missing_count: number;
+  error: string | null;
 }
 
-export const backfillExif = () =>
-  fetchJson<BackfillExifResult>('/api/assets/backfill-exif', {
+export interface BackfillExifLogsResponse {
+  job_id: string;
+  lines: string[];
+}
+
+export const startBackfillExif = () =>
+  fetchJson<{ job_id: string }>('/api/assets/backfill-exif', {
     method: 'POST',
+  });
+
+export const pollBackfillExifJob = (job_id: string) =>
+  fetchJson<BackfillExifJobSnapshot>(`/api/assets/backfill-exif/job/${job_id}`);
+
+export const getBackfillExifLogs = (job_id: string, tail = 80) =>
+  fetchJson<BackfillExifLogsResponse>('/api/assets/backfill-exif/logs', {
+    query: { job_id, tail },
   });
 
 // ---- Build KNN index (FAISS) ---------------------------------------

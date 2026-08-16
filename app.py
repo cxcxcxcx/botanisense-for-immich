@@ -1995,90 +1995,195 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
 # longitude. Existing rows from before the EXIF pipeline landed have
 # these as NULL — this endpoint lets the user populate them without
 # re-running the full pipeline (which would re-embed and re-cluster).
+#
+# Spawned as a background job (like KNN build) so the UI can show
+# live progress + log tail during the ~30s run. The worker writes
+# per-chunk progress lines to data/backfill-exif-{job_id}.log and the
+# UI polls /api/assets/backfill-exif/job/{id} for status + /logs
+# for the tail.
+
+_backfill_exif_jobs: dict[str, dict] = {}
+
+
+def _backfill_exif_worker(job_id: str) -> None:
+    """Body of the backfill thread. Walks every DB row, fetches the
+    AssetResponseDTO from Immich, extracts EXIF, writes it back. Per-
+    chunk progress + skip counts go to a per-job log file the UI
+    tails."""
+    import logging
+    asyncio.run(_backfill_exif_async(job_id))
+
+
+async def _backfill_exif_async(job_id: str) -> None:
+    import logging
+    job = _backfill_exif_jobs[job_id]
+    log_path = Path(job["log_path"])
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = logging.getLogger("backfill_exif")
+    handler = logging.FileHandler(log_path, mode="w")
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    try:
+        client = _immich_client()
+        try:
+            with storage.connect(DB_PATH) as conn:
+                rows = conn.execute(
+                    "SELECT asset_id FROM assets ORDER BY asset_id"
+                ).fetchall()
+                asset_ids = [r["asset_id"] for r in rows]
+
+            if not asset_ids:
+                logger.info("[backfill-exif] no assets in DB — nothing to do")
+                job["updated_count"] = 0
+                return
+
+            logger.info(f"[backfill-exif] starting  total={len(asset_ids):,}")
+            api_key = client._client.headers["x-api-key"]
+            base_url = client.base_url
+            sem = asyncio.Semaphore(100)
+
+            async def fetch_one(aid: str) -> tuple[str, dict] | None:
+                async with sem:
+                    try:
+                        async with httpx.AsyncClient(
+                            base_url=base_url,
+                            headers={"x-api-key": api_key, "Accept": "application/json"},
+                            timeout=10.0,
+                            limits=httpx.Limits(max_connections=200),
+                        ) as ac:
+                            r = await ac.get(f"/api/assets/{aid}")
+                    except httpx.HTTPError:
+                        return None
+                    return (aid, r.json()) if r.status_code == 200 else None
+
+            results = await asyncio.gather(*(fetch_one(a) for a in asset_ids))
+            parsed = [
+                (aid, ImmichClient.extract_exif(payload))
+                for aid, payload in results
+                if payload is not None
+            ]
+            # Asset Immich returned nothing for (404 or network error) —
+            # surface in the log so the user can see how many were
+            # missing without opening a second tool.
+            missing_count = sum(1 for r in results if r is None)
+            if missing_count:
+                logger.info(f"[backfill-exif] {missing_count:,} assets returned no data (deleted in Immich?)")
+            logger.info(f"[backfill-exif] fetched  got={len(parsed):,}")
+
+            updated = 0
+            skipped = 0
+            no_exif = 0
+            # Log every ~500 assets (or every asset for tiny batches)
+            # so the UI sees steady scroll during the ~30s run.
+            log_every = max(1, min(500, len(parsed) // 10))
+            with storage.connect(DB_PATH) as conn:
+                for i, (aid, exif) in enumerate(parsed, 1):
+                    if not exif["captured_at"]:
+                        no_exif += 1
+                        continue
+                    # Skip rows that already have a captured_at — the
+                    # user can clear them via SQL or re-run the
+                    # pipeline (which has its own refresh semantics).
+                    existing = conn.execute(
+                        "SELECT captured_at FROM assets WHERE asset_id = ?",
+                        (aid,),
+                    ).fetchone()
+                    if existing and existing["captured_at"]:
+                        skipped += 1
+                        continue
+                    storage.update_asset_exif(
+                        conn,
+                        asset_id=aid,
+                        captured_at=exif["captured_at"],
+                        latitude=exif["latitude"],
+                        longitude=exif["longitude"],
+                    )
+                    updated += 1
+                    if i % log_every == 0:
+                        logger.info(
+                            f"[backfill-exif] progress  "
+                            f"{i:,}/{len(parsed):,}  updated={updated:,}  "
+                            f"skipped(already-set)={skipped:,}"
+                        )
+            logger.info(
+                f"[backfill-exif] done  "
+                f"updated={updated:,}  skipped(already-set)={skipped:,}  "
+                f"no-exif={no_exif:,}  missing-from-immich={missing_count:,}"
+            )
+            job["updated_count"] = updated
+            job["skipped_count"] = skipped
+            job["no_exif_count"] = no_exif
+            job["missing_count"] = missing_count
+        finally:
+            client.close()
+    except Exception as e:
+        logger.exception("[backfill-exif] failed")
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+        if job["status"] != "error":
+            job["status"] = "done"
+        _results_cache.clear()  # sort-by-time needs fresh captured_at
+        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
 
 @app.post("/api/assets/backfill-exif")
-async def backfill_exif() -> dict:
-    """GET /api/assets/{id} for every DB row, capture EXIF into the
-    assets table. Synchronous like purge-missing; ~30s for the user's
-    17k-row DB. Returns the count + first few samples so the UI can
-    confirm what landed."""
-    client = _immich_client()
+async def start_backfill_exif() -> dict:
+    """Spawn a backfill thread, return its job_id. The UI polls
+    /api/assets/backfill-exif/job/{job_id} for status and /logs for
+    the live tail."""
+    job_id = uuid.uuid4().hex[:8]
+    log_path = Path(DB_PATH).parent / f"backfill-exif-{job_id}.log"
+    _backfill_exif_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "log_path": str(log_path),
+        "updated_count": 0,
+        "skipped_count": 0,
+        "no_exif_count": 0,
+        "missing_count": 0,
+        "error": None,
+    }
+    threading.Thread(target=_backfill_exif_worker, args=(job_id,), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/assets/backfill-exif/job/{job_id}")
+async def poll_backfill_exif_job(job_id: str) -> dict:
+    job = _backfill_exif_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown backfill job")
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "updated_count": job["updated_count"],
+        "skipped_count": job["skipped_count"],
+        "no_exif_count": job["no_exif_count"],
+        "missing_count": job["missing_count"],
+        "error": job["error"],
+    }
+
+
+@app.get("/api/assets/backfill-exif/logs")
+async def get_backfill_exif_logs(job_id: str, tail: int = 50) -> dict:
+    """Tail the per-job log file. The worker writes progress lines as
+    it processes each chunk of assets."""
+    job = _backfill_exif_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown backfill job")
     try:
-        with storage.connect(DB_PATH) as conn:
-            rows = conn.execute(
-                "SELECT asset_id FROM assets ORDER BY asset_id"
-            ).fetchall()
-            asset_ids = [r["asset_id"] for r in rows]
-
-        if not asset_ids:
-            return {"updated_count": 0, "sample": []}
-
-        # Async GET per asset, 100 concurrent — same shape as the
-        # purge probe but pulls the full AssetResponseDTO (~1.7KB) so
-        # we can extract EXIF.
-        api_key = client._client.headers["x-api-key"]
-        base_url = client.base_url
-        sem = asyncio.Semaphore(100)
-
-        async def fetch_one(aid: str) -> tuple[str, dict] | None:
-            async with sem:
-                try:
-                    async with httpx.AsyncClient(
-                        base_url=base_url,
-                        headers={"x-api-key": api_key, "Accept": "application/json"},
-                        timeout=10.0,
-                        limits=httpx.Limits(max_connections=200),
-                    ) as ac:
-                        r = await ac.get(f"/api/assets/{aid}")
-                except httpx.HTTPError:
-                    return None
-                if r.status_code != 200:
-                    return None
-                return aid, r.json()
-
-        results = await asyncio.gather(*(fetch_one(a) for a in asset_ids))
-        # Filter to (aid, payload) pairs; missing assets are also
-        # candidates for the upcoming purge but we don't touch them
-        # here — backfill-exif only writes when Immich returns data.
-        parsed = [
-            (aid, ImmichClient.extract_exif(payload))
-            for aid, payload in results
-            if payload is not None
-        ]
-
-        updated = 0
-        sample: list[dict] = []
-        with storage.connect(DB_PATH) as conn:
-            for aid, exif in parsed:
-                # Skip rows that already have a captured_at — the
-                # user can re-run the pipeline to refresh stale EXIF,
-                # but the backfill shouldn't blow away existing data.
-                existing = conn.execute(
-                    "SELECT captured_at FROM assets WHERE asset_id = ?",
-                    (aid,),
-                ).fetchone()
-                if existing and existing["captured_at"]:
-                    continue
-                storage.update_asset_exif(
-                    conn,
-                    asset_id=aid,
-                    captured_at=exif["captured_at"],
-                    latitude=exif["latitude"],
-                    longitude=exif["longitude"],
-                )
-                updated += 1
-                if len(sample) < 5 and exif["captured_at"]:
-                    sample.append({
-                        "asset_id": aid,
-                        "captured_at": exif["captured_at"],
-                        "latitude": exif["latitude"],
-                        "longitude": exif["longitude"],
-                    })
-        # Invalidate results cache — sort-by-time needs captured_at.
-        _results_cache.clear()
-        return {"updated_count": updated, "sample": sample}
-    finally:
-        client.close()
+        with open(job["log_path"]) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    return {"job_id": job_id, "lines": [l.rstrip() for l in lines[-tail:]]}
 
 
 @app.post("/api/assets/purge-missing")

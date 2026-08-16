@@ -1,15 +1,17 @@
 import { useEffect, useState } from 'react';
-import { backfillExif, getResults, reclassifyVisible } from '../api/endpoints';
+import { getResults, reclassifyVisible } from '../api/endpoints';
 import type { ResultsResponse } from '../api/types';
 import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
 import { KnnBuildModal } from './KnnBuildModal';
+import { BackfillExifModal } from './BackfillExifModal';
 
 export function LegendBar() {
   const { dispatch } = useApp();
   const push = useToasts();
   const [plantae, setPlantae] = useState<{ green: number; yellow: number }>({ green: 0.60, yellow: 0.35 });
   const [knnOpen, setKnnOpen] = useState(false);
+  const [backfillOpen, setBackfillOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -31,21 +33,6 @@ export function LegendBar() {
       const r = await reclassifyVisible();
       push({ kind: 'info', message: 'KNN reclassify queued for visible assets' }, 2000);
       console.debug('reclassify-visible queued', r);
-    } catch (err) {
-      push({ kind: 'error', message: err instanceof Error ? err.message : String(err) }, 4000);
-    }
-  };
-
-  const handleBackfillExif = async () => {
-    push({ kind: 'info', message: 'Backfilling EXIF from Immich — this takes ~30s for a 17k library' }, 2500);
-    try {
-      const r = await backfillExif();
-      push({
-        kind: r.updated_count > 0 ? 'success' : 'info',
-        message: r.updated_count > 0
-          ? `Backfilled EXIF on ${r.updated_count.toLocaleString()} assets`
-          : 'Nothing to backfill — every asset already has capture time',
-      }, 4000);
     } catch (err) {
       push({ kind: 'error', message: err instanceof Error ? err.message : String(err) }, 4000);
     }
@@ -80,7 +67,7 @@ export function LegendBar() {
         >🧠 Build KNN index</button>
         <button
           className={btnCls}
-          onClick={handleBackfillExif}
+          onClick={() => setBackfillOpen(true)}
           title="Pull EXIF capture time + GPS from Immich for every asset that doesn't have it yet. ~30s for 17k assets."
         >🕒 Backfill EXIF</button>
         <button
@@ -90,6 +77,7 @@ export function LegendBar() {
         >🗑 Purge assets deleted in Immich</button>
       </div>
       <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
+      <BackfillExifModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
     </nav>
   );
 }
