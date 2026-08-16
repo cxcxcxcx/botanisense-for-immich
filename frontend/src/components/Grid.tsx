@@ -108,7 +108,7 @@ export function Grid() {
         <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">No results in this view.</div>
       ) : (
         <>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5 items-start">
+          <div className="grid grid-cols-2 gap-1.5 items-start">
             {sortedRows.map(r => (
               <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
             ))}
