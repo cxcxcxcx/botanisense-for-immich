@@ -19,8 +19,8 @@ const FIELDS: Record<string, FieldHelp> = {
   },
   n_samples: {
     label: 'photos to fetch',
-    help: 'How many candidate photos to pull from Immich for this run. Higher = more to classify, longer runtime. No hard cap — the server processes whatever you give it (default 120).',
-    placeholder: '120',
+    help: 'How many candidate photos to pull from Immich for this run. Higher = more to classify, longer runtime. No hard cap — the server processes whatever you give it (default 10000).',
+    placeholder: '10000',
     min: 1,
   },
   top_k: {

@@ -1,7 +1,7 @@
 """CLI: run the Immich smart-search + BioCLIP pipeline, persisting results.
 
 Reads from .env (via python-dotenv) for IMMICH_BASE_URL, IMMICH_API_KEY,
-N_SAMPLES (default 100), TOP_K (default 5), DB_PATH (default data/state.db).
+N_SAMPLES (default 10000), TOP_K (default 5), DB_PATH (default data/state.db).
 
 Usage:
     uv run run.py                       # run with defaults
@@ -33,7 +33,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--query", default=os.environ.get("QUERY", DEFAULT_QUERY))
     ap.add_argument("--db", default=os.environ.get("DB_PATH", "data/state.db"))
-    ap.add_argument("--n", type=int, default=int(os.environ.get("N_SAMPLES", "120")))
+    ap.add_argument("--n", type=int, default=int(os.environ.get("N_SAMPLES", "10000")))
     ap.add_argument("--k", type=int, default=int(os.environ.get("TOP_K", "5")))
     ap.add_argument(
         "--batch-size",
