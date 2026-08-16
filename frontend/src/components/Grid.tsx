@@ -8,12 +8,15 @@ import { Card } from './Card';
 import { Pagination } from './Pagination';
 
 // Photo-sort radio chips — live here (with the grid they sort) instead
-// of in the Toolbar (which sits on the cluster/taxon list view).
+// of in the Toolbar (which sits on the cluster/taxon list view). Labels
+// use arrows so the direction is unambiguous; the matching `hint` is
+// rendered inline next to the active chip so users see what each sort
+// means without hovering for a tooltip.
 const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
-  { value: 'rank',    label: 'default',        hint: 'order returned by the server' },
-  { value: 'plantae', label: 'plants first',   hint: 'highest Plantae confidence on top' },
-  { value: 'score',   label: 'most confident', hint: 'highest BioCLIP top-1 score on top' },
-  { value: 'time',    label: 'newest first',   hint: 'newest EXIF capture time on top (nulls last)' },
+  { value: 'rank',    label: 'default',    hint: 'order returned by the server (Immich rank)' },
+  { value: 'plantae', label: 'Plantae ↓',  hint: 'highest Plantae kingdom confidence first (green badge)' },
+  { value: 'score',   label: 'top-1 ↓',    hint: 'highest BioCLIP top-1 species score first (green chip)' },
+  { value: 'time',    label: 'newest ↓',   hint: 'newest EXIF capture time first (nulls last)' },
 ];
 
 function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score' | 'time'): ResultRow[] {
@@ -173,6 +176,12 @@ function Breadcrumb({ groupBy, activeFilterLabel, total, onBack, sort, onSortCha
             {i < SORT_OPTIONS.length - 1 && <span className="crumb-sort-sep">/</span>}
           </span>
         ))}
+        {/* Inline explanation of the active sort — sits right after
+            the chips so the user sees what each mode means without
+           hovering for a tooltip. */}
+        <span className="crumb-sort-desc">
+          {SORT_OPTIONS.find(o => o.value === sort)?.hint}
+        </span>
       </span>
     </nav>
   );

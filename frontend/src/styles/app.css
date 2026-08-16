@@ -412,11 +412,19 @@ nav.legend-bar, .legend-bar {
 .crumb-sort-sep { color: #444; }
 .crumb-sort-chip {
   background: transparent; color: #aaa; border: 0; padding: 0;
+  margin: 0; /* override Pico's default <button> margin-bottom */
   cursor: pointer; font: inherit;
 }
 .crumb-sort-chip:hover { color: #fff; }
 .crumb-sort-chip.active {
   color: #5c93c0; font-weight: 500;
+}
+/* Inline description of the active sort — sits after the chip group
+   so users see what "Plantae ↓" / "top-1 ↓" actually mean without
+   hovering for a tooltip. */
+.crumb-sort-desc {
+  color: #888; font-size: 0.75rem; font-style: italic;
+  margin-left: 0.25rem;
 }
 
 .photo-grid {
