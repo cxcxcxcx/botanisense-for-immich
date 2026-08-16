@@ -386,7 +386,7 @@ nav.legend-bar, .legend-bar {
 .cluster-album-controls .muted { color: #888; }
 
 /* ---- Grid + cards ---- */
-.grid-pane { padding: 0.25rem 1rem; }
+.grid-pane { padding: 0 0.5rem; }
 
 /* Breadcrumb above the photo grid: one tight strip with back link,
    active-filter scope, count, and inline sort chips. No big button,
@@ -422,18 +422,18 @@ nav.legend-bar, .legend-bar {
 .photo-grid {
   display: grid;
   /* Fixed 2-column grid for the photo browsing view — each card is
-     wide enough for the photo to breathe and the meta block to be
-     readable. Tight gap (8px) so the photos fill the viewport. */
+     wide enough for the photo to breathe and the overlay to be
+     readable. Tight gap (6px) so the photos fill the viewport. */
   grid-template-columns: 1fr 1fr;
-  gap: 8px; align-items: start;
+  gap: 6px; align-items: start;
 }
 
 .card {
-  /* Subtle border + small radius. The 1px border separates cards
-     from the dark page background; the 4px radius softens without
-     competing with the photo or wasting space. */
+  /* Subtle border + tiny radius. The 1px border separates cards
+     from the dark page background; the 2px radius is just enough
+     to soften the corners without competing with the photo. */
   background: #111;
-  border: 1px solid #2a2a2a; border-radius: 4px;
+  border: 1px solid #2a2a2a; border-radius: 2px;
   overflow: hidden; display: flex; flex-direction: column; cursor: pointer;
   position: relative;
   transition: border-color 0.12s;
@@ -493,52 +493,37 @@ nav.legend-bar, .legend-bar {
 .plantae.yellow { background: #3a3a1a; color: #ff6; }
 .plantae.red    { background: #3a1a1a; color: #f88; }
 
-/* Image overlay: removed — textual info now lives in the .meta-card
-   block below the photo (filename, top-1 species + score, kingdom
-   chips). The in-photo overlay was cramped, low-contrast, and the
-   truncated text was unreadable at grid scale. */
-
-.meta-card {
-  padding: 8px 10px;
-  display: flex; flex-direction: column; gap: 4px;
-  font-size: 13px; line-height: 1.35;
-  background: #14181d; border-top: 1px solid #1f1f1f;
+/* Image overlay: species + score + per-kingdom chips, pinned to the
+   bottom of the photo with a translucent dark gradient so the card
+   stays compact (no separate meta block in grid mode). */
+.img-overlay {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 22px 8px 8px;
+  background: linear-gradient(to bottom, rgba(0,0,0,0) 0%, rgba(0,0,0,0.85) 100%);
+  color: #eee; display: flex; flex-direction: column; gap: 3px;
+  pointer-events: none;
 }
-.meta-card .meta-name {
-  font-weight: 600; color: #eee; font-size: 12px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-.meta-card .meta-top {
+.img-overlay .overlay-top {
   display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
 }
-.meta-card .meta-species {
+.img-overlay .overlay-species {
   font: italic 600 13px/1.2 system-ui, sans-serif;
-  color: #eee;
+  text-shadow: 0 1px 3px rgba(0,0,0,0.8);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  flex: 1; min-width: 0;
 }
-.meta-card .meta-score {
+.img-overlay .overlay-score {
   font: 600 12px/1 ui-monospace, monospace;
   background: #2c8a4a; color: #fff;
   padding: 2px 6px; border-radius: 3px; flex-shrink: 0;
 }
-.meta-card .meta-scores {
+.img-overlay .overlay-scores {
   display: flex; flex-wrap: wrap; gap: 4px;
 }
-.meta-card .meta-score-chip {
+.img-overlay .overlay-score-chip {
   font: 10px ui-monospace, monospace;
-  background: rgba(255,255,255,0.08); color: #ccc;
-  padding: 1px 6px; border-radius: 3px;
+  background: rgba(255,255,255,0.12); color: #ccc;
+  padding: 1px 5px; border-radius: 3px;
 }
-
-/* Legacy meta-card styles kept for compatibility with any future use
-   (e.g. urls block). Not currently rendered by Card.tsx. */
-.meta-card .urls a {
-  color: #7ad; text-decoration: none; display: block;
-  font-family: ui-monospace, monospace; font-size: 11px;
-  margin-top: 2px; word-break: break-all;
-}
-.meta-card .urls a:hover { text-decoration: underline; }
 
 /* ---- Taxonomy hierarchy (card meta + modal hero) ----
    Renders kingdom → family → genus (→ species) as a breadcrumb-like row.

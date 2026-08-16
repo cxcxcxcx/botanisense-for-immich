@@ -48,36 +48,31 @@ export function Card({ row }: Props) {
             Plantae {(plantaeScore * 100).toFixed(1)}%
           </span>
         )}
-      </div>
-      {/* Textual info lives in its own meta block under the photo:
-         filename + top-1 species + score + per-kingdom chips. This
-         makes the card naturally taller than a bare square so the
-         text breathes; the in-photo overlay was cramped and unreadable. */}
-      <div className="meta-card">
-        <div className="meta-name" title={row.original_file_name}>
-          {row.original_file_name}
+        {/* Bottom-of-photo overlay: top-1 prediction + score + per-
+           kingdom chips on a translucent gradient. The filename lives
+           only in the asset-detail modal — it adds noise at grid
+           scale and is rarely what the user is scanning for. */}
+        <div className="img-overlay">
+          {fullTop1 && (
+            <div className="overlay-top">
+              <span className="overlay-species">{fullTop1.species}</span>
+              <span className="overlay-score">{formatPct(fullTop1.score)}</span>
+            </div>
+          )}
+          {row.taxon_scores && (
+            <div className="overlay-scores">
+              {Object.entries(row.taxon_scores)
+                .filter(([k]) => k !== 'Plantae')
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 4)
+                .map(([k, v]) => (
+                  <span key={k} className="overlay-score-chip">
+                    {k} {(v * 100).toFixed(0)}%
+                  </span>
+                ))}
+            </div>
+          )}
         </div>
-        {fullTop1 && (
-          <div className="meta-top">
-            <span className="meta-species" title={fullTop1.species}>
-              {fullTop1.species}
-            </span>
-            <span className="meta-score">{formatPct(fullTop1.score)}</span>
-          </div>
-        )}
-        {row.taxon_scores && (
-          <div className="meta-scores">
-            {Object.entries(row.taxon_scores)
-              .filter(([k]) => k !== 'Plantae')
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 4)
-              .map(([k, v]) => (
-                <span key={k} className="meta-score-chip">
-                  {k} {(v * 100).toFixed(0)}%
-                </span>
-              ))}
-          </div>
-        )}
       </div>
     </article>
   );
