@@ -299,6 +299,10 @@ def connect(path: str | Path):
         conn.execute("PRAGMA busy_timeout=30000")
         conn.row_factory = sqlite3.Row
         yield conn
+        conn.commit()  # auto-commit on clean exit; rolls back on exception
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
