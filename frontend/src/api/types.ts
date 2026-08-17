@@ -52,6 +52,12 @@ export interface ResultRow {
   original_url: string;
   thumbnail_url: string;
   cluster_id: number | null;
+  // first_seen_at is the wall-clock time we first inserted the asset
+  // row (set by `DEFAULT (datetime('now'))` on the initial INSERT and
+  // never overwritten by upsert). Drives the "added ↓" sort chip —
+  // "what did we most recently ingest?" — distinguishing from
+  // captured_at which is when the photo was *taken*.
+  first_seen_at: string | null;
   // EXIF time + geo (from Immich's GET /api/assets/{id}). NULL until
   // the pipeline ingest captures them, or until the user runs the
   // one-shot /api/assets/backfill-exif.
@@ -62,6 +68,9 @@ export interface ResultRow {
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
   detections: Detection[];
+  // Person-detection flag from the pipeline's "person" stage. See
+  // AssetDetail.has_person for the three-state semantics.
+  has_person?: boolean | null;
   near_dups?: NearDup[];
   knn?: KnnRow | null;
 }
@@ -76,6 +85,10 @@ export interface Pagination {
 export interface TaxonomyEntry {
   name: string;
   n: number;
+  // Most recent captured_at across all assets in this taxon — drives the
+  // "latest" sort chip in FilterCards so taxa with recent photos
+  // bubble to the top.
+  latest_captured_at: string | null;
   // Representative asset for this taxon — used as the thumbnail on the
   // filter card. The frontend ignores `sample_thumbnail_url` (Immich's
   // direct URL) and uses thumbUrl(sample_asset_id) so it goes through
@@ -120,6 +133,12 @@ export interface AssetDetail {
   captured_at: string | null;
   latitude: number | null;
   longitude: number | null;
+  // Person-detection flag from the pipeline's "person" stage. Three
+  // states: true (YOLO detected person/face/human), false (scanned,
+  // none found), null (not yet scanned — gate is `has_person IS NULL`
+  // in storage.py). Drives the asset-detail "👤" chip and pairs with
+  // the /api/results has_person=0/1 filter.
+  has_person: boolean | null;
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
   detections: Detection[];
@@ -133,6 +152,10 @@ export interface ClusterSummary {
   name: string;
   top_species: { species: string; common_name: string | null; count: number }[];
   top_genus: { genus: string; count: number }[];
+  // Most recent captured_at across all assets in this cluster — drives
+  // the "latest" sort chip in FilterCards so clusters with recent
+  // photos bubble to the top.
+  latest_captured_at: string | null;
   // Representative asset for this cluster — used as the thumbnail on
   // the filter card.
   sample_asset_id: string | null;
@@ -182,7 +205,7 @@ export interface KnnBuildLogsResponse {
 }
 
 export interface PipelineStatus {
-  status: 'idle' | 'running' | 'done' | 'error';
+  status: 'idle' | 'running' | 'done' | 'error' | 'stopped';
   stage: string | null;
   chunk_idx: number | null;
   chunk_total: number | null;

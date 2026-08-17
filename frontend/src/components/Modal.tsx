@@ -27,7 +27,11 @@ export function Modal({ open, onClose, title, children }: Props) {
       }}
     >
       <article className="m-0">
-        <header className="flex items-center justify-between mb-2 border-b border-[#222] pb-2">
+        {/* Header padding bumped from `mb-2 pb-2` to `mb-4 py-4 px-6`
+            so it visually matches the body's `px-6 py-4`. Subtle but
+            gives the title bar breathing room next to the dense
+            asset-detail content below. */}
+        <header className="flex items-center justify-between mb-4 border-b border-[#222] py-4 px-6">
           <h3 className="m-0 flex-1">{title || 'Asset detail'}</h3>
           <button
             className="text-fg-1 hover:text-fg text-lg leading-none px-2"

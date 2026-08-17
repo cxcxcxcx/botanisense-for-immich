@@ -27,6 +27,7 @@ export function LegendBar() {
   const handlePlants  = () => dispatch({ type: 'OPEN_JOB', kind: 'plants', payload: {} });
   const handleFungi   = () => dispatch({ type: 'OPEN_JOB', kind: 'fungi', payload: {} });
   const handlePurgeMissing = () => dispatch({ type: 'OPEN_JOB', kind: 'purge-missing', payload: {} });
+  const handleDetectPeople = () => dispatch({ type: 'OPEN_JOB', kind: 'person-backfill', payload: {} });
 
   const handleReclassifyVisible = async () => {
     try {
@@ -75,6 +76,11 @@ export function LegendBar() {
           onClick={handlePurgeMissing}
           title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
         >🗑 Purge assets deleted in Immich</button>
+        <button
+          className={btnCls}
+          onClick={handleDetectPeople}
+          title="Run YOLO over every asset where has_person is unknown. No BioCLIP — fast relative to a full pipeline run. ~70 min for ~19k photos."
+        >👤 Detect people in all photos</button>
       </div>
       <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
       <BackfillExifModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />

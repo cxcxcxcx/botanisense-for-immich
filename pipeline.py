@@ -30,6 +30,7 @@ from PIL import Image
 # startup. See run_pipeline() for the deferred-import block.
 
 import storage
+from storage import PERSON_LABELS, PERSON_MIN_CONF, HAND_LABEL, HAND_MIN_CONF, has_real_person
 from immich_client import ImmichAsset, ImmichClient
 
 # PEP 562 module-level __getattr__ — lazy-loads the heavy bits
@@ -121,6 +122,47 @@ _state: dict = {
     "stage_t0": None,
 }
 
+# Cooperative-stop signal. Set by POST /api/run/stop; checked at every
+# batch/chunk boundary in the loops below so the worker unwinds cleanly,
+# commits whatever it has, and exits with status='stopped'.
+_stop_event = threading.Event()
+
+
+class _PipelineStop(Exception):
+    """Raised by `check_stop()` when the user requested a stop. The
+    outer try/except in run_pipeline catches this and runs the same
+    cleanup as success/error paths (commit, set state, log)."""
+
+
+def request_stop() -> bool:
+    """Signal the running pipeline to stop at the next batch boundary.
+    Returns True if a stop was actually requested (i.e. the pipeline
+    was running); False if nothing was running."""
+    with _state_lock:
+        was_running = _state["status"] == "running"
+    if was_running:
+        _stop_event.set()
+    return was_running
+
+
+def clear_stop() -> None:
+    """Reset the stop flag. Called by reset_state() at the start of a
+    new run so a previous stop doesn't leak into the next run."""
+    _stop_event.clear()
+
+
+def is_stopped() -> bool:
+    """Cheap check used at batch boundaries. Returns True if a stop
+    has been requested since the last clear_stop()."""
+    return _stop_event.is_set()
+
+
+def check_stop() -> None:
+    """Same as is_stopped() but raises _PipelineStop so callers can
+    use try/except for control flow rather than checking on every line."""
+    if _stop_event.is_set():
+        raise _PipelineStop("user requested stop")
+
 # File log path — set by app.py on startup so the log lives next to the DB.
 _log_file_path: Path | None = None
 _file_handler: logging.FileHandler | None = None
@@ -143,6 +185,10 @@ def attach_log_file(path: Path) -> None:
 
 
 def reset_state() -> None:
+    # Clear any leftover stop flag from a previous run that was
+    # actually stopped (or killed) — otherwise the new run would
+    # immediately bail at the first check_stop().
+    clear_stop()
     with _state_lock:
         _state.update(
             {
@@ -210,6 +256,21 @@ def error_state(message: str) -> None:
         _state.update(
             status="error", last_error=message, finished_at=time.time()
         )
+
+
+def stopped_state(message: str = "stopped by user") -> None:
+    """Mark the run as stopped — the user clicked Stop. Distinct from
+    `error_state` so the UI can render a neutral "stopped" badge
+    instead of a red error one. We clear the request_stop flag so the
+    next run starts fresh."""
+    with _state_lock:
+        _state.update(
+            status="stopped",
+            last_error=message,
+            finished_at=time.time(),
+            eta_seconds=0.0,
+        )
+    _stop_event.clear()
 
 
 def set_state(**updates) -> None:
@@ -404,6 +465,14 @@ PLANT_BATCH_SIZE = 32            # decision batch size (2× DEFAULT_BATCH_SIZE)
 PLANT_PAGE_SIZE = 500            # Immich page size
 PLANT_MIN_PROB = 0.60            # Plantae or Fungi > this counts as a candidate
 PLANT_BATCH_MAJORITY = 0.30      # 30% of the batch must be candidates to continue
+# Tail batches (the leftover from page_size % batch_size) can be tiny —
+# e.g. 500 % 32 = 20 items. With n=20 a 30% majority is ±6 candidates;
+# with n=4 it's ±1. A single BioCLIP noise spike can flip the boundary
+# decision and terminate the search prematurely. Skip the boundary check
+# on batches smaller than this — accumulate candidates and continue to
+# the next page, where the next (full-size) batch will get a reliable
+# signal. Set to 0 to disable.
+PLANT_MIN_BATCH_FOR_BOUNDARY = 24
 
 
 def _score_batch_for_kingdoms(
@@ -465,9 +534,17 @@ def discover_plantae_assets(
       4. If >= PLANT_BATCH_MAJORITY of the batch have
          max(Plantae, Fungi) > PLANT_MIN_PROB, include those assets and
          continue to the next batch.
-      5. If < PLANT_BATCH_MAJORITY, include EVERY asset from this batch
-         (plants, mushrooms, and everything else) so the user can review
-         the boundary with their kingdom scores visible, then return.
+      5. If < PLANT_BATCH_MAJORITY AND the batch has at least
+         PLANT_MIN_BATCH_FOR_BOUNDARY items, we treat it as a real
+         boundary: include EVERY asset from this batch (plants, mushrooms,
+         and everything else) so the user can review the boundary with
+         their kingdom scores visible, then return.
+      6. If < PLANT_BATCH_MAJORITY but the batch is *smaller* than
+         PLANT_MIN_BATCH_FOR_BOUNDARY (the tail of a page), the majority
+         ratio is too noisy to trust — a single candidate can flip the
+         decision and prematurely terminate the search. Skip the boundary
+         termination: include plants-or-fungi from this batch and keep
+         going. The next full-size batch will produce a reliable signal.
 
     Hard cap at n_samples. Status updates are pushed to the shared state
     so the UI can show progress.
@@ -499,6 +576,10 @@ def discover_plantae_assets(
                 f"[search] no more results from Immich after page {page - 1}"
             )
             break
+        # User-visible stop check between Immich pages. Stopping here
+        # means we've already committed the previous page's batch into
+        # the DB so no work is lost.
+        check_stop()
         n_batches = (len(items) + batch_size - 1) // batch_size
         _log.info(
             f"[search] page {page} from Immich: got {len(items)} photos to score "
@@ -509,6 +590,11 @@ def discover_plantae_assets(
             batch = items[batch_start : batch_start + batch_size]
             batch_idx = batch_start // batch_size + 1
 
+            # Per-batch stop check. The previous batch already committed
+            # all its DB writes (we commit after each batch's writes
+            # above), so stopping here is safe.
+            check_stop()
+
             # Gather cache hits and download preds in one pass.
             # plantae_by_path: {path: {"Plantae": p, "Fungi": f}} — max of
             # the two is used downstream to decide if a photo counts as a
@@ -516,8 +602,19 @@ def discover_plantae_assets(
             plantae_by_path: dict[str, dict[str, float]] = {}
             to_predict_paths: list[str] = []
             to_predict_assets: list[ImmichAsset] = []
+            # Per-batch breakdown for the log so the user can see what
+            # the batch actually did:
+            #   n_cached      — taxon_scores read from DB (no BioCLIP)
+            #   n_predict     — BioCLIP kingdom-rank predict() runs
+            #   n_thumb_dl    — of those, how many needed a fresh thumb
+            #   n_dedup       — already seen in an earlier batch on this run
+            n_cached = 0
+            n_predict = 0
+            n_thumb_dl = 0
+            n_dedup = 0
             for asset in batch:
                 if asset.id in seen_ids:
+                    n_dedup += 1
                     continue
                 # Ensure the asset row exists before we write any
                 # taxon_scores (FK on taxon_scores.asset_id). The full
@@ -547,6 +644,7 @@ def discover_plantae_assets(
                 if storage.taxon_scores_have_asset(
                     conn, asset_id=asset.id, rank="kingdom"
                 ):
+                    n_cached += 1
                     cached = storage.fetch_taxon_scores(
                         conn, asset_ids=[asset.id], rank="kingdom"
                     )
@@ -556,8 +654,10 @@ def discover_plantae_assets(
                         "Fungi": float(d.get("Fungi") or 0.0),
                     }
                 else:
+                    n_predict += 1
                     p = thumb_dir / f"{asset.id}.jpg"
                     if not p.exists():
+                        n_thumb_dl += 1
                         thumb_bytes = client.download_bytes(
                             f"/api/assets/{asset.id}/thumbnail"
                             f"?size={THUMBNAIL_SIZE}"
@@ -565,6 +665,13 @@ def discover_plantae_assets(
                         p.write_bytes(thumb_bytes)
                     to_predict_paths.append(str(p))
                     to_predict_assets.append(asset)
+            # Compact suffix shared by all three log branches below.
+            # `n_added` falls out of the branch-local counter; the
+            # breakdown is computed once up front.
+            breakdown = (
+                f"cached={n_cached} predict={n_predict} "
+                f"(thumbs_dl={n_thumb_dl}) dedup={n_dedup}"
+            )
 
             # Run BioCLIP kingdom-rank on the misses. Persist each row.
             if to_predict_paths:
@@ -614,14 +721,40 @@ def discover_plantae_assets(
                 _log.info(
                     f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
                     f"{n_plant} of {len(scored)} are plants-or-fungi (>= {threshold_pct}%) "
+                    f"[{breakdown}] "
                     f"-> keep going, added {n_added} (run={len(accepted)})"
                 )
+            elif len(scored) < PLANT_MIN_BATCH_FOR_BOUNDARY:
+                # Small batch (the tail of a page or a short page) — the
+                # majority ratio is too noisy to decide a boundary. A
+                # single BioCLIP noise spike can flip the decision and
+                # terminate the search prematurely. Skip the boundary
+                # termination: include plants-or-fungi from this batch and
+                # keep going. The next full-size batch will give a reliable
+                # signal.
+                n_added = 0
+                for asset, s in scored:
+                    if asset.id in seen_ids:
+                        continue
+                    if s > PLANT_MIN_PROB:
+                        accepted.append(asset)
+                        seen_ids.add(asset.id)
+                        n_added += 1
+                _log.info(
+                    f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
+                    f"only {n_plant} of {len(scored)} are plants "
+                    f"(< {threshold_pct}%) but small batch "
+                    f"(< {PLANT_MIN_BATCH_FOR_BOUNDARY}) — too noisy, "
+                    f"[{breakdown}] keep going, added {n_added} "
+                    f"(run={len(accepted)})"
+                )
             else:
-                # Boundary batch: < PLANT_BATCH_MAJORITY candidates. Include
-                # EVERY asset from this batch — plantae, fungi, and anything
-                # else alike — so the user can review the entire batch in
-                # Immich search order, with their Plantae/Fungi scores visible
-                # via the per-asset badge. Then stop searching.
+                # Boundary batch: < PLANT_BATCH_MAJORITY candidates on a
+                # full-size batch. Include EVERY asset from this batch —
+                # plantae, fungi, and anything else alike — so the user
+                # can review the entire batch in Immich search order,
+                # with their Plantae/Fungi scores visible via the per-asset
+                # badge. Then stop searching.
                 n_added = 0
                 for asset, s in scored:
                     if asset.id in seen_ids:
@@ -632,7 +765,8 @@ def discover_plantae_assets(
                 _log.info(
                     f"[search]   page {page}, batch {batch_idx}/{n_batches}: "
                     f"only {n_plant} of {len(scored)} are plants "
-                    f"(< {threshold_pct}%) -> boundary, adding all {n_added} "
+                    f"(< {threshold_pct}%) [{breakdown}] "
+                    f"-> boundary, adding all {n_added} "
                     f"(run={len(accepted)}, stopping search)"
                 )
                 return accepted
@@ -902,6 +1036,10 @@ def run_pipeline(
                 )
                 i = 0
                 while i < len(needs_bioclip):
+                    # Stop check at chunk boundary. Each chunk commits
+                    # its embeddings + predictions before the next, so
+                    # stopping here loses nothing.
+                    check_stop()
                     j = min(i + batch_size, len(needs_bioclip))
                     pil_images: list[Image.Image] = []
                     file_paths: list[str] = []
@@ -1111,6 +1249,7 @@ def run_pipeline(
 
             i = 0
             while i < len(kingdom_assets):
+                check_stop()
                 j = min(i + batch_size, len(kingdom_assets))
                 pil_images: list[Image.Image] = []
                 file_paths: list[str] = []
@@ -1187,6 +1326,7 @@ def run_pipeline(
                 try:
                     i = 0
                     while i < len(needs_yolo):
+                        check_stop()
                         j = min(i + batch_size, len(needs_yolo))
                         todo: list[tuple[int, ImmichAsset, Path]] = []
                         for k in range(i, j):
@@ -1220,8 +1360,20 @@ def run_pipeline(
                             before = len(dets)
                             dets = _merge_overlapping_boxes(dets)
                             n_merged += before - len(dets)
+                            # Strip person/face/human boxes — those are
+                            # the person stage's responsibility (it
+                            # uses append_detections). Letting them
+                            # through here would (a) duplicate every
+                            # person box when an asset flows through
+                            # both stages in the same run and (b) route
+                            # person crops through BioCLIP-reclassify
+                            # (wrong — BioCLIP is plant-focused).
+                            plant_dets = [
+                                d for d in dets
+                                if d["label"] not in PERSON_LABELS
+                            ]
                             new_ids = storage.replace_detections(
-                                conn, asset_id=asset.id, detections=dets
+                                conn, asset_id=asset.id, detections=plant_dets
                             )
                             n_dets += len(new_ids)
                         for im in pil_images:
@@ -1252,6 +1404,124 @@ def run_pipeline(
                 )
             _stage_end("yolo")
 
+            # ---- Person detection: scan all assets (one-time backfill) ----
+            # Unlike the yolo stage above (which only iterates plantae
+            # candidates from `discover_plantae_assets`), this stage
+            # scans EVERY asset in the DB where `has_person IS NULL`.
+            # On the first run after this change that's ~19,300 assets.
+            # Subsequent runs only touch newly-ingested assets. Uses
+            # `append_detections` (NOT `replace_detections`) so existing
+            # plant detections and their `bbox_predictions` FK CASCADE
+            # children stay cached — only person/face/human boxes are
+            # added. Gate: `WHERE has_person IS NULL`.
+            _stage_begin("person")
+            try:
+                n_total = 0
+                # Outer page loop — 500 unscanned assets per page keeps
+                # memory low and progress visible.
+                outer_offset = 0
+                outer_page = 500
+                while True:
+                    check_stop()
+                    todo = storage.get_assets_without_person_scan(
+                        conn, limit=outer_page, offset=outer_offset
+                    )
+                    if not todo:
+                        break
+                    # Inner batch loop — chunked for the YOLO forward
+                    # pass (matches batch_size used elsewhere).
+                    todo_paths: list[tuple[str, Path]] = []
+                    for asset_id, _fn in todo:
+                        p = thumb_dir / f"{asset_id}.jpg"
+                        if not p.exists():
+                            thumb_bytes = client.download_bytes(
+                                f"/api/assets/{asset_id}/thumbnail"
+                                f"?size={THUMBNAIL_SIZE}"
+                            )
+                            p.write_bytes(thumb_bytes)
+                        todo_paths.append((asset_id, p))
+                    # Process in chunks of `batch_size`. YOLO-World's
+                    # first forward pass here rebakes the 17-label
+                    # embedding table under the singleton's _LOCK; the
+                    # previous yolo stage's finally already unloaded so
+                    # we get the fresh 17-class init.
+                    n_chunks = (len(todo_paths) + batch_size - 1) // batch_size
+                    person_t0 = time.monotonic()
+                    for i in range(0, len(todo_paths), batch_size):
+                        check_stop()
+                        chunk = todo_paths[i : i + batch_size]
+                        pil_images = [Image.open(p).convert("RGB") for _, p in chunk]
+                        detections = _yolo.detect(pil_images, conf=yolo_conf)
+                        for (asset_id, _), dets in zip(chunk, detections):
+                            # Class-agnostic IoU merge — same as yolo
+                            # stage. A photo with overlapping person +
+                            # face boxes collapses to one detection.
+                            dets = _merge_overlapping_boxes(dets)
+                            # Keep ONLY person/face/human/hand boxes —
+                            # the yolo stage already persisted the plant
+                            # boxes for any plantae candidate that
+                            # flowed through it. If we appended plant
+                            # boxes here too, plantae candidates would
+                            # end up with duplicate plant rows in the
+                            # detections table. Hand is kept because
+                            # has_real_person() cross-checks it to
+                            # suppress hand-silhouette false positives.
+                            person_dets = [
+                                d for d in dets
+                                if d["label"] in PERSON_LABELS
+                                and d["score"] >= PERSON_MIN_CONF
+                            ]
+                            hand_dets = [
+                                d for d in dets
+                                if d["label"] == HAND_LABEL
+                                and d["score"] >= HAND_MIN_CONF
+                            ]
+                            if person_dets or hand_dets:
+                                # Append (no delete) — preserves any
+                                # existing plant detections and keeps
+                                # their bbox_predictions cache intact
+                                # via FK CASCADE.
+                                storage.append_detections(
+                                    conn, asset_id=asset_id,
+                                    detections=person_dets + hand_dets,
+                                )
+                            # has_real_person applies the hand-suppression
+                            # rule — see storage.has_real_person().
+                            storage.mark_person_scanned(
+                                conn,
+                                asset_id=asset_id,
+                                has_person=has_real_person(dets),
+                            )
+                        for im in pil_images:
+                            try:
+                                im.close()
+                            except Exception:
+                                pass
+                        del pil_images
+                        gc.collect()
+                    n_total += len(todo_paths)
+                    elapsed = time.monotonic() - person_t0
+                    _log.info(
+                        f"[person] page {(outer_offset // outer_page) + 1} "
+                        f"items={len(todo_paths)}  scanned_so_far={n_total}  "
+                        f"elapsed={_fmt_eta(elapsed)}"
+                    )
+                    outer_offset += outer_page
+                    # Periodic commit so a 70-min backfill flushes
+                    # progress to disk and survives a SIGKILL/OOM
+                    # between pages. The pipeline's outer commit at
+                    # line 1688 only fires once per full run.
+                    conn.commit()
+                # Final summary log — only emit when we actually scanned.
+                n_remaining = storage.count_assets_without_person_scan(conn)
+                if n_total or n_remaining == 0:
+                    _log.info(
+                        f"[person] done  scanned {n_total} assets this run, "
+                        f"{n_remaining} still unscanned total"
+                    )
+            finally:
+                _stage_end("person")
+
             # ---- Bbox BioCLIP: re-classify each crop ----
             # Iterates over EVERY detection across the run (not just the
             # ones collected during the YOLO pass), filtering by score
@@ -1266,6 +1536,12 @@ def run_pipeline(
                 )
                 for d in dets:
                     if d["score"] < BBOX_BIOCLIP_MIN:
+                        continue
+                    # Skip person/face/human boxes — BioCLIP is
+                    # plant-focused, so re-classifying a person crop
+                    # would produce a meaningless Plantae score. Plant
+                    # crops go through BioCLIP as before.
+                    if d["label"] in PERSON_LABELS:
                         continue
                     if storage.bbox_predictions_have_detection(
                         conn,
@@ -1301,6 +1577,7 @@ def run_pipeline(
             if all_bbox_targets:
                 i = 0
                 while i < len(all_bbox_targets):
+                    check_stop()
                     j = min(i + batch_size, len(all_bbox_targets))
                     chunk = all_bbox_targets[i:j]
 
@@ -1460,11 +1737,208 @@ def run_pipeline(
         client.close()
 
 
+def run_person_backfill(
+    *,
+    base_url: str,
+    api_key: str,
+    db_path: str | Path,
+    yolo_conf: float = 0.05,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    progress_cb=None,
+    status_path: Path | None = None,
+    stop_event=None,
+) -> dict:
+    """Standalone person-detection backfill — runs ONLY the person
+    stage, no BioCLIP, no search, no species classification, no
+    clustering. Used by the 'Detect people' LegendBar button for the
+    one-time sweep over the ~19k existing assets where `has_person IS
+    NULL`.
+
+    Same chunked pattern as the in-pipeline person stage but lifted
+    out so it can be triggered without re-running the slow BioCLIP
+    pipeline. Uses cursor pagination (`after_first_seen_at` +
+    `after_asset_id`) so re-runs after a crash or stop always resume
+    cleanly — no rows skipped due to offset drift. Runs YOLO with the
+    17-label model, persists person-only boxes via `append_detections`,
+    sets `has_person` accordingly.
+
+    Args:
+      progress_cb: optional callable invoked with `(scanned_count,
+        has_person_count, no_person_count)` after each outer page so
+        the UI can show live progress without re-querying the DB.
+      status_path: optional Path. When set, the worker writes a small
+        JSON snapshot after each outer page so the parent process can
+        poll progress without sharing memory. Used by the
+        multiprocessing-based app worker — JSON file beats
+        multiprocessing.Manager().dict() for our access pattern
+        (parent reads every 400ms, child writes every ~30s).
+      stop_event: optional `multiprocessing.Event`. When set, the
+        worker checks `stop_event.is_set()` between batches in
+        addition to the module-level `_stop_event`. Lets the parent
+        cancel a running child without sending signals.
+
+    Returns a small dict the caller can serialize to the job snapshot.
+    """
+    from immich_client import ImmichClient  # local import (heavy? cheap; here for clarity)
+
+    # yolo is a PEP 562 lazy-loaded attribute on this module — access
+    # it via `sys.modules[__name__]` to trigger the lazy loader. Same
+    # pattern as run_pipeline() at the top.
+    import sys as _sys
+    _self = _sys.modules[__name__]
+    _yolo = _self.yolo
+
+    db_path = Path(db_path)
+    thumb_dir = db_path.parent / "thumbs"
+    thumb_dir.mkdir(parents=True, exist_ok=True)
+
+    client = ImmichClient(base_url=base_url, api_key=api_key)
+    n_total_scanned = 0
+    n_with_person = 0
+    n_without_person = 0
+
+    def _stop_requested() -> bool:
+        """Stop check used by both threaded and multiprocess callers.
+        `stop_event` is the multiprocessing.Event passed by the parent
+        (None for the in-pipeline thread, which uses the module-level
+        `_stop_event` via check_stop()).
+        """
+        if stop_event is not None and stop_event.is_set():
+            return True
+        try:
+            check_stop()
+            return False
+        except _PipelineStop:
+            return True
+
+    def _write_status(stage: str) -> None:
+        """Write a small JSON snapshot so the parent can poll progress
+        without holding a Manager proxy. Atomic via tmp+rename."""
+        if status_path is None:
+            return
+        import json as _json
+        payload = {
+            "stage": stage,
+            "scanned_count": n_total_scanned,
+            "with_person_count": n_with_person,
+            "without_person_count": n_without_person,
+        }
+        tmp = status_path.with_suffix(status_path.suffix + ".tmp")
+        tmp.write_text(_json.dumps(payload))
+        tmp.replace(status_path)
+
+    try:
+        with storage.connect(db_path) as conn:
+            # Cursor pagination: track the last (first_seen_at,
+            # asset_id) we processed; the next query skips past it.
+            # Resilient to interruption — re-runs always resume
+            # without skipping or duplicating.
+            cursor_ts: str | None = None
+            cursor_id: str | None = None
+            outer_page = 500
+            while True:
+                if _stop_requested():
+                    break
+                todo = storage.get_assets_without_person_scan(
+                    conn, limit=outer_page,
+                    after_first_seen_at=cursor_ts,
+                    after_asset_id=cursor_id,
+                )
+                if not todo:
+                    break
+                # Resolve thumbs (download if missing).
+                todo_paths: list[tuple[str, Path, str]] = []
+                for asset_id, _fn, _ts in todo:
+                    p = thumb_dir / f"{asset_id}.jpg"
+                    if not p.exists():
+                        thumb_bytes = client.download_bytes(
+                            f"/api/assets/{asset_id}/thumbnail"
+                            f"?size={THUMBNAIL_SIZE}"
+                        )
+                        p.write_bytes(thumb_bytes)
+                    todo_paths.append((asset_id, p, _ts))
+                # Chunked YOLO forward pass.
+                for i in range(0, len(todo_paths), batch_size):
+                    if _stop_requested():
+                        break
+                    chunk = todo_paths[i : i + batch_size]
+                    pil_images = [Image.open(p).convert("RGB") for _, p, _ in chunk]
+                    detections = _yolo.detect(pil_images, conf=yolo_conf)
+                    for (asset_id, _, _ts), dets in zip(chunk, detections):
+                        dets = _merge_overlapping_boxes(dets)
+                        person_dets = [
+                            d for d in dets
+                            if d["label"] in PERSON_LABELS
+                            and d["score"] >= PERSON_MIN_CONF
+                        ]
+                        hand_dets = [
+                            d for d in dets
+                            if d["label"] == HAND_LABEL
+                            and d["score"] >= HAND_MIN_CONF
+                        ]
+                        if person_dets or hand_dets:
+                            storage.append_detections(
+                                conn, asset_id=asset_id,
+                                detections=person_dets + hand_dets,
+                            )
+                        # has_real_person applies the hand-suppression
+                        # rule — see storage.has_real_person().
+                        has_p = has_real_person(dets)
+                        storage.mark_person_scanned(
+                            conn, asset_id=asset_id, has_person=has_p
+                        )
+                        n_total_scanned += 1
+                        if has_p:
+                            n_with_person += 1
+                        else:
+                            n_without_person += 1
+                    for im in pil_images:
+                        try:
+                            im.close()
+                        except Exception:
+                            pass
+                    del pil_images
+                    gc.collect()
+                if progress_cb is not None:
+                    progress_cb(
+                        n_total_scanned, n_with_person, n_without_person
+                    )
+                # Periodic commit so a 70-min backfill flushes
+                # progress to disk and survives an OOM kill / SIGKILL
+                # between outer pages. Also makes has_person visible
+                # to other SQLite connections (the API + UI) without
+                # waiting for the full run to finish.
+                conn.commit()
+                # Advance cursor to the last row of this page.
+                cursor_ts = todo_paths[-1][2]
+                cursor_id = todo_paths[-1][0]
+                _write_status("running")
+    finally:
+        try:
+            _yolo.unload_model()
+        except Exception:
+            pass
+        _write_status("finished")
+    return {
+        "scanned_count": n_total_scanned,
+        "with_person_count": n_with_person,
+        "without_person_count": n_without_person,
+    }
+
+
 def _run_pipeline_safe(**kwargs) -> RunResult | None:
     """Wrapper that converts pipeline exceptions into error_state() so the
     UI can surface them instead of just hanging the request."""
     try:
         return run_pipeline(**kwargs)
+    except _PipelineStop:
+        # User clicked Stop. The check_stop() raise was already at a
+        # batch boundary, so the previous chunk's writes are committed.
+        # We just need to mark the state, log it, and return so the
+        # wrapping request releases the pipeline lock.
+        _log.warning("pipeline stopped by user")
+        stopped_state("stopped by user")
+        return None
     except Exception as e:  # noqa: BLE001 — surface anything to the UI
         _log.exception("pipeline failed")
         error_state(f"{type(e).__name__}: {e}")

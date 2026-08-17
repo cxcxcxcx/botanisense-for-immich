@@ -3,16 +3,21 @@ import {
   pollPlantsAlbumJob,
   pollKingdomAlbumJob,
   pollClusterAlbumJob,
+  pollPersonBackfillJob,
   previewPlantsAlbum,
   previewKingdomAlbum,
   previewClusterAlbum,
+  previewPersonBackfill,
   previewPurgeMissing,
   purgeMissing,
+  startPersonBackfill,
   startPlantsAlbum,
   startKingdomAlbum,
   startClusterAlbumSync,
   startSyncAllClusterAlbums,
+  stopPersonBackfill,
 } from '../api/endpoints';
+import type { PersonBackfillJobSnapshot } from '../api/endpoints';
 import type { JobSnapshot, PurgeMissingPreview, PurgeMissingResult } from '../api/types';
 import { ApiError } from '../api/client';
 import { useApp, useJob, type JobKind } from '../state/AppContext';
@@ -30,8 +35,10 @@ interface JobConfig {
   // dispatch JOB_DONE directly without entering the polling loop.
   isSync?: boolean;
   preview: () => Promise<{ n_assets: number; sample?: PurgeMissingPreview['sample'] }>;
-  // Sync jobs return their own result shape; async jobs return {job_id}.
-  start: () => Promise<{ job_id: string } | PurgeMissingResult>;
+  // Sync jobs return their own result shape; async jobs return
+  // {job_id: string} (or {job_id: null} for noop short-circuits, which
+  // the start() handler in JobPanel recognizes).
+  start: () => Promise<{ job_id: string | null } | PurgeMissingResult>;
   poll: (jobId: string) => Promise<JobSnapshot>;
   extractProgress: (snap: JobSnapshot) => { added: number; total: number };
 }
@@ -121,6 +128,43 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       start: () => purgeMissing(),
       poll: () => Promise.reject(new Error('not used for sync jobs')),
       extractProgress: () => ({ added: 0, total: 0 }),
+    },
+    // Standalone person-detection backfill — runs ONLY the YOLO
+    // person stage (no BioCLIP). Fills `assets.has_person` for every
+    // asset where it's currently NULL so the "has person" filter
+    // works on the existing library.
+    'person-backfill': {
+      title: () => 'Detect people in existing photos',
+      confirmText: n => `Run YOLO over ${n.toLocaleString()} photos to detect people (~70 min for ~19k photos). No BioCLIP is involved — just the 17-label person+plant model. Skip if your library is small or you've never enabled the person filter.`,
+      runningText: (added, total) => `Scanning ${added.toLocaleString()} / ${total.toLocaleString()} photos…`,
+      doneSubject: () => 'photos scanned for person',
+      hasPreview: true,
+      hasAlbumLink: false,
+      preview: () => previewPersonBackfill(),
+      start: () => startPersonBackfill().then(r => {
+        // Backend returns {noop: true, n_to_scan: 0, job_id: null}
+        // when nothing needs scanning — fall through to JOB_DONE
+        // immediately so the panel shows "nothing to do" instead of
+        // hanging on "running".
+        if (r.noop || !r.job_id) {
+          return { job_id: null };
+        }
+        return { job_id: r.job_id };
+      }),
+      // poll returns PersonBackfillJobSnapshot which is structurally
+      // compatible with JobSnapshot's [k: string]: unknown. Cast at
+      // the call site to keep the JobConfig generic.
+      poll: id => pollPersonBackfillJob(id) as unknown as Promise<JobSnapshot>,
+      extractProgress: snap => {
+        // Cast through unknown — PersonBackfillJobSnapshot is the
+        // concrete shape returned by the poll endpoint; JobSnapshot
+        // is the generic union.
+        const s = snap as unknown as PersonBackfillJobSnapshot;
+        return {
+          added: s.scanned_count ?? 0,
+          total: s.n_to_scan ?? 0,
+        };
+      },
     },
   };
 }
@@ -241,7 +285,22 @@ export function JobPanel() {
         }, 4000);
         return;
       }
-      dispatch({ type: 'JOB_STARTED', jobId: (r as { job_id: string }).job_id, total: active.progress.total });
+      // Noop short-circuit for jobs whose start() endpoint can
+      // immediately resolve to "nothing to do" (e.g. person-backfill
+      // when all assets already scanned).
+      const jobId = (r as { job_id: string | null }).job_id;
+      if (!jobId) {
+        dispatch({
+          type: 'JOB_DONE',
+          added: active.progress.total,
+          album_id: null,
+          album_url: null,
+          reused: false,
+        });
+        push({ kind: 'info', message: 'Nothing to scan — already complete' }, 3000);
+        return;
+      }
+      dispatch({ type: 'JOB_STARTED', jobId, total: active.progress.total });
     } catch (e) {
       const msg = e instanceof ApiError ? e.detail : (e instanceof Error ? e.message : String(e));
       dispatch({ type: 'JOB_ERROR', errorMsg: msg });
@@ -301,7 +360,7 @@ export function JobPanel() {
           <div>
             <p>{cfg.runningText(active.progress.added, active.progress.total)}</p>
             <progress value={active.progress.added} max={Math.max(1, active.progress.total)} className="w-full h-1.5" />
-            <p>
+            <p className="flex gap-2">
               <button
                 type="button"
                 className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]"
@@ -310,6 +369,26 @@ export function JobPanel() {
               >
                 Hide
               </button>
+              {/* Person-backfill has its own Stop endpoint (the main
+                  pipeline uses the existing /api/run/stop). Show the
+                  button only for the kinds that support stopping. */}
+              {active.kind === 'person-backfill' && (
+                <button
+                  type="button"
+                  className="px-2.5 py-1 rounded border border-[#a44] bg-transparent text-red-300 text-sm hover:bg-[#422]"
+                  onClick={async () => {
+                    try {
+                      await stopPersonBackfill(active.jobId!);
+                      push({ kind: 'info', message: 'Stop requested — will unwind at the next batch boundary' }, 3000);
+                    } catch (e) {
+                      push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
+                    }
+                  }}
+                  title="Stop the backfill at the next batch boundary"
+                >
+                  Stop
+                </button>
+              )}
             </p>
           </div>
         )}

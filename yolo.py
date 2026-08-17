@@ -27,6 +27,16 @@ _os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
 _os.environ.setdefault("ULTRALYTICS_SAFE_LOAD", "0")
 
 # Phrases tuned for the Immich dataset (a personal photo library of plants).
+# The last three ("person", "face", "human") feed the person-detection
+# pipeline stage — YOLO-World treats them as additional open-vocab
+# phrases alongside the plants. Semantically overlapping on purpose so
+# YOLO can pick whichever phrase matches best for a given photo.
+# storage.PERSON_LABELS mirrors these for the persistence filter.
+# "hand" is added so YOLO can label hands explicitly when only a hand
+# is visible (reaching into frame, etc.) — but it is NOT in
+# PERSON_LABELS, so it doesn't trigger has_person=1. That way
+# photos with just a hand get has_person=0 instead of a false
+# positive on "person".
 PLANT_LABELS: list[str] = [
     "plant",
     "leaf",
@@ -42,6 +52,10 @@ PLANT_LABELS: list[str] = [
     "bloom",
     "petal",
     "seedling",
+    "person",
+    "face",
+    "human",
+    "hand",
 ]
 
 _LOCK = threading.Lock()

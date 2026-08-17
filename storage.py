@@ -265,6 +265,10 @@ def init_db(path: str | Path) -> None:
             ("ALTER TABLE assets ADD COLUMN captured_at TEXT", "captured_at"),
             ("ALTER TABLE assets ADD COLUMN latitude REAL", "latitude"),
             ("ALTER TABLE assets ADD COLUMN longitude REAL", "longitude"),
+            # Person-detection flag: 0 = scanned, no person; 1 = scanned,
+            # person found; NULL = not yet scanned (gate for the
+            # pipeline's person stage). See pipeline.py:_stage_person.
+            ("ALTER TABLE assets ADD COLUMN has_person INTEGER", "has_person"),
         ]:
             try:
                 conn.execute(stmt)
@@ -273,6 +277,13 @@ def init_db(path: str | Path) -> None:
                 # migration already ran on a previous init.
                 if "duplicate column" not in str(e):
                     raise
+        # Partial index — only scanned rows are interesting for the
+        # filter, NULL rows are the pipeline's "todo" set. Partial index
+        # keeps it small even when most assets are NULL.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_has_person "
+            "ON assets(has_person) WHERE has_person IS NOT NULL"
+        )
         conn.commit()
 
 
@@ -467,8 +478,10 @@ def set_cluster_ids(
 
 
 def cluster_summary(conn: sqlite3.Connection) -> list[dict]:
-    # One SQL aggregate per cluster: count + representative sample. The
-    # representative is the asset in the cluster whose top-1 BioCLIP
+    # One SQL aggregate per cluster: count + representative sample + the
+    # most recent capture time in the cluster (lets the FilterCards UI
+    # sort by "latest" so clusters with recent photos bubble to the top).
+    # The representative is the asset in the cluster whose top-1 BioCLIP
     # prediction has the highest score (tie-break by filename for
     # deterministic ordering across reloads). The frontend renders this
     # as a thumbnail on the cluster filter card.
@@ -477,6 +490,7 @@ def cluster_summary(conn: sqlite3.Connection) -> list[dict]:
         SELECT
           a.cluster_id,
           COUNT(*) AS n,
+          MAX(a.captured_at) AS latest_captured_at,
           (
             SELECT p.asset_id
             FROM predictions p
@@ -1226,6 +1240,300 @@ def detections_have_asset(conn: sqlite3.Connection, asset_id: str) -> bool:
         "SELECT 1 FROM detections WHERE asset_id = ?", (asset_id,)
     ).fetchone()
     return row is not None
+
+
+# YOLO labels that count as "this image has a person in it". Kept in
+# sync with the trailing entries of yolo.PLANT_LABELS — used by the
+# pipeline's person stage to derive `assets.has_person` and by the
+# frontend filter chip "has person". "hand" is deliberately NOT in this
+# set — a hand reaching into frame shouldn't flip has_person=1.
+PERSON_LABELS: frozenset[str] = frozenset({"person", "face", "human"})
+
+# Hand label. Used by the suppression rule below — if a photo contains
+# a hand detection, the person flag is suppressed UNLESS the photo also
+# contains a person detection with substantially more body evidence
+# (multiple person boxes, or face + person).
+HAND_LABEL: str = "hand"
+
+# Minimum YOLO confidence for a hand detection to suppress has_person.
+# Set to YOLO's own conf floor (0.05) — any emission at all is enough
+# evidence to consider the photo a hand-only photo. YOLO rarely emits
+# `hand` on non-hand content, so this is safe; but the suppression is
+# only applied when there's no face or 2+ person boxes (the existence
+# of strong body evidence wins).
+HAND_MIN_CONF: float = 0.05
+
+# Minimum hand-box area (w*h, in proportion of image 0..1) for the
+# hand-suppression rule to fire. Real-person photos have small hand
+# boxes (~0.2% of image area) — only the wrist/hand pokes out of the
+# body silhouette. Hand-only photos have large hand boxes (~4-12% of
+# image area) — the whole arm/forearm is the silhouette. Threshold
+# sits at 0.02 (2%) so the gap between 0.2% (incidental) and 4.4%
+# (hand silhouette) is well-separated.
+HAND_MIN_AREA: float = 0.02
+
+# Minimum containment (fraction of hand-box area inside person-box
+# area) for the hand to count as a suppression signal. 0.85 = "the
+# hand box is essentially a sub-region of the person box" — the
+# signature of the hand-silhouette false positive (YOLO labeled the
+# same arm as both). Below 0.85 = "incidental hand near a person"
+# (e.g. someone pointing or holding something — the hand sticks out
+# of the body silhouette and is NOT contained in it).
+HAND_CONTAINMENT: float = 0.85
+
+# Minimum YOLO confidence for a person/face/human detection to flip
+# `has_person=1`. YOLO's own conf floor is 0.05 (fine for plant crops
+# because BioCLIP re-scores each box), but for the binary person flag
+# there is no second-stage filter — sub-50% boxes are overwhelmingly
+# noise (tiny edge slivers, textured foliage, etc.) and produce false
+# positives like a 6.77%-conf "person" pinned to the top of a flower
+# photo, or a 38% "person" label on a shrub corner. Matches
+# BboxOverlay's display cutoff so every has_person=1 asset has at
+# least one visible box in the asset detail modal. A person who's
+# actually in frame almost always scores ≥0.5; the false-positive
+# rate at this floor is near zero in practice.
+PERSON_MIN_CONF: float = 0.50
+
+
+def _box_iou(a: dict, b: dict) -> float:
+    """Intersection-over-Union of two bbox dicts (x, y, w, h in 0..1).
+    Used to detect when a `hand` box overlaps a `person` box — that's
+    the signature of the hand-silhouette false positive (YOLO labeled
+    the same region as both).
+    """
+    ax1, ay1, ax2, ay2 = a["x"], a["y"], a["x"] + a["w"], a["y"] + a["h"]
+    bx1, by1, bx2, by2 = b["x"], b["y"], b["x"] + b["w"], b["y"] + b["h"]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    union = a["w"] * a["h"] + b["w"] * b["h"] - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _box_containment(small: dict, big: dict) -> float:
+    """Fraction of `small`'s area that lies inside `big`. Returns 0 if
+    they don't intersect. Used to detect hand-silhouette false
+    positives where the hand box is essentially a sub-region of the
+    person box (YOLO labeled the same arm as both). Real-person hand
+    boxes typically stick out of the body, so containment is low.
+    """
+    ax1, ay1 = small["x"], small["y"]
+    ax2, ay2 = ax1 + small["w"], ay1 + small["h"]
+    bx1, by1 = big["x"], big["y"]
+    bx2, by2 = bx1 + big["w"], by1 + big["h"]
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    small_area = small["w"] * small["h"]
+    return inter / small_area if small_area > 0 else 0.0
+
+
+def has_real_person(detections: list[dict]) -> bool:
+    """Decide if YOLO's detections on a single photo constitute "has
+    person" given the per-photo rules:
+
+    1. Must have at least one person/face/human box ≥ PERSON_MIN_CONF
+       (the existence-of-person test).
+    2. Suppression: a `hand` box that is MOSTLY CONTAINED in a
+       `person` box (containment ≥ HAND_CONTAINMENT) is the signature
+       of a hand-silhouette false positive — YOLO labeled the same
+       arm region as both, producing a tight hand-shaped box that
+       fits entirely inside the looser person silhouette. In that
+       case, the photo is hand-only and does NOT count as has_person
+       UNLESS there's a separate face box ≥ PERSON_MIN_CONF OR a
+       person box that DOESN'T have a hand contained in it.
+
+    Why containment-based:
+      - Real person photos may have small incidental hand boxes
+        (someone pointing, holding a tool) where the hand sticks out
+        of the body. Containment of hand in person is < 0.5 → no
+        suppression.
+      - Hand-only photos have YOLO emit a tight hand box that's a
+        sub-region of the looser person silhouette for the same arm.
+        Containment is ~1.0 → suppression.
+      - IoU alone misses the rose-hand case where the person bbox is
+        4× the hand bbox (IoU ~0.14 but containment ~1.0).
+      - Tuned on the 18-label YOLO-World model (yolov8s-world.pt).
+    """
+    person_boxes = [
+        d for d in detections
+        if d["label"] in PERSON_LABELS
+        and d["score"] >= PERSON_MIN_CONF
+    ]
+    if not person_boxes:
+        return False
+    hand_boxes = [
+        d for d in detections
+        if d["label"] == HAND_LABEL
+        and d["score"] >= HAND_MIN_CONF
+    ]
+    if not hand_boxes:
+        return True
+    # Hand detected. The hand is a suppression signal only if it's
+    # mostly contained in some person box — otherwise it's incidental
+    # (a hand holding a price tag, pointing at a leaf, etc.).
+    contained_pairs = [
+        (h, p) for h in hand_boxes for p in person_boxes
+        if _box_containment(h, p) >= HAND_CONTAINMENT
+    ]
+    if not contained_pairs:
+        return True
+    # Some hand is mostly contained in a person box. Look for body
+    # evidence that argues the person is real and distinct from the
+    # hand silhouette.
+    has_face = any(
+        d["label"] == "face" and d["score"] >= PERSON_MIN_CONF
+        for d in detections
+    )
+    if has_face:
+        return True
+    # A person box that DOESN'T fully contain any hand box is a real
+    # person distinct from the hand silhouette.
+    has_separate_person = any(
+        all(_box_containment(h, p) < HAND_CONTAINMENT for h in hand_boxes)
+        for p in person_boxes
+    )
+    if has_separate_person:
+        return True
+    # No face, no separate person box → hand-only silhouette case.
+    return False
+
+
+def append_detections(
+    conn: sqlite3.Connection, *, asset_id: str, detections: Iterable[dict]
+) -> list[int]:
+    """Insert detections WITHOUT deleting existing rows for the asset.
+
+    Distinct from `replace_detections` (which wipes + reinserts all
+    detections). Use this when you want to ADD new detections to an
+    asset that may already have rows — for example, the person stage
+    adds person/face/human boxes on top of existing plant boxes
+    without re-running the (potentially expensive) plant YOLO pass.
+    Crucially, leaving the existing rows alone keeps their FK
+    CASCADE children (`bbox_predictions`) intact — re-running plant
+    YOLO would wipe the bbox cache and force the bbox-bioclip stage
+    to re-process every crop.
+
+    Detection dict shape: `{label, score, x, y, w, h}` where x/y/w/h
+    are normalized 0..1.
+
+    Returns the new detection row IDs in insertion order so the caller
+    can chain per-detection follow-ups. Empty list when no detections
+    are provided.
+    """
+    rows = [
+        (
+            asset_id,
+            d["label"],
+            float(d["score"]),
+            float(d["x"]),
+            float(d["y"]),
+            float(d["w"]),
+            float(d["h"]),
+        )
+        for d in detections
+    ]
+    if not rows:
+        return []
+    conn.executemany(
+        """
+        INSERT INTO detections (asset_id, label, score, x, y, w, h)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    # Pair rowids (insertion order) with their assigned ids.
+    sel = conn.execute(
+        """
+        SELECT id FROM detections
+        WHERE asset_id = ? AND rowid >= last_insert_rowid() - ?
+        ORDER BY rowid ASC
+        """,
+        (asset_id, len(rows) - 1),
+    ).fetchall()
+    return [int(r["id"]) for r in sel]
+
+
+def get_assets_without_person_scan(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 1000,
+    after_first_seen_at: str | None = None,
+    after_asset_id: str | None = None,
+) -> list[tuple[str, str | None, str]]:
+    """Return `(asset_id, original_file_name, first_seen_at)` for assets
+    that haven't been scanned for person yet.
+
+    Uses **cursor pagination**, not LIMIT/OFFSET — the previous
+    offset-based version had a subtle bug: the same process was
+    marking rows NULL→0/1 while the outer loop incremented the offset,
+    so the offset would skip entries that had moved up in the
+    shrinking NULL set. With ~19k assets and 500-row pages, this
+    caused the loop to terminate early at ~9000 scans even though
+    ~8800 unscanned rows remained. Cursor pagination uses a compound
+    (first_seen_at, asset_id) key — pass back the last row's values
+    on each call and the next call picks up right where we left off,
+    regardless of how many rows the current call marked.
+
+    Returns rows in `ORDER BY first_seen_at ASC, asset_id ASC` so
+    re-running after an interruption always resumes deterministically
+    — the same asset never gets scanned twice even if the cursor
+    pointed at it before the previous run died.
+    """
+    if after_first_seen_at is None:
+        rows = conn.execute(
+            """
+            SELECT asset_id, original_file_name, first_seen_at
+            FROM assets
+            WHERE has_person IS NULL
+            ORDER BY first_seen_at ASC, asset_id ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    else:
+        # Compound key: skip past (after_ts, after_id). Both columns
+        # are part of ORDER BY so this is a clean continuation even when
+        # multiple rows share the same first_seen_at.
+        rows = conn.execute(
+            """
+            SELECT asset_id, original_file_name, first_seen_at
+            FROM assets
+            WHERE has_person IS NULL
+              AND (first_seen_at > ?
+                   OR (first_seen_at = ? AND asset_id > ?))
+            ORDER BY first_seen_at ASC, asset_id ASC
+            LIMIT ?
+            """,
+            (after_first_seen_at, after_first_seen_at, after_asset_id, limit),
+        ).fetchall()
+    return [
+        (r["asset_id"], r["original_file_name"], r["first_seen_at"])
+        for r in rows
+    ]
+
+
+def count_assets_without_person_scan(conn: sqlite3.Connection) -> int:
+    """How many assets still need to be scanned. Used by the pipeline
+    log line at stage entry."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM assets WHERE has_person IS NULL"
+    ).fetchone()[0]
+
+
+def mark_person_scanned(
+    conn: sqlite3.Connection, *, asset_id: str, has_person: bool
+) -> None:
+    """Atomic flag-set after YOLO has scanned this asset for person.
+    Setting `has_person` to 0 or 1 removes the row from the pipeline's
+    "needs scan" set (the `IS NULL` gate), so a successful mark is
+    idempotent against re-runs."""
+    conn.execute(
+        "UPDATE assets SET has_person = ? WHERE asset_id = ?",
+        (1 if has_person else 0, asset_id),
+    )
 
 
 def fetch_detections(
@@ -2004,6 +2312,7 @@ def get_all_results(
     species: str | None = None,
     genus: str | None = None,
     family: str | None = None,
+    has_person: int | None = None,
 ) -> tuple[list[dict], int]:
     """Return (page_of_buckets, total) for every asset with predictions.
 
@@ -2020,6 +2329,10 @@ def get_all_results(
     - species/genus/family: predictions.position=0 (rank='species') has
       matching label. These are applied via JOIN so the filter is on the
       same prediction row used by the taxonomy pills.
+    - has_person: 0 (no person) or 1 (has person). Plain WHERE clause on
+      the indexed `assets.has_person` column. NULL rows (not yet
+      scanned) are excluded by both 0 and 1 — correct UX: don't claim
+      "no person" until you've actually checked.
     """
     # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
     # need an INNER JOIN on predictions (position=0); the cluster_id
@@ -2042,6 +2355,10 @@ def get_all_results(
         joins += " JOIN predictions p_family ON p_family.asset_id = a.asset_id AND p_family.rank = 'species' AND p_family.position = 0"
         where.append("p_family.family = ?")
         params.append(family)
+    if has_person is not None:
+        # 0 or 1 — excludes unscanned (NULL) rows in both cases.
+        where.append("a.has_person = ?")
+        params.append(has_person)
 
     where_sql = " AND ".join(where)
 
@@ -2057,7 +2374,9 @@ def get_all_results(
         f"""
         SELECT a.asset_id, a.original_file_name, a.original_url,
                a.thumbnail_url, a.cluster_id,
+               a.first_seen_at,
                a.captured_at, a.latitude, a.longitude,
+               a.has_person,
                (SELECT sr.rank_position
                   FROM search_results sr
                   WHERE sr.asset_id = a.asset_id
@@ -2183,9 +2502,19 @@ def get_all_results(
             "original_url": r["original_url"],
             "thumbnail_url": r["thumbnail_url"],
             "cluster_id": r["cluster_id"],
+            # first_seen_at is the wall-clock time we first inserted the
+            # asset row (set by `DEFAULT (datetime('now'))` and never
+            # overwritten by upsert). Drives the "added ↓" sort on the
+            # grid so users can see what was recently ingested.
+            "first_seen_at": r["first_seen_at"],
             "captured_at": r["captured_at"],
             "latitude": r["latitude"],
             "longitude": r["longitude"],
+            # has_person: 0/1/NULL — drives the "has person" filter
+            # chip. NULL means the person stage hasn't scanned this
+            # asset yet, so it appears in no filter and is hidden by
+            # both has_person=0 and has_person=1.
+            "has_person": r["has_person"],
             "top_predictions": preds_by_asset.get(aid, []),
             "taxon_scores": taxon_by_asset.get(aid, {}),
             "near_dups": near_dups,
@@ -2206,27 +2535,34 @@ def get_global_taxonomy_summary(
     filter cards in the global view so counts match the photos in the
     grid. Also picks a representative asset per (rank, name) using the
     same heuristic as cluster_summary (highest top-1 score, filename
-    tie-break) so the cards have a thumbnail.
+    tie-break) so the cards have a thumbnail. Also tracks the most
+    recent captured_at per (rank, name) so the FilterCards UI can sort
+    by "latest" — taxa with recent photos bubble to the top.
     """
     rows = conn.execute(
         """
-        SELECT p.species, p.genus, p.family, COUNT(*) AS n
+        SELECT p.species, p.genus, p.family, COUNT(*) AS n,
+               MAX(a.captured_at) AS latest_captured_at
         FROM predictions p
+        JOIN assets a ON a.asset_id = p.asset_id
         WHERE p.position = 0
         GROUP BY p.species, p.genus, p.family
         """,
     ).fetchall()
 
-    species: dict[str, int] = {}
-    genus: dict[str, int] = {}
-    family: dict[str, int] = {}
+    species: dict[str, dict] = {}
+    genus: dict[str, dict] = {}
+    family: dict[str, dict] = {}
     for r in rows:
         if r["species"]:
-            species[r["species"]] = species.get(r["species"], 0) + r["n"]
+            species[r["species"]] = {"n": (species.get(r["species"]) or {"n": 0})["n"] + r["n"],
+                                     "latest": _max_iso(species.get(r["species"], {}).get("latest"), r["latest_captured_at"])}
         if r["genus"]:
-            genus[r["genus"]] = genus.get(r["genus"], 0) + r["n"]
+            genus[r["genus"]] = {"n": (genus.get(r["genus"]) or {"n": 0})["n"] + r["n"],
+                                 "latest": _max_iso(genus.get(r["genus"], {}).get("latest"), r["latest_captured_at"])}
         if r["family"]:
-            family[r["family"]] = family.get(r["family"], 0) + r["n"]
+            family[r["family"]] = {"n": (family.get(r["family"]) or {"n": 0})["n"] + r["n"],
+                                   "latest": _max_iso(family.get(r["family"], {}).get("latest"), r["latest_captured_at"])}
 
     # Per (rank, name): the asset with the best (score DESC, filename ASC)
     # top-1 prediction — used as the card thumbnail.
@@ -2255,20 +2591,34 @@ def get_global_taxonomy_summary(
             if prev is None or entry > prev:
                 best[rank][name] = entry
 
-    def sorted_dict(d: dict[str, int], rank: str) -> list[dict]:
+    def to_list(d: dict[str, dict], rank: str) -> list[dict]:
         return [
             {
                 "name": k,
-                "n": v,
+                "n": v["n"],
+                "latest_captured_at": v["latest"],
                 "sample_asset_id": (best[rank].get(k) or (None, None, None, None))[2],
                 "sample_thumbnail_url": (best[rank].get(k) or (None, None, None, None))[3],
                 "sample_original_file_name": (best[rank].get(k) or (None, None, None, None))[1],
             }
-            for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0]))
+            for k, v in sorted(d.items(), key=lambda kv: (-kv[1]["n"], kv[0]))
         ]
 
     return {
-        "species": sorted_dict(species, "species"),
-        "genus": sorted_dict(genus, "genus"),
-        "family": sorted_dict(family, "family"),
+        "species": to_list(species, "species"),
+        "genus": to_list(genus, "genus"),
+        "family": to_list(family, "family"),
     }
+
+
+def _max_iso(a: str | None, b: str | None) -> str | None:
+    """Return the lexicographically larger of two ISO 8601 strings
+    (chronologically larger for UTC timestamps), or the non-None one if
+    the other is None. Used to compute MAX(captured_at) across groups
+    where SQLite's MAX skips NULLs but we also want to preserve the
+    NULL-vs-non-NULL distinction."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a > b else b

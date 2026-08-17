@@ -38,6 +38,7 @@ from pipeline import (
     attach_log_file,
     get_state,
     read_recent_log_lines,
+    run_person_backfill,
     run_pipeline,
 )
 
@@ -93,6 +94,21 @@ _classifier = None
 # JSON payload. Invalidated whenever a new pipeline run completes.
 _results_cache: dict[int, dict] = {}
 _results_lock = threading.Lock()
+
+
+def _invalidate_results_cache(prefix: str = "all:") -> None:
+    """Pop every cache entry whose key starts with `prefix` (or equals
+    `prefix` with the trailing colon stripped). The /api/results cache
+    uses keys like "all:sort=rank" / "all:sort=time" / "all:sort=added"
+    plus per-filter variants like "all:cid=3:sp=…:sort=rank". Popping the
+    bare literal "all" — which the previous code did — only ever matched
+    a single key, so the cache silently went stale across runs.
+    """
+    bare = prefix.rstrip(":")
+    with _results_lock:
+        for k in list(_results_cache):
+            if k.startswith(prefix) or k == bare:
+                _results_cache.pop(k, None)
 
 # Only one pipeline run at a time across the whole process. Prevents
 # state corruption (the shared state dict would get clobbered) and
@@ -272,7 +288,7 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
     # cache — new embeddings change which photos are near-duplicates —
     # and the cluster-names cache — HDBSCAN may reassign cluster_ids.
     with _results_lock:
-        _results_cache.pop("all", None)
+        _invalidate_results_cache("all:")
         _results_cache.pop(out.run_id, None)
     storage.invalidate_global_near_dup_cache()
     with storage.connect(DB_PATH) as conn:
@@ -400,6 +416,8 @@ async def get_results(
     species: str | None = Query(default=None),
     genus: str | None = Query(default=None),
     family: str | None = Query(default=None),
+    has_person: int | None = Query(default=None, ge=0, le=1),
+    sort: str = Query(default="rank", pattern="^(rank|time|added)$"),
 ) -> dict:
     """Return a paginated slice of every indexed asset. The `run` param
     was dropped — the view is now global so the cluster / taxonomy pills
@@ -409,11 +427,21 @@ async def get_results(
     - cluster_id: matches assets.cluster_id exactly
     - species/genus/family: matches predictions.position=0 (rank='species')
       label of the same value
+    - has_person: 0 (no person) or 1 (has person). Plain WHERE on
+      assets.has_person; NULL rows (unscanned) are excluded by both.
+    - sort: 'rank' (default, server-defined order — Immich rank then
+      cluster_id tiebreak), 'time' (newest captured_at first, NULLs
+      last), or 'added' (newest first_seen_at first, NULLs last).
+      Time/added sort happens server-side so the page slice is the
+      actual most-recent N photos, not the top-N by rank re-sorted.
     """
-    has_filter = any(v is not None for v in (cluster_id, species, genus, family))
+    # Cache key includes every filter + sort param so different filter
+    # combinations can't poison each other. has_person is included so
+    # has_person=0 and has_person=1 each get their own cached slice.
+    has_filter = any(v is not None for v in (cluster_id, species, genus, family, has_person))
     cache_key = (
-        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}"
-        if has_filter else "all"
+        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:sort={sort}"
+        if has_filter else f"all:hp={has_person}:sort={sort}"
     )
 
     with _results_lock:
@@ -443,10 +471,32 @@ async def get_results(
             species=species,
             genus=genus,
             family=family,
+            has_person=has_person,
         )
         taxonomy = storage.get_global_taxonomy_summary(conn)
         if total == 0:
             return {"error": "no assets match this filter", "results": []}
+        # Server-side time sort. Without this, the client-side sortRows()
+        # would only re-order the page slice the server already picked by
+        # rank — recent photos with low Immich rank never appear. Split +
+        # sort-with-reverse + concat puts NULLs last without a custom
+        # comparator; ISO 8601 strings sort chronologically
+        # lexicographically.
+        if sort == "time":
+            with_ts = [r for r in results if r.get("captured_at")]
+            without_ts = [r for r in results if not r.get("captured_at")]
+            with_ts.sort(key=lambda r: r["captured_at"], reverse=True)
+            results = with_ts + without_ts
+        elif sort == "added":
+            # "added ↓" — newest first_seen_at first. first_seen_at is
+            # set by `DEFAULT (datetime('now'))` on the initial INSERT
+            # and is never overwritten by upsert, so it's the most
+            # recently *ingested* asset. NULLs sort last (shouldn't
+            # happen given the schema, but defensive).
+            with_ts = [r for r in results if r.get("first_seen_at")]
+            without_ts = [r for r in results if not r.get("first_seen_at")]
+            with_ts.sort(key=lambda r: r["first_seen_at"], reverse=True)
+            results = with_ts + without_ts
         start = page * page_size
         end = start + page_size
         page_results = results[start:end]
@@ -482,7 +532,8 @@ async def asset_detail(asset_id: str) -> dict:
         asset_row = conn.execute(
             """SELECT asset_id, original_file_name, original_url,
                       thumbnail_url, cluster_id,
-                      captured_at, latitude, longitude
+                      captured_at, latitude, longitude,
+                      has_person
                FROM assets WHERE asset_id = ?""",
             (asset_id,),
         ).fetchone()
@@ -534,6 +585,16 @@ async def asset_detail(asset_id: str) -> dict:
             "original_url": meta["original_url"],
             "thumbnail_url": meta["thumbnail_url"],
             "cluster_id": meta["cluster_id"],
+            "captured_at": meta.get("captured_at"),
+            "latitude": meta.get("latitude"),
+            "longitude": meta.get("longitude"),
+            # has_person: True / False / None (None = unscanned).
+            # Drives the asset-detail "👤" chip in the frontend; pairs
+            # with the grid's /api/results has_person filter.
+            "has_person": (
+                None if meta.get("has_person") is None
+                else bool(meta["has_person"])
+            ),
             "top_predictions": top_preds,
             "taxon_scores": taxon_scores,
             "detections": detections,
@@ -825,6 +886,32 @@ async def run_endpoint(params: RunParams) -> dict:
     )
 
 
+@app.post("/api/run/stop")
+async def stop_run() -> dict:
+    """Ask the running pipeline to stop at the next batch boundary.
+
+    The worker checks `_stop_event` at every chunk boundary (plantae
+    decision, species, kingdom, YOLO, bbox-bioclip) and raises
+    `_PipelineStop` to unwind cleanly. Whatever the previous batch
+    already wrote is committed — no work is lost.
+
+    Returns:
+      - 200 with `{stopped: true}` if a run was actually running and
+        the stop flag was set
+      - 200 with `{stopped: false, reason: "no run in progress"}` if
+        nothing was running (no-op)
+    """
+    # Defer import to avoid pinning the running pipeline module path
+    # into the route definition (it's also imported by the worker).
+    import pipeline as _pipeline
+    import logging
+    _log = logging.getLogger(__name__)
+    was_running = _pipeline.request_stop()
+    if was_running:
+        _log.info("stop requested by user; worker will unwind at next batch boundary")
+    return {"stopped": was_running}
+
+
 class ReclassifyParams(BaseModel):
     asset_ids: list[str]
     k: int | None = None  # default: server KNN_K
@@ -990,7 +1077,7 @@ async def reclassify(params: ReclassifyParams) -> dict:
     # Invalidate the per-page cache so the next /api/results reflects
     # the new KNN rows.
     with _results_lock:
-        _results_cache.pop("all", None)
+        _invalidate_results_cache("all:")
     return {"stats": stats, "results": fresh}
 
 
@@ -2058,7 +2145,28 @@ async def _backfill_exif_async(job_id: str) -> None:
                         return None
                     return (aid, r.json()) if r.status_code == 200 else None
 
-            results = await asyncio.gather(*(fetch_one(a) for a in asset_ids))
+            # Stream progress instead of gather()-ing silently. The
+            # old code waited ~30s on a 17k DB before logging anything;
+            # as_completed surfaces results as they finish so the UI
+            # sees steady scroll. Order doesn't matter — fetch_one
+            # returns (aid, payload), and the DB write phase iterates
+            # in arrival order without depending on the original list.
+            fetch_log_every = max(1, min(200, len(asset_ids) // 25))
+            results: list[tuple[str, dict] | None] = []
+            tasks = [asyncio.create_task(fetch_one(aid)) for aid in asset_ids]
+            done = 0
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    result = await coro
+                except Exception:
+                    result = None
+                results.append(result)
+                done += 1
+                if done % fetch_log_every == 0 or done == len(asset_ids):
+                    logger.info(
+                        f"[backfill-exif] fetch progress  "
+                        f"{done:,}/{len(asset_ids):,}"
+                    )
             parsed = [
                 (aid, ImmichClient.extract_exif(payload))
                 for aid, payload in results
@@ -2070,14 +2178,16 @@ async def _backfill_exif_async(job_id: str) -> None:
             missing_count = sum(1 for r in results if r is None)
             if missing_count:
                 logger.info(f"[backfill-exif] {missing_count:,} assets returned no data (deleted in Immich?)")
-            logger.info(f"[backfill-exif] fetched  got={len(parsed):,}")
+            logger.info(f"[backfill-exif] fetched  got={len(parsed):,}  missing={missing_count:,}")
 
             updated = 0
             skipped = 0
             no_exif = 0
-            # Log every ~500 assets (or every asset for tiny batches)
-            # so the UI sees steady scroll during the ~30s run.
-            log_every = max(1, min(500, len(parsed) // 10))
+            # Log every ~100 assets (or every asset for tiny batches)
+            # so the UI sees steady scroll during the ~30s run. Tighter
+            # than the fetch cadence — the DB phase is sequential, so
+            # smaller chunks keep the log visibly moving.
+            log_every = max(1, min(100, len(parsed) // 20))
             with storage.connect(DB_PATH) as conn:
                 for i, (aid, exif) in enumerate(parsed, 1):
                     if not exif["captured_at"]:
@@ -2092,21 +2202,29 @@ async def _backfill_exif_async(job_id: str) -> None:
                     ).fetchone()
                     if existing and existing["captured_at"]:
                         skipped += 1
-                        continue
-                    storage.update_asset_exif(
-                        conn,
-                        asset_id=aid,
-                        captured_at=exif["captured_at"],
-                        latitude=exif["latitude"],
-                        longitude=exif["longitude"],
-                    )
-                    updated += 1
+                    else:
+                        storage.update_asset_exif(
+                            conn,
+                            asset_id=aid,
+                            captured_at=exif["captured_at"],
+                            latitude=exif["latitude"],
+                            longitude=exif["longitude"],
+                        )
+                        updated += 1
+                    # Log every N rows regardless of skip/update so the
+                    # user sees steady scroll even when 90% of rows are
+                    # already-set.
                     if i % log_every == 0:
                         logger.info(
                             f"[backfill-exif] progress  "
                             f"{i:,}/{len(parsed):,}  updated={updated:,}  "
                             f"skipped(already-set)={skipped:,}"
                         )
+                # Commit before the `with` block closes — otherwise
+                # every UPDATE rolls back on conn.close(). Python's
+                # sqlite3 default isolation is deferred; the context
+                # manager only closes, never commits.
+                conn.commit()
             logger.info(
                 f"[backfill-exif] done  "
                 f"updated={updated:,}  skipped(already-set)={skipped:,}  "
@@ -2184,6 +2302,279 @@ async def get_backfill_exif_logs(job_id: str, tail: int = 50) -> dict:
     except FileNotFoundError:
         lines = []
     return {"job_id": job_id, "lines": [l.rstrip() for l in lines[-tail:]]}
+
+
+# ---- Person-detection backfill ---------------------------------------
+# Standalone sweep that runs ONLY the person stage (no BioCLIP). Used
+# to fill in `assets.has_person` for the ~19k existing assets without
+# rerunning the slow BioCLIP pipeline. Spawned as a background job
+# (same pattern as backfill-exif): POST returns {job_id, n_to_scan};
+# UI polls /api/person/backfill/job/{id} for status + scanned counts
+# and /logs for the live tail.
+
+_person_backfill_jobs: dict[str, dict] = {}
+# Stop signals per job_id, used to ask a running child process to
+# unwind at the next batch boundary. multiprocessing.Event is shared
+# with the child by reference (it's a sync primitive that crosses the
+# fork/spawn boundary cleanly).
+_person_backfill_stops: dict[str, "multiprocessing.Event"] = {}
+
+
+def _person_backfill_child_entry(
+    base_url: str,
+    api_key: str,
+    db_path: str,
+    log_path: str,
+    status_path: str,
+    stop_event,  # multiprocessing.Event — passed by parent
+) -> None:
+    """Entry point for the multiprocessing child. Runs the standalone
+    pipeline.run_person_backfill() and writes:
+    - log lines to `log_path`
+    - status JSON (scanned/with/without counts) to `status_path`
+    - the final "done"/"error" status to `status_path` and the log
+
+    The parent (uvicorn worker) reads `status_path` on each /job poll
+    — JSON file beats multiprocessing.Manager().dict() for our access
+    pattern (parent reads every 400ms, child writes every ~30s). No
+    IPC machinery, no extra threads in the parent.
+    """
+    import logging as _logging
+    log_path = Path(log_path)
+    status_path = Path(status_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    logger = _logging.getLogger("person_backfill")
+    for h in list(logger.handlers):
+        if isinstance(h, _logging.FileHandler):
+            logger.removeHandler(h)
+            h.close()
+    handler = _logging.FileHandler(log_path, mode="w")
+    handler.setFormatter(_logging.Formatter("%(asctime)s %(message)s",
+                                            datefmt="%H:%M:%S"))
+    logger.addHandler(handler)
+    logger.setLevel(_logging.INFO)
+    try:
+        # Count up front so the log line is meaningful.
+        from storage import count_assets_without_person_scan
+        with storage.connect(db_path) as conn:
+            n_to_scan = count_assets_without_person_scan(conn)
+        logger.info(f"[person-backfill] starting  n_to_scan={n_to_scan:,}")
+
+        def progress_cb(scanned: int, with_p: int, without_p: int) -> None:
+            logger.info(
+                f"[person-backfill] progress  scanned={scanned:,}  "
+                f"has_person={with_p:,}  no_person={without_p:,}"
+            )
+
+        result = run_person_backfill(
+            base_url=base_url,
+            api_key=api_key,
+            db_path=db_path,
+            progress_cb=progress_cb,
+            status_path=status_path,
+            stop_event=stop_event,
+        )
+
+        # Stop requested vs. natural completion — distinguish so the
+        # UI can show "Stopped" vs "Done" cleanly.
+        if stop_event.is_set():
+            logger.info(
+                f"[person-backfill] stopped  scanned={result['scanned_count']:,}"
+            )
+        else:
+            logger.info(
+                f"[person-backfill] done  scanned={result['scanned_count']:,}  "
+                f"has_person={result['with_person_count']:,}  "
+                f"no_person={result['without_person_count']:,}"
+            )
+    except Exception as e:  # noqa: BLE001 — surface anything to the UI
+        logger.exception("[person-backfill] failed")
+        try:
+            import json as _json
+            status_path.write_text(_json.dumps({
+                "stage": "error",
+                "error": f"{type(e).__name__}: {e}",
+            }))
+        except Exception:
+            pass
+    finally:
+        handler.close()
+        logger.removeHandler(handler)
+
+
+@app.post("/api/person/backfill")
+async def start_person_backfill() -> dict:
+    """Spawn the standalone person-backfill process. Returns
+    {job_id, n_to_scan} — the count tells the UI how much work is
+    queued (and is what the confirm message should show).
+
+    Runs as a separate **multiprocessing.Process** (not a thread) so
+    YOLO's CPU-bound work doesn't hold the GIL and starve the
+    FastAPI event loop. The child writes progress to a JSON status
+    file; the parent reads it on each /job poll — no shared memory.
+    """
+    import multiprocessing as _mp
+    # Concurrent-job guard. Even though each job is now in its own
+    # process, two concurrent jobs would still contend on the SQLite
+    # write lock. Refuse the second until the first finishes.
+    running = [
+        j for j in _person_backfill_jobs.values()
+        if j["status"] == "running"
+    ]
+    if running:
+        existing = running[0]
+        return {
+            "job_id": existing["job_id"],
+            "n_to_scan": existing["n_to_scan"],
+            "noop": False,
+            "already_running": True,
+        }
+    # Count up front so the UI can show the work size in the confirm
+    # modal without an extra round-trip.
+    with storage.connect(DB_PATH) as conn:
+        n_to_scan = storage.count_assets_without_person_scan(conn)
+    if n_to_scan == 0:
+        # Nothing to do — surface as a 200 with a structured payload
+        # so the UI can show "all done" without spawning a process.
+        return {"job_id": None, "n_to_scan": 0, "noop": True}
+    job_id = uuid.uuid4().hex[:8]
+    log_path = Path(DB_PATH).parent / f"person-backfill-{job_id}.log"
+    status_path = Path(DB_PATH).parent / f"person-backfill-{job_id}.status.json"
+    stop_event = _mp.Event()
+    _person_backfill_stops[job_id] = stop_event
+    _person_backfill_jobs[job_id] = {
+        "job_id": job_id,
+        "status": "running",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": None,
+        "log_path": str(log_path),
+        "status_path": str(status_path),
+        "n_to_scan": n_to_scan,
+        "scanned_count": 0,
+        "with_person_count": 0,
+        "without_person_count": 0,
+        "error": None,
+    }
+    # Resolve Immich creds in the parent (env vars, not from the
+    # singleton which is in this process anyway).
+    ic = _immich_client()
+    base_url = ic.base_url
+    api_key = ic._client.headers["x-api-key"]
+    proc = _mp.Process(
+        target=_person_backfill_child_entry,
+        args=(base_url, api_key, DB_PATH, str(log_path),
+              str(status_path), stop_event),
+        daemon=True,
+        name=f"person-backfill-{job_id}",
+    )
+    proc.start()
+    _person_backfill_jobs[job_id]["_proc"] = proc
+    return {"job_id": job_id, "n_to_scan": n_to_scan, "noop": False, "already_running": False}
+
+
+@app.post("/api/person/backfill/stop")
+async def stop_person_backfill(job_id: str) -> dict:
+    """Ask a running backfill to unwind at the next batch boundary.
+    The child process checks the stop Event we share with it; the
+    loop exits and marks the job as 'stopped' in its JSON status
+    file. The poll endpoint then surfaces that."""
+    job = _person_backfill_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown person-backfill job")
+    if job["status"] != "running":
+        return {"stopped": False, "reason": "job not running"}
+    stop_event = _person_backfill_stops.get(job_id)
+    if stop_event is not None:
+        stop_event.set()
+    return {"stopped": True, "job_id": job_id}
+
+
+@app.get("/api/person/backfill/job/{job_id}")
+async def poll_person_backfill_job(job_id: str) -> dict:
+    job = _person_backfill_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown person-backfill job")
+    # The child writes JSON status to `status_path`. Read it here so
+    # progress is visible across processes. Falls back to the
+    # in-memory dict (init values) before the child has had time to
+    # write its first snapshot.
+    status_path = job.get("status_path")
+    if status_path:
+        try:
+            import json as _json
+            snap = _json.loads(Path(status_path).read_text())
+            # Update in-memory job from the JSON snapshot so /job
+            # reflects the child's latest counts. The child is the
+            # source of truth; the in-memory dict is the bookkeeping.
+            if snap.get("stage") in ("running", "stopped", "error", "finished"):
+                job["scanned_count"] = snap.get("scanned_count", job["scanned_count"])
+                job["with_person_count"] = snap.get(
+                    "with_person_count", job["with_person_count"]
+                )
+                job["without_person_count"] = snap.get(
+                    "without_person_count", job["without_person_count"]
+                )
+                if snap.get("stage") == "running":
+                    pass  # still running
+                elif snap.get("stage") == "stopped":
+                    job["status"] = "stopped"
+                    if job.get("finished_at") is None:
+                        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+                elif snap.get("stage") == "error":
+                    job["status"] = "error"
+                    job["error"] = snap.get("error", "unknown")
+                    if job.get("finished_at") is None:
+                        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+                elif snap.get("stage") == "finished":
+                    job["status"] = "done"
+                    if job.get("finished_at") is None:
+                        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+                    # Once the child reports done, invalidate the
+                    # results cache so the grid reflects new has_person.
+                    if not job.get("_cache_invalidated"):
+                        with _results_lock:
+                            _invalidate_results_cache("all:")
+                        job["_cache_invalidated"] = True
+        except FileNotFoundError:
+            pass  # child hasn't written its first snapshot yet
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "n_to_scan": job["n_to_scan"],
+        "scanned_count": job["scanned_count"],
+        "with_person_count": job["with_person_count"],
+        "without_person_count": job["without_person_count"],
+        "error": job["error"],
+    }
+
+
+@app.get("/api/person/backfill/logs")
+async def get_person_backfill_logs(job_id: str, tail: int = 80) -> dict:
+    """Tail the per-job log file. The worker writes progress lines
+    after each outer page (500 assets) so the UI gets steady scroll."""
+    job = _person_backfill_jobs.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="unknown person-backfill job")
+    try:
+        with open(job["log_path"]) as f:
+            lines = f.readlines()
+    except FileNotFoundError:
+        lines = []
+    return {"job_id": job_id, "lines": [l.rstrip() for l in lines[-tail:]]}
+
+
+@app.get("/api/person/backfill/preview")
+async def preview_person_backfill() -> dict:
+    """Cheap count-only call: how many assets would be scanned if the
+    user kicked off the backfill right now. Drives the confirm-modal
+    message in the UI. Mirrors the shape of `/api/album/.../preview`
+    so the JobPanel config can reuse the same hasPreview flow."""
+    with storage.connect(DB_PATH) as conn:
+        n = storage.count_assets_without_person_scan(conn)
+    return {"n_assets": n}
 
 
 @app.post("/api/assets/purge-missing")

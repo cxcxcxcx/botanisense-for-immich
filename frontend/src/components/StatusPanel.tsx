@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
-import { getStatus } from '../api/endpoints';
+import { getStatus, stopPipeline } from '../api/endpoints';
 import type { PipelineStatus } from '../api/types';
 import { usePolling } from '../hooks/usePolling';
 import { fmtDuration } from '../lib/format';
+import { useToasts } from './ToastProvider';
 
 const STAGE_COLORS: Record<string, string> = {
   search: 'bg-stage-search',
@@ -23,6 +24,27 @@ export function StatusPanel({ compact = false }: Props = {}) {
   const { data } = usePolling<PipelineStatus>(() => getStatus(), { intervalMs: 1000 });
   const [stageTotals, setStageTotals] = useState<Record<string, number>>({});
   const prevStatusRef = useRef<string>('idle');
+  const [stopping, setStopping] = useState(false);
+  const push = useToasts();
+
+  const handleStop = async () => {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      const r = await stopPipeline();
+      if (r.stopped) {
+        push({ kind: 'info', message: 'Stop requested — will unwind at the next batch boundary' }, 3000);
+      } else {
+        push({ kind: 'info', message: 'No run was in progress' }, 2500);
+      }
+    } catch (err) {
+      push({ kind: 'info', message: err instanceof Error ? err.message : String(err) }, 4000);
+    } finally {
+      // Re-enable after a short debounce so a rapid click doesn't
+      // double-fire; the status panel will refresh on its own.
+      window.setTimeout(() => setStopping(false), 1500);
+    }
+  };
 
   useEffect(() => {
     if (!data) return;
@@ -67,6 +89,17 @@ export function StatusPanel({ compact = false }: Props = {}) {
   return (
     <aside className={`flex flex-wrap items-center gap-2 font-mono text-[12px]/[1.6] ml-auto ${compact ? 'text-[11px]' : ''}`}>
       <span className={`status-${status}`}>{badgeText}</span>
+      {status === 'running' && (
+        <button
+          type="button"
+          onClick={handleStop}
+          disabled={stopping}
+          className="px-2 py-0.5 rounded border border-[#a44] bg-transparent text-red-300 text-[11px] hover:bg-[#422] hover:border-red-400 disabled:opacity-50"
+          title="Stop the running pipeline at the next batch boundary"
+        >
+          {stopping ? 'stopping…' : 'Stop'}
+        </button>
+      )}
       <progress
         className="hidden"
         style={{ display: status === 'running' ? 'block' : 'none', width: '200px', flexShrink: 0, height: '6px' }}

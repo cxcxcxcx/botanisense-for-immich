@@ -69,6 +69,12 @@ export const getClusteringStatus   = () =>
 export const runPipeline = (p: RunParams) =>
   fetchJson<unknown>('/api/run', { method: 'POST', body: p });
 
+export const stopPipeline = () =>
+  fetchJson<{ stopped: boolean; reason?: string }>(
+    '/api/run/stop',
+    { method: 'POST' },
+  );
+
 export const refreshPipeline = () =>
   fetchJson<unknown>('/api/refresh', { method: 'POST' });
 
@@ -208,6 +214,70 @@ export const getBackfillExifLogs = (job_id: string, tail = 80) =>
   fetchJson<BackfillExifLogsResponse>('/api/assets/backfill-exif/logs', {
     query: { job_id, tail },
   });
+
+// ---- Person-detection backfill -------------------------------------
+// Standalone YOLO sweep that fills in `assets.has_person` for every
+// asset where it's currently NULL. No BioCLIP — just YOLO-World with
+// the 17-label model. Same job shape as backfill-exif so the UI can
+// reuse the same modal pattern.
+
+export interface PersonBackfillJobSnapshot {
+  job_id: string;
+  status: 'running' | 'done' | 'error';
+  started_at: string;
+  finished_at: string | null;
+  // Total assets queued at start — drives the confirm-modal message.
+  n_to_scan: number;
+  // Live counters — updated as each outer page (500 assets) finishes.
+  scanned_count: number;
+  with_person_count: number;
+  without_person_count: number;
+  error: string | null;
+}
+
+export interface PersonBackfillLogsResponse {
+  job_id: string;
+  lines: string[];
+}
+
+export interface StartPersonBackfillResponse {
+  job_id: string | null;
+  n_to_scan: number;
+  // true when the DB had zero unscanned assets — endpoint short-circuits
+  // and returns this so the UI can show "already done" without
+  // spawning a thread.
+  noop: boolean;
+}
+
+export const startPersonBackfill = () =>
+  fetchJson<StartPersonBackfillResponse>('/api/person/backfill', {
+    method: 'POST',
+  });
+
+// Cheap count call so the confirm modal can show "N photos will be
+// scanned". Same shape as the album-job previews (n_assets) so the
+// JobPanel can treat it identically.
+export const previewPersonBackfill = () =>
+  fetchJson<{ n_assets: number }>('/api/person/backfill/preview');
+
+export const pollPersonBackfillJob = (job_id: string) =>
+  fetchJson<PersonBackfillJobSnapshot>(
+    `/api/person/backfill/job/${job_id}`,
+  );
+
+export const getPersonBackfillLogs = (job_id: string, tail = 80) =>
+  fetchJson<PersonBackfillLogsResponse>('/api/person/backfill/logs', {
+    query: { job_id, tail },
+  });
+
+// Tell a running person-backfill to unwind at the next batch
+// boundary. Returns 200 even if the job isn't running — the UI can
+// show "already finished" without an error.
+export const stopPersonBackfill = (job_id: string) =>
+  fetchJson<{ stopped: boolean; job_id?: string; reason?: string }>(
+    `/api/person/backfill/stop/${encodeURIComponent(job_id)}`,
+    { method: 'POST' },
+  );
 
 // ---- Build KNN index (FAISS) ---------------------------------------
 // Long-running job spawned by the Run view "Build KNN index" button.

@@ -20,7 +20,12 @@ import {
 export type GroupBy = 'cluster' | 'species' | 'genus' | 'family';
 // `time` = newest captured_at first (EXIF dateTimeOriginal, falling
 // back to fileCreatedAt). Photos without captured_at sort last.
-export type SortMode = 'rank' | 'plantae' | 'score' | 'time';
+// 'rank'  — server-defined order (Immich rank then cluster_id tiebreak)
+// 'plantae' — highest Plantae confidence first
+// 'score' — highest BioCLIP top-1 species score first
+// 'time'  — newest EXIF capture time first (nulls last) — server-side
+// 'added' — newest first_seen_at first (nulls last) — server-side
+export type SortMode = 'rank' | 'plantae' | 'score' | 'time' | 'added';
 
 export interface Filters {
   group_by: GroupBy;
@@ -33,6 +38,10 @@ export interface Filters {
   species?: string | undefined;
   genus?: string | undefined;
   family?: string | undefined;
+  // Person-filter: top-level facet, independent of group_by.
+  // 0 = no person, 1 = has person, undefined = any (and unscanned).
+  // Drives /api/results?has_person= and the toolbar chip group.
+  has_person?: 0 | 1 | undefined;
 }
 
 export interface ModalState {
@@ -44,7 +53,7 @@ export interface ModalState {
   assetId: string | null;
 }
 
-export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'cluster' | 'sync-all' | 'purge-missing';
+export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'cluster' | 'sync-all' | 'purge-missing' | 'person-backfill';
 
 // Up to 5 sample rows from /api/assets/purge-missing, used by the
 // confirm modal so the user can spot-check filenames before purging.

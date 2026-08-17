@@ -3,6 +3,7 @@ import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
+import { FilterCards } from './components/FilterCards';
 import { Modal } from './components/Modal';
 import { AssetDetail } from './components/AssetDetail';
 import { ParamsForm } from './components/ParamsForm';
@@ -82,9 +83,10 @@ export function App() {
     return () => window.removeEventListener('keydown', onKey);
   }, [modal.open, dispatch]);
 
-  const modalTitle = modal.kind === 'asset'
-    ? (modal.assetId ? `Asset ${modal.assetId.slice(0, 8)}…` : 'Asset detail')
-    : '';
+  // No asset-id title in the modal header — the body shows the
+  // filename + capture time prominently, and a truncated UUID adds
+  // noise without telling the user anything they don't already see.
+  const modalTitle = '';
 
   return (
     <>
@@ -98,6 +100,7 @@ export function App() {
         ) : view === 'browse-content' ? (
           <>
             <ClusterAlbumBar />
+            <FilterCards />
             <Grid />
           </>
         ) : (

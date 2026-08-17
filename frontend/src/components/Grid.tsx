@@ -17,9 +17,13 @@ const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
   { value: 'plantae', label: 'Plantae ↓',  hint: 'highest Plantae kingdom confidence first (green badge)' },
   { value: 'score',   label: 'top-1 ↓',    hint: 'highest BioCLIP top-1 species score first (green chip)' },
   { value: 'time',    label: 'newest ↓',   hint: 'newest EXIF capture time first (nulls last)' },
+  { value: 'added',   label: 'added ↓',    hint: 'newest first_seen_at first — most recently ingested into the DB (nulls last)' },
 ];
 
-function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score' | 'time'): ResultRow[] {
+function sortRows(
+  rows: ResultRow[],
+  sort: 'rank' | 'plantae' | 'score' | 'time' | 'added',
+): ResultRow[] {
   if (sort === 'plantae') {
     return [...rows].sort((a, b) => (b.taxon_scores?.Plantae ?? -1) - (a.taxon_scores?.Plantae ?? -1));
   }
@@ -30,6 +34,19 @@ function sortRows(rows: ResultRow[], sort: 'rank' | 'plantae' | 'score' | 'time'
     return [...rows].sort((a, b) => {
       const av = a.captured_at ?? '';
       const bv = b.captured_at ?? '';
+      if (!av && bv) return 1;
+      if (av && !bv) return -1;
+      return bv.localeCompare(av);
+    });
+  }
+  if (sort === 'added') {
+    // Server already sorted by first_seen_at DESC when this is the
+    // active sort (`sortRequests` below), but we still apply the same
+    // comparator when the user re-renders (e.g. after a filter change)
+    // so the chip stays consistent regardless of cache state.
+    return [...rows].sort((a, b) => {
+      const av = a.first_seen_at ?? '';
+      const bv = b.first_seen_at ?? '';
       if (!av && bv) return 1;
       if (av && !bv) return -1;
       return bv.localeCompare(av);
@@ -65,6 +82,17 @@ export function Grid() {
   useEffect(() => {
     const reqId = ++reqIdRef.current;
     setLoading(true);
+    // Drop the previous page's results so stale photos don't flash
+    // under the new filter while the request is in flight. The render
+    // branch then falls into the "loading && !data" → "Loading…"
+    // path until the new response arrives.
+    setData(null);
+    setError(null);
+    // Server-side sorts: 'time' and 'added' need to be sent to the
+    // server so the page slice is the actual most-recent N photos
+    // (not the top-N by rank re-sorted). Client-side sorts
+    // ('plantae', 'score') and the default 'rank' don't need a param.
+    const serverSort = filters.sort === 'time' || filters.sort === 'added' ? filters.sort : 'rank';
     getResults({
       page: filters.page,
       page_size: filters.page_size,
@@ -72,6 +100,11 @@ export function Grid() {
       species: filters.species,
       genus: filters.genus,
       family: filters.family,
+      // Top-level facet — independent of group_by. Pass through
+      // unchanged; backend treats 0/1 as exact-match on assets.has_person
+      // and excludes unscanned (NULL) rows from both.
+      has_person: filters.has_person,
+      sort: serverSort,
     })
       .then(r => { if (reqId === reqIdRef.current) { setData(r); setError(null); } })
       .catch(e => { if (reqId === reqIdRef.current) setError(e); })
@@ -79,6 +112,8 @@ export function Grid() {
   }, [
     filters.page, filters.page_size,
     filters.cluster_id, filters.species, filters.genus, filters.family,
+    filters.has_person,
+    filters.sort,
   ]);
 
   const sortedRows = useMemo(() => {

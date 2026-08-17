@@ -51,6 +51,10 @@ export function parseUrlFilters(search: string = window.location.search): Filter
   if (group_by === 'species')  { const v = sp.get('species');  if (v !== null) f.species  = v; }
   if (group_by === 'genus')    { const v = sp.get('genus');    if (v !== null) f.genus    = v; }
   if (group_by === 'family')   { const v = sp.get('family');   if (v !== null) f.family   = v; }
+  // Person filter is a top-level facet, independent of group_by. Parse
+  // as 0|1 (string is the URL transport); absent/unknown → undefined.
+  const hp = sp.get('has_person');
+  if (hp === '0' || hp === '1') f.has_person = hp === '1' ? 1 : 0;
   return f;
 }
 
@@ -63,6 +67,7 @@ export function buildUrl(f: Filters): string {
   if (f.group_by === 'species' && f.species) sp.set('species', f.species);
   if (f.group_by === 'genus'   && f.genus)   sp.set('genus',   f.genus);
   if (f.group_by === 'family'  && f.family)  sp.set('family',  f.family);
+  if (f.has_person != null) sp.set('has_person', String(f.has_person));
   if (f.page) sp.set('page', String(f.page));
   return `?${sp.toString()}`;
 }
@@ -72,7 +77,8 @@ export function initialFilters(): Filters {
   const fromUrl = parseUrlFilters();
   // If URL had nothing useful, try localStorage.
   if (fromUrl.group_by === 'cluster' && fromUrl.sort === 'rank' && !fromUrl.q && fromUrl.page === 0
-      && fromUrl.cluster_id == null && !fromUrl.species && !fromUrl.genus && !fromUrl.family) {
+      && fromUrl.cluster_id == null && !fromUrl.species && !fromUrl.genus && !fromUrl.family
+      && fromUrl.has_person == null) {
     return readPersisted(DEFAULT_FILTERS);
   }
   return fromUrl;
@@ -92,6 +98,11 @@ export function useUrlFilters() {
     if (patch.group_by && patch.group_by !== parseUrlFilters().group_by) {
       next.cluster_id = undefined; next.species = undefined;
       next.genus = undefined; next.family = undefined; next.page = 0;
+    }
+    // has_person changes (including toggling off) re-paginate to 0 so
+    // the user lands on page 1 of the new result set.
+    if (Object.prototype.hasOwnProperty.call(patch, 'has_person')) {
+      next.page = 0;
     }
     writePersisted(next);
     const qs = buildUrl(next).slice(1); // strip leading '?'

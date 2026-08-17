@@ -5,6 +5,7 @@ import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
 import { DetectionBlock } from './DetectionBlock';
+import { BboxOverlay } from './BboxOverlay';
 import { useToasts } from './ToastProvider';
 import { plantaeColorClass } from '../lib/plantae';
 import { formatPct } from '../lib/format';
@@ -16,12 +17,14 @@ interface Props {
 export function AssetDetail({ assetId }: Props) {
   const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
+  const [copied, setCopied] = useState(false);
   const push = useToasts();
 
   useEffect(() => {
     let cancelled = false;
     setData(null);
     setError(null);
+    setCopied(false);
     getAsset(assetId)
       .then(d => { if (!cancelled) setData(d); })
       .catch(e => { if (!cancelled) setError(e); });
@@ -55,7 +58,7 @@ export function AssetDetail({ assetId }: Props) {
 
   return (
     <div className="text-[13px]">
-      <figure className="m-0 mb-2 bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] flex items-center justify-center min-h-[120px] max-h-[220px]">
+      <figure className="m-0 mb-2 bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] flex items-center justify-center min-h-[120px] max-h-[220px] relative">
         <img
           src={thumbUrl(data.asset_id, 'fullsize')}
           alt={data.original_file_name}
@@ -70,11 +73,62 @@ export function AssetDetail({ assetId }: Props) {
             }
           }}
         />
+        {/* YOLO detection boxes overlaid on the image so the user can
+            see exactly where YOLO saw each label. Color-coded by
+            label — person/face/human in warm colors (high signal),
+            hand in yellow (visible but doesn't count as has_person),
+            plants in green. Same component used by the photo grid
+            cards (Card.tsx) so behaviour is consistent. */}
+        <BboxOverlay detections={data.detections} />
       </figure>
 
       <p className="mb-0.5">
         <strong>{data.original_file_name}</strong>
         {data.cluster_id != null && <small className="text-fg-1"> · cluster {data.cluster_id}</small>}
+      </p>
+
+      {/* Asset ID + copy button. Subtle monospace line so users can
+          grab the UUID (for sharing / debugging / pasting into
+          /api/asset/{id}) without scraping it from the URL. The
+          button label flips to "Copied" for 1.5s after a successful
+          clipboard write so the user gets visual feedback. */}
+      <p className="-mt-1 mb-2 text-[11px] text-fg-1 flex items-center gap-2 flex-wrap">
+        <code
+          className="font-mono text-fg-1 select-all"
+          title={data.asset_id}
+        >{data.asset_id}</code>
+        <button
+          type="button"
+          className="px-1.5 py-0.5 rounded border border-[#345] bg-transparent text-[10px] text-fg-1 hover:bg-[#234] hover:border-accent"
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(data.asset_id);
+              setCopied(true);
+              window.setTimeout(() => setCopied(false), 1500);
+            } catch (e) {
+              push({ kind: 'error', message: 'Copy failed: ' + (e instanceof Error ? e.message : String(e)) }, 3000);
+            }
+          }}
+        >{copied ? 'Copied ✓' : 'Copy ID'}</button>
+        {/* Person chip — mirrors the grid filter state. Three states:
+            true (👤, accent), false (no person, dim), null (unscanned,
+            italic 'unscanned'). Drives from data.has_person which is
+            set by the pipeline's "person" stage. */}
+        {data.has_person === true && (
+          <span className="px-1.5 py-0.5 rounded border border-accent text-accent text-[10px] font-medium" title="YOLO detected a person in this image">
+            👤 person
+          </span>
+        )}
+        {data.has_person === false && (
+          <span className="px-1.5 py-0.5 rounded border border-[#345] text-fg-1 text-[10px]" title="Scanned, no person detected">
+            no person
+          </span>
+        )}
+        {data.has_person === null && (
+          <span className="px-1.5 py-0.5 rounded border border-[#234] text-fg-1 text-[10px] italic" title="Person scan hasn't run on this asset yet">
+            unscanned
+          </span>
+        )}
       </p>
 
       {(data.captured_at || (data.latitude != null && data.longitude != null)) && (
