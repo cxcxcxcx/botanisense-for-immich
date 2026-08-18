@@ -192,13 +192,36 @@ def main():
             )
             print(f"  applied {min(i+BATCH, len(to_flip))}/{len(to_flip)}", flush=True)
 
-        # Invalidate /api/results cache
-        try:
-            storage._invalidate_results_cache("all:")
-        except AttributeError:
-            pass
+        # Invalidate /api/results cache on the running uvicorn worker so the
+        # flipped rows show up immediately (no restart needed).
+        _post_cache_invalidate()
 
-        print(f"\nDone. Flipped {len(to_flip)} rows from has_person=0 to 1.", flush=True)
+    print(f"\nDone. Flipped {len(to_flip)} rows from has_person=0 to 1.", flush=True)
+
+
+def _post_cache_invalidate(base_url: str = "http://127.0.0.1:8765"):
+    """POST /api/cache/invalidate so the running API worker drops its
+    in-process results cache. Uses urllib to avoid a hard dependency on
+    requests. Honors PORT env var if set.
+    """
+    import os
+    port = os.environ.get("PORT", "8765")
+    base_url = f"http://127.0.0.1:{port}"
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/cache/invalidate?prefix=all:",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8"))
+            print(f"  cache invalidated: {body}", flush=True)
+    except Exception as e:
+        print(f"  WARN: cache invalidate failed: {type(e).__name__}: {e}",
+              flush=True)
+        print(f"  (the running uvicorn worker will still serve stale data "
+              f"until restarted)", flush=True)
 
 
 def _fmt(s: float) -> str:

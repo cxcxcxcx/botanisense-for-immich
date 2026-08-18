@@ -134,15 +134,32 @@ def main():
             print(f"  updated {n_done}/{len(to_flip_up)}")
 
         # storage.connect() auto-commits on clean exit; rolls back on exception.
-        # Invalidate the /api/results cache so the new flags show up immediately.
-        try:
-            storage._invalidate_results_cache("all:")
-        except AttributeError:
-            # If the helper isn't named exactly that, fall back to a no-op
-            pass
+        # Invalidate the running uvicorn worker's in-process /api/results
+        # cache so the new flags show up immediately (no restart needed).
+        _post_cache_invalidate()
 
     print(f"\nDone. Flipped {n_flip_up} rows from has_person=0 to has_person=1.")
 
 
-if __name__ == "__main__":
-    main()
+def _post_cache_invalidate(base_url: str = "http://127.0.0.1:8765"):
+    """POST /api/cache/invalidate so the running API worker drops its
+    in-process results cache. Uses urllib to avoid a hard dependency on
+    requests. Honors PORT env var if set.
+    """
+    import os
+    port = os.environ.get("PORT", "8765")
+    base_url = f"http://127.0.0.1:{port}"
+    import json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/api/cache/invalidate?prefix=all:",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8"))
+            print(f"  cache invalidated: {body}")
+    except Exception as e:
+        print(f"  WARN: cache invalidate failed: {type(e).__name__}: {e}")
+        print(f"  (the running uvicorn worker will still serve stale data "
+              f"until restarted)")
