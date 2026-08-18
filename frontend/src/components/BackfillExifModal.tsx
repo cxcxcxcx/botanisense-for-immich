@@ -2,10 +2,10 @@ import { useEffect, useState } from 'react';
 import { Modal } from './Modal';
 import {
   getBackfillExifLogs,
-  pollBackfillExifJob,
   startBackfillExif,
 } from '../api/endpoints';
 import type { BackfillExifJobSnapshot } from '../api/endpoints';
+import { useJobStream } from '../hooks/useJobStream';
 import { useToasts } from './ToastProvider';
 
 interface Props {
@@ -20,6 +20,15 @@ export function BackfillExifModal({ open, onClose }: Props) {
   const [phase, setPhase] = useState<Phase>('starting');
   const [job, setJob] = useState<BackfillExifJobSnapshot | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
+
+  // Subscribe to the SSE stream for this backfill job. The server
+  // pushes every progress tick (~1s cadence from the worker) so we
+  // get sub-second updates without our own poll loop.
+  const streamJobId = phase === 'running' && job ? job.job_id : null;
+  const { job: streamJob } = useJobStream<BackfillExifJobSnapshot>(
+    'backfill_exif_jobs',
+    streamJobId,
+  );
 
   // Reset on reopen so a stale job doesn't bleed across sessions.
   useEffect(() => {
@@ -39,39 +48,18 @@ export function BackfillExifModal({ open, onClose }: Props) {
       try {
         const { job_id } = await startBackfillExif();
         if (cancelled) return;
+        setJob({
+          job_id,
+          status: 'running',
+          started_at: new Date().toISOString(),
+          finished_at: null,
+          updated_count: 0,
+          skipped_count: 0,
+          no_exif_count: 0,
+          missing_count: 0,
+          error: null,
+        });
         setPhase('running');
-        // Poll loop: status + tail logs every second. The log tail
-        // endpoint returns just the last N lines so we don't ship the
-        // whole file each tick.
-        const tick = async () => {
-          try {
-            const [snap, logResp] = await Promise.all([
-              pollBackfillExifJob(job_id),
-              getBackfillExifLogs(job_id, 80),
-            ]);
-            if (cancelled) return;
-            setJob(snap);
-            setLogs(logResp.lines);
-            if (snap.status === 'done') {
-              setPhase('done');
-              push({
-                kind: snap.updated_count > 0 ? 'success' : 'info',
-                message: snap.updated_count > 0
-                  ? `Backfilled EXIF on ${snap.updated_count.toLocaleString()} assets`
-                  : 'Nothing to backfill — every asset already has capture time',
-              }, 4000);
-            } else if (snap.status === 'error') {
-              setPhase('error');
-              push({ kind: 'error', message: snap.error ?? 'backfill failed' }, 5000);
-            }
-          } catch (err) {
-            if (cancelled) return;
-            console.warn('backfill-exif poll failed', err);
-          }
-        };
-        tick();
-        const t = setInterval(tick, 1000);
-        return () => clearInterval(t);
       } catch (err) {
         if (cancelled) return;
         push({ kind: 'error', message: err instanceof Error ? err.message : String(err) }, 5000);
@@ -80,6 +68,44 @@ export function BackfillExifModal({ open, onClose }: Props) {
     })();
     return () => { cancelled = true; };
   }, [open, push]);
+
+  // React to SSE status changes. Mirror the snapshot into local state
+  // and transition to done/error.
+  useEffect(() => {
+    if (!streamJob) return;
+    setJob(streamJob);
+    if (streamJob.status === 'done') {
+      setPhase('done');
+      push({
+        kind: streamJob.updated_count > 0 ? 'success' : 'info',
+        message: streamJob.updated_count > 0
+          ? `Backfilled EXIF on ${streamJob.updated_count.toLocaleString()} assets`
+          : 'Nothing to backfill — every asset already has capture time',
+      }, 4000);
+    } else if (streamJob.status === 'error') {
+      setPhase('error');
+      push({ kind: 'error', message: streamJob.error ?? 'backfill failed' }, 5000);
+    }
+  }, [streamJob, push]);
+
+  // Tail the log file while running.
+  useEffect(() => {
+    if (phase !== 'running' || !job) return;
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const logResp = await getBackfillExifLogs(job.job_id, 80);
+        if (cancelled) return;
+        setLogs(logResp.lines);
+      } catch (err) {
+        if (cancelled) return;
+        console.warn('backfill-exif log poll failed', err);
+      }
+    };
+    tick();
+    const t = setInterval(tick, 1000);
+    return () => { cancelled = true; clearInterval(t); };
+  }, [phase, job]);
 
   // Summary line shown above the log tail. Hidden until the first
   // poll lands (the worker hasn't reported anything yet).

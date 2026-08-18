@@ -3,10 +3,10 @@ import { Modal } from './Modal';
 import {
   getKnnBuildLogs,
   getKnnStatus,
-  pollKnnBuildJob,
   startKnnBuild,
 } from '../api/endpoints';
 import type { KnnBuildArgs, KnnBuildJobSnapshot } from '../api/types';
+import { useJobStream } from '../hooks/useJobStream';
 import { useToasts } from './ToastProvider';
 
 interface Props {
@@ -35,6 +35,15 @@ export function KnnBuildModal({ open, onClose }: Props) {
   const [logs, setLogs] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
 
+  // Subscribe to the SSE stream for this build job. While we're in
+  // the running phase and have a job_id, useJobStream gives us the
+  // server's latest snapshot — no 1Hz REST poll needed.
+  const streamJobId = phase === 'running' && job ? job.job_id : null;
+  const { job: streamJob } = useJobStream<KnnBuildJobSnapshot>(
+    'knn_build_jobs',
+    streamJobId,
+  );
+
   // Reset state every time the modal reopens so a stale job doesn't
   // leak from a previous session.
   useEffect(() => {
@@ -46,39 +55,44 @@ export function KnnBuildModal({ open, onClose }: Props) {
     }
   }, [open]);
 
-  // While running, poll status + tail the logs every second. The
-  // log endpoint returns just the tail of the file (default 50 lines)
-  // so we don't ship the whole file each tick.
+  // React to SSE status changes. Logs are still REST-polled because
+  // they're a long file tail (cheaper than SSE-firing on every line).
+  useEffect(() => {
+    if (!streamJob) return;
+    if (streamJob.status === 'done') {
+      setPhase('done');
+      push({ kind: 'success', message: 'KNN index built — refresh to use' }, 4000);
+      getKnnStatus().catch(() => {});
+    } else if (streamJob.status === 'error') {
+      setPhase('error');
+      push({ kind: 'error', message: streamJob.error ?? 'build failed' }, 5000);
+    }
+    // Mirror started_at from the server so the header timer is right
+    // (client clock might drift from the server's).
+    if (streamJob.started_at && (!job || job.started_at !== streamJob.started_at)) {
+      setJob(streamJob);
+    }
+  }, [streamJob, push, job]);
+
+  // Tail the log file while running. The log endpoint returns just the
+  // tail (default 50 lines) so we don't ship the whole file each tick.
   useEffect(() => {
     if (phase !== 'running' || !job) return;
     let cancelled = false;
     const tick = async () => {
       try {
-        const [snap, logResp] = await Promise.all([
-          pollKnnBuildJob(job.job_id),
-          getKnnBuildLogs(job.job_id, 80),
-        ]);
+        const logResp = await getKnnBuildLogs(job.job_id, 80);
         if (cancelled) return;
         setLogs(logResp.lines);
-        if (snap.status === 'done') {
-          setPhase('done');
-          push({ kind: 'success', message: 'KNN index built — refresh to use' }, 4000);
-          // Refresh the KNN pill so the header shows "v1 · N rows" again.
-          getKnnStatus().catch(() => {});
-        } else if (snap.status === 'error') {
-          setPhase('error');
-          push({ kind: 'error', message: snap.error ?? 'build failed' }, 5000);
-        }
       } catch (err) {
         if (cancelled) return;
-        // Network glitch — keep polling, the next tick will recover.
-        console.warn('knn-build poll failed', err);
+        console.warn('knn-build log poll failed', err);
       }
     };
     tick();
     const t = setInterval(tick, 1000);
     return () => { cancelled = true; clearInterval(t); };
-  }, [phase, job, push]);
+  }, [phase, job]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

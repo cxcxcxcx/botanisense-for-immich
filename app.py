@@ -16,6 +16,7 @@ Run with:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import threading
 import time
@@ -26,14 +27,15 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import storage
 from immich_client import ImmichClient
 import clusters
+import pipeline  # full module — the SSE generator reads pipeline._log_file_path
 from pipeline import (
     attach_log_file,
     get_state,
@@ -397,7 +399,11 @@ async def recompute_cluster_names() -> dict:
 @app.get("/api/status")
 async def status() -> dict:
     """Live pipeline state. Poll this every 1s while a run is in
-    progress to drive the UI status panel. Safe to read when idle."""
+    progress to drive the UI status panel. Safe to read when idle.
+
+    Kept for backwards-compat / scripts / debugging. The React UI now
+    reads the same payload via /api/events (SSE) instead of polling
+    this endpoint."""
     return get_state()
 
 
@@ -406,6 +412,157 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
     """Tail the file log. Lines are split on \\n; the last `tail` lines
     are returned (oldest first)."""
     return {"lines": read_recent_log_lines(tail)}
+
+
+# ---- Real-time event stream (SSE) ---------------------------------------
+# One connection replaces the five independent polling loops the UI used
+# to drive (StatusPanel 1Hz, LogTail 2Hz, JobPanel 400ms, KnnBuildModal
+# 1Hz, BackfillExifModal 1Hz). The server snapshots all live state under
+# their respective locks and emits only when the snapshot changes —
+# latency is bounded by the 200ms tick, well below what 1Hz REST polling
+# could deliver.
+#
+# Payload shape (one JSON object per `data:` line):
+#   {
+#     "pipeline":           {status, stage, chunk_idx, ...},   # pipeline.get_state()
+#     "plants_jobs":        {job_id: {...}, ...},
+#     "cluster_album_jobs": {job_id: {...}, ...},
+#     "kingdom_jobs":       {job_id: {...}, ...},
+#     "clustering_jobs":    {job_id: {...}, ...},
+#     "knn_build_jobs":     {job_id: {...}, ...},
+#     "backfill_exif_jobs": {job_id: {...}, ...},
+#     "logs":               {"lines": [...], "mtime": float},
+#   }
+# The per-registry REST endpoints (/api/album/.../job/{id},
+# /api/knn/build/job/{id}, /api/assets/backfill-exif/job/{id}) stay in
+# place so scripts and one-off curl calls still work.
+
+
+def _snapshot_jobs(
+    registry: dict, lock: threading.Lock
+) -> dict[str, dict]:
+    """Snapshot the {job_id: state} pairs of an in-memory job registry.
+    Caller-safe: takes the registry's lock and copies each entry so
+    the response is internally consistent even if the worker is mid-
+    update. Drops `finished_at` (monotonic clock; not meaningful over
+    the wire)."""
+    with lock:
+        out: dict[str, dict] = {}
+        for jid, j in registry.items():
+            s = dict(j)
+            s.pop("finished_at", None)
+            out[jid] = s
+        return out
+
+
+def _build_event_snapshot() -> dict:
+    """Assemble the full event payload. Each source takes its own short
+    lock; the worst-case time is bounded by the sum of the lock hold
+    times (microseconds). Safe to call from the SSE generator loop."""
+    return {
+        "pipeline": get_state(),
+        "plants_jobs": _snapshot_jobs(_plants_jobs, _plants_jobs_lock),
+        "cluster_album_jobs": _snapshot_jobs(
+            _cluster_album_jobs, _cluster_album_jobs_lock
+        ),
+        "kingdom_jobs": _snapshot_jobs(_kingdom_jobs, _kingdom_jobs_lock),
+        "clustering_jobs": _snapshot_jobs(
+            _clustering_jobs, _clustering_jobs_lock
+        ),
+        "knn_build_jobs": _snapshot_jobs(
+            _knn_build_jobs, _knn_build_jobs_lock
+        ),
+        "backfill_exif_jobs": _snapshot_jobs(
+            _backfill_exif_jobs, _backfill_exif_jobs_lock
+        ),
+    }
+
+
+# Cached tail of the pipeline log. The SSE generator refreshes this only
+# when the log file's mtime advances — saves re-reading + re-parsing 200
+# lines every 200ms when the pipeline is idle. (`read_recent_log_lines`
+# itself is cheap, but reading + JSON-encoding still costs when nothing
+# changed.)
+_log_tail_cache: list[str] = []
+_log_tail_mtime: float = 0.0
+
+
+def _snapshot_logs() -> dict:
+    """Tail the pipeline log file if its mtime has advanced. Returns the
+    same shape as /api/logs plus a `mtime` field so the client can
+    dedupe / know when the tail was last refreshed."""
+    global _log_tail_cache, _log_tail_mtime
+    # Attribute lookup (not bare `_log_file_path`) so we read the
+    # post-attach_log_file value rather than the import-time None.
+    path = pipeline._log_file_path
+    if path is not None and path.exists():
+        mt = path.stat().st_mtime
+        if mt != _log_tail_mtime:
+            _log_tail_cache = read_recent_log_lines(200)
+            _log_tail_mtime = mt
+    return {"lines": _log_tail_cache, "mtime": _log_tail_mtime}
+
+
+@app.get("/api/events")
+async def events_stream(request: Request) -> StreamingResponse:
+    """Server-Sent Events stream. Emits a JSON snapshot whenever any of:
+    pipeline state, any job registry, or the log file tail changes.
+    Sends an SSE comment (`: keepalive`) every 15s so HTTP proxies
+    don't drop an otherwise-quiet connection while idle.
+
+    `request.is_disconnected()` lets the generator loop exit cleanly
+    when the client closes the tab — no dangling coroutine."""
+
+    async def gen():
+        # Initial flush so a freshly-connected client doesn't wait up
+        # to 200ms before seeing the current state.
+        snap = _build_event_snapshot()
+        snap["logs"] = _snapshot_logs()
+        last_payload = json.dumps(snap, default=str)
+        yield f"data: {last_payload}\n\n"
+        last_keepalive = time.monotonic()
+
+        while True:
+            if await request.is_disconnected():
+                break
+            snap = _build_event_snapshot()
+            snap["logs"] = _snapshot_logs()
+            payload = json.dumps(snap, default=str)
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+                last_keepalive = time.monotonic()
+            else:
+                now = time.monotonic()
+                if now - last_keepalive > 15.0:
+                    yield ": keepalive\n\n"
+                    last_keepalive = now
+            await asyncio.sleep(0.2)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            # Tell nginx (and friends) not to buffer the stream — otherwise
+            # the client sees no events until the buffer fills or the
+            # proxy decides to flush.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/cache/invalidate")
+async def cache_invalidate(prefix: str = Query(default="all:")) -> dict:
+    """Drop entries from the in-process /api/results cache whose key starts
+    with `prefix`. External scripts that write to the DB directly
+    (e.g. scripts/person_apply_flips.py, scripts/person_classifier_backfill.py)
+    should POST here to bust the cache so the next /api/results call
+    re-reads from the DB. Without this, the running uvicorn worker
+    keeps serving the pre-update payload until it is restarted.
+    """
+    _invalidate_results_cache(prefix)
+    return {"invalidated_prefix": prefix}
 
 
 @app.get("/api/results")

@@ -1,8 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import {
-  pollPlantsAlbumJob,
-  pollKingdomAlbumJob,
-  pollClusterAlbumJob,
   pollPersonBackfillJob,
   previewPlantsAlbum,
   previewKingdomAlbum,
@@ -21,6 +18,8 @@ import type { PersonBackfillJobSnapshot } from '../api/endpoints';
 import type { JobSnapshot, PurgeMissingPreview, PurgeMissingResult } from '../api/types';
 import { ApiError } from '../api/client';
 import { useApp, useJob, type JobKind } from '../state/AppContext';
+import type { JobRegistryKey } from '../hooks/useJobStream';
+import { useJobStream } from '../hooks/useJobStream';
 import { useToasts } from './ToastProvider';
 
 interface JobConfig {
@@ -32,14 +31,23 @@ interface JobConfig {
   hasAlbumLink: boolean;
   // `true` for synchronous jobs (e.g. purge-missing) that complete in
   // a single round-trip — `start()` returns the final result and we
-  // dispatch JOB_DONE directly without entering the polling loop.
+  // dispatch JOB_DONE directly without entering the stream.
   isSync?: boolean;
+  // Registry key in the SSE snapshot where this job's progress lives.
+  // Null for sync jobs (no stream subscription needed). Also null for
+  // person-backfill, which runs in a child process that writes its
+  // status to a JSON file — the in-memory dict doesn't update on its
+  // own, so we keep the REST poll for that one.
+  registryKey: JobRegistryKey | null;
+  // Optional REST poll for jobs whose state doesn't flow through the
+  // in-memory registry (currently just person-backfill). When set,
+  // takes precedence over the SSE registry.
+  poll?: (jobId: string) => Promise<JobSnapshot>;
   preview: () => Promise<{ n_assets: number; sample?: PurgeMissingPreview['sample'] }>;
   // Sync jobs return their own result shape; async jobs return
   // {job_id: string} (or {job_id: null} for noop short-circuits, which
   // the start() handler in JobPanel recognizes).
   start: () => Promise<{ job_id: string | null } | PurgeMissingResult>;
-  poll: (jobId: string) => Promise<JobSnapshot>;
   extractProgress: (snap: JobSnapshot) => { added: number; total: number };
 }
 
@@ -52,9 +60,9 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added to Plantae album',
       hasPreview: true,
       hasAlbumLink: true,
+      registryKey: 'plants_jobs',
       preview: () => previewPlantsAlbum(),
       start: () => startPlantsAlbum({}),
-      poll: id => pollPlantsAlbumJob(id),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
     },
     fungi: {
@@ -64,9 +72,9 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added to Fungi album',
       hasPreview: true,
       hasAlbumLink: true,
+      registryKey: 'kingdom_jobs',
       preview: () => previewKingdomAlbum('Fungi'),
       start: () => startKingdomAlbum('Fungi', {}),
-      poll: id => pollKingdomAlbumJob(id),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
     },
     kingdom: {
@@ -76,9 +84,9 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added to kingdom album',
       hasPreview: true,
       hasAlbumLink: true,
+      registryKey: 'kingdom_jobs',
       preview: () => previewKingdomAlbum('Plantae'),
       start: () => startKingdomAlbum('Plantae', {}),
-      poll: id => pollKingdomAlbumJob(id),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
     },
     cluster: {
@@ -88,6 +96,7 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added to cluster album',
       hasPreview: true,
       hasAlbumLink: true,
+      registryKey: 'cluster_album_jobs',
       preview: () => {
         if (clusterId == null) return Promise.resolve({ n_assets: 0 });
         return previewClusterAlbum(clusterId);
@@ -96,7 +105,6 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
         if (clusterId == null) return Promise.reject(new Error('no cluster id'));
         return startClusterAlbumSync(clusterId);
       },
-      poll: id => pollClusterAlbumJob(id),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
     },
     'sync-all': {
@@ -106,9 +114,9 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added across all cluster albums',
       hasPreview: false,
       hasAlbumLink: false,
+      registryKey: 'cluster_album_jobs',
       preview: () => Promise.reject(new Error('no preview')),
       start: () => startSyncAllClusterAlbums(),
-      poll: id => pollClusterAlbumJob(id),
       extractProgress: snap => ({
         added: (snap.photos_added as number | undefined) ?? (snap.clusters_done as number | undefined) ?? 0,
         total: (snap.n_assets_total as number | undefined) ?? 0,
@@ -122,11 +130,11 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       hasPreview: true,
       hasAlbumLink: false,
       // Synchronous job — start() returns the final result directly,
-      // no polling, no progress bar.
+      // no stream, no progress bar.
       isSync: true,
+      registryKey: null,
       preview: () => previewPurgeMissing(),
       start: () => purgeMissing(),
-      poll: () => Promise.reject(new Error('not used for sync jobs')),
       extractProgress: () => ({ added: 0, total: 0 }),
     },
     // Standalone person-detection backfill — runs ONLY the YOLO
@@ -140,6 +148,12 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos scanned for person',
       hasPreview: true,
       hasAlbumLink: false,
+      // Multiprocess job — child writes status JSON, parent reads it
+      // via /api/person/backfill/job/{id}. In-memory dict doesn't get
+      // updated by the child, so the SSE stream wouldn't see progress.
+      // Falls through to the REST poll below.
+      registryKey: null,
+      poll: id => pollPersonBackfillJob(id) as unknown as Promise<JobSnapshot>,
       preview: () => previewPersonBackfill(),
       start: () => startPersonBackfill().then(r => {
         // Backend returns {noop: true, n_to_scan: 0, job_id: null}
@@ -151,10 +165,6 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
         }
         return { job_id: r.job_id };
       }),
-      // poll returns PersonBackfillJobSnapshot which is structurally
-      // compatible with JobSnapshot's [k: string]: unknown. Cast at
-      // the call site to keep the JobConfig generic.
-      poll: id => pollPersonBackfillJob(id) as unknown as Promise<JobSnapshot>,
       extractProgress: snap => {
         // Cast through unknown — PersonBackfillJobSnapshot is the
         // concrete shape returned by the poll endpoint; JobSnapshot
@@ -175,6 +185,28 @@ export function JobPanel() {
   const push = useToasts();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [pollError, setPollError] = useState<string>('');
+
+  // Resolve the active job's SSE registry key (or null if it should
+  // use REST polling / no polling). Held outside the useEffect so the
+  // hook order is stable across renders.
+  const activeCfg =
+    job.kind === 'idle'
+      ? null
+      : buildConfigs(job.payload.clusterId)[job.kind];
+  const sseRegistryKey: JobRegistryKey | null =
+    activeCfg && !activeCfg.isSync && !activeCfg.poll
+      ? activeCfg.registryKey
+      : null;
+  const sseJobId: string | null =
+    sseRegistryKey && job.kind !== 'idle' && job.jobId ? job.jobId : null;
+  // useJobStream always opens the EventSource (it's a hook, can't be
+  // conditional), but returns null until both key + jobId are set.
+  // We pass 'plants_jobs' as a dummy fallback that will never match
+  // since jobId is null in that case.
+  const { job: streamJob } = useJobStream<JobSnapshot>(
+    sseRegistryKey ?? 'plants_jobs',
+    sseJobId,
+  );
 
   // When the panel enters the confirm state, kick off the preview (if any).
   useEffect(() => {
@@ -200,7 +232,13 @@ export function JobPanel() {
     // the preview to re-fetch when that happens.
   }, [job, dispatch]);
 
-  // Poll the running job.
+  // Track the running job. Two paths:
+  //   - registryKey != null: subscribe to the SSE stream and react to
+  //     snapshots that include this jobId. Sub-second latency, no
+  //     network traffic when the snapshot hasn't changed.
+  //   - poll != null: fall back to a REST poll (currently only used
+  //     for person-backfill, which runs in a child process that writes
+  //     its status to a JSON file).
   useEffect(() => {
     if (job.kind === 'idle') return;
     const activeJob = job;
@@ -210,51 +248,98 @@ export function JobPanel() {
     if (cfg.isSync) return;
     const jobId = activeJob.jobId;
 
-    const loop = async () => {
-      try {
-        const snap = await cfg.poll(jobId);
-        setPollError('');
-        if (snap.status === 'running') {
-          const { added, total } = cfg.extractProgress(snap);
-          dispatch({ type: 'JOB_PROGRESS', added, total });
-          timerRef.current = setTimeout(loop, 400);
-          return;
+    // ---- REST poll branch (person-backfill) --------------------------
+    if (cfg.poll) {
+      const loop = async () => {
+        try {
+          const snap = await cfg.poll!(jobId);
+          setPollError('');
+          if (snap.status === 'running') {
+            const { added, total } = cfg.extractProgress(snap);
+            dispatch({ type: 'JOB_PROGRESS', added, total });
+            timerRef.current = setTimeout(loop, 400);
+            return;
+          }
+          if (snap.status === 'done') {
+            const { added } = cfg.extractProgress(snap);
+            dispatch({
+              type: 'JOB_DONE',
+              added,
+              album_id: (snap.album_id as string | null | undefined) ?? null,
+              album_url: (snap.album_url as string | null | undefined) ?? null,
+              reused: Boolean(snap.reused_existing),
+            });
+            push({
+              kind: 'success',
+              message: `Done — ${added.toLocaleString()} photos added`,
+            }, 4000);
+            return;
+          }
+          if (snap.status === 'error') {
+            dispatch({ type: 'JOB_ERROR', errorMsg: (snap.error as string | undefined) ?? 'unknown error' });
+            return;
+          }
+        } catch (e) {
+          if (e instanceof ApiError && e.status === 404) {
+            // Job aged out — treat as best-effort done.
+            dispatch({ type: 'JOB_HIDE' });
+            return;
+          }
+          const msg = e instanceof Error ? e.message : String(e);
+          setPollError(msg);
+          dispatch({ type: 'JOB_ERROR', errorMsg: msg });
         }
-        if (snap.status === 'done') {
-          const { added } = cfg.extractProgress(snap);
-          dispatch({
-            type: 'JOB_DONE',
-            added,
-            album_id: (snap.album_id as string | null | undefined) ?? null,
-            album_url: (snap.album_url as string | null | undefined) ?? null,
-            reused: Boolean(snap.reused_existing),
-          });
-          push({
-            kind: 'success',
-            message: `Done — ${added.toLocaleString()} photos added`,
-          }, 4000);
-          return;
-        }
-        if (snap.status === 'error') {
-          dispatch({ type: 'JOB_ERROR', errorMsg: (snap.error as string | undefined) ?? 'unknown error' });
-          return;
-        }
-      } catch (e) {
-        if (e instanceof ApiError && e.status === 404) {
-          // Job aged out — treat as best-effort done.
-          dispatch({ type: 'JOB_HIDE' });
-          return;
-        }
-        const msg = e instanceof Error ? e.message : String(e);
-        setPollError(msg);
-        dispatch({ type: 'JOB_ERROR', errorMsg: msg });
-      }
-    };
-    loop();
-    return () => {
-      if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-    };
+      };
+      loop();
+      return () => {
+        if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+      };
+    }
+
+    // ---- SSE branch (plants / kingdom / cluster / sync-all) -----------
+    // Handled by the streamJob-driven effect below — no imperative
+    // loop needed.
+    return undefined;
   }, [job, dispatch, push]);
+
+  // React to SSE snapshots for the running job. `streamJob` is the
+  // job's current state from the latest server-emitted snapshot; each
+  // new value means the server pushed an update.
+  useEffect(() => {
+    if (!streamJob) return;
+    const cfg = activeCfg;
+    if (!cfg) return;
+    // Don't re-dispatch once we've moved to a terminal state — the
+    // server keeps emitting snapshots of finished jobs (until TTL)
+    // and we don't want to clobber JOB_DONE with stale JOB_PROGRESS.
+    if (job.kind === 'idle' || job.state === 'done' || job.state === 'error') return;
+    setPollError('');
+    if (streamJob.status === 'done') {
+      const { added } = cfg.extractProgress(streamJob);
+      dispatch({
+        type: 'JOB_DONE',
+        added,
+        album_id: (streamJob.album_id as string | null | undefined) ?? null,
+        album_url: (streamJob.album_url as string | null | undefined) ?? null,
+        reused: Boolean(streamJob.reused_existing),
+      });
+      push({
+        kind: 'success',
+        message: `Done — ${added.toLocaleString()} photos added`,
+      }, 4000);
+      return;
+    }
+    if (streamJob.status === 'error') {
+      dispatch({
+        type: 'JOB_ERROR',
+        errorMsg: (streamJob.error as string | undefined) ?? 'unknown error',
+      });
+      return;
+    }
+    // status === 'running' (or any other in-progress state)
+    const { added, total } = cfg.extractProgress(streamJob);
+    dispatch({ type: 'JOB_PROGRESS', added, total });
+  }, [streamJob, activeCfg, job, dispatch, push]);
 
   if (job.kind === 'idle') return null;
   const active = job;

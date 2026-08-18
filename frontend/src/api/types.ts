@@ -191,7 +191,7 @@ export interface KnnBuildArgs {
   index_type?: string | null;
 }
 
-export interface KnnBuildJobSnapshot {
+export interface KnnBuildJobSnapshot extends JobSnapshot {
   job_id: string;
   status: 'running' | 'done' | 'error';
   started_at: string;
@@ -298,4 +298,22 @@ export interface RunParams {
   n_samples?: number | null;
   top_k?: number | null;
   batch_size?: number | null;
+}
+
+// SSE snapshot pushed by /api/events. One object per `data:` line,
+// emitted whenever ANY of pipeline status, a job registry, or the
+// log file tail changes. Replaces the 5 polling loops the UI used to
+// run (StatusPanel 1Hz, LogTail 2Hz, JobPanel 400ms, KnnBuildModal
+// 1Hz, BackfillExifModal 1Hz).
+export interface EventSnapshot {
+  pipeline: PipelineStatus;
+  plants_jobs: Record<string, JobSnapshot>;
+  cluster_album_jobs: Record<string, JobSnapshot>;
+  kingdom_jobs: Record<string, JobSnapshot>;
+  clustering_jobs: Record<string, JobSnapshot>;
+  knn_build_jobs: Record<string, JobSnapshot>;
+  backfill_exif_jobs: Record<string, JobSnapshot>;
+  // Log tail is included in the snapshot so LogTail can drop its own
+  // 2-second poll. `mtime` lets the client dedupe / know freshness.
+  logs: { lines: string[]; mtime: number };
 }

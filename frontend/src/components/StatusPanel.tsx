@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
-import { getStatus, stopPipeline } from '../api/endpoints';
-import type { PipelineStatus } from '../api/types';
-import { usePolling } from '../hooks/usePolling';
+import { stopPipeline } from '../api/endpoints';
+import type { EventSnapshot } from '../api/types';
+import { useEventStream } from '../hooks/useEventStream';
 import { fmtDuration } from '../lib/format';
 import { useToasts } from './ToastProvider';
 
@@ -21,7 +21,11 @@ interface Props {
 }
 
 export function StatusPanel({ compact = false }: Props = {}) {
-  const { data } = usePolling<PipelineStatus>(() => getStatus(), { intervalMs: 1000 });
+  // Subscribe to /api/events. The server only emits when state changes,
+  // so an idle pipeline produces zero events; while running we get
+  // ~200ms-cadence updates (cheaper + lower-latency than the old 1Hz
+  // poll, and it stops hammering the server when nothing's happening).
+  const { data } = useEventStream<EventSnapshot>('/api/events');
   const [stageTotals, setStageTotals] = useState<Record<string, number>>({});
   const prevStatusRef = useRef<string>('idle');
   const [stopping, setStopping] = useState(false);
@@ -47,16 +51,17 @@ export function StatusPanel({ compact = false }: Props = {}) {
   };
 
   useEffect(() => {
-    if (!data) return;
-    const cur = data.status || 'idle';
+    const pipeline = data?.pipeline;
+    if (!pipeline) return;
+    const cur = pipeline.status || 'idle';
     if (prevStatusRef.current !== 'idle' && cur !== 'running') {
       setStageTotals({});
     }
     prevStatusRef.current = cur;
-    if (data.stage_times) {
+    if (pipeline.stage_times) {
       setStageTotals(prev => {
         const next = { ...prev };
-        for (const [k, v] of Object.entries(data.stage_times)) {
+        for (const [k, v] of Object.entries(pipeline.stage_times)) {
           const v0 = next[k] || 0;
           next[k] = Math.max(v0, v);
         }
@@ -65,17 +70,18 @@ export function StatusPanel({ compact = false }: Props = {}) {
     }
   }, [data]);
 
-  const status = data?.status || 'idle';
-  const stage = data?.stage || '';
+  const pipeline = data?.pipeline;
+  const status = pipeline?.status || 'idle';
+  const stage = pipeline?.stage || '';
   const badgeText = stage ? `${status} · ${stage}` : status;
   const etaParts: string[] = [];
-  if (data?.rate != null) etaParts.push(`${data.rate.toFixed(1)}/s`);
-  if (data?.eta_seconds != null) etaParts.push(`~${Math.ceil(data.eta_seconds)}s left`);
+  if (pipeline?.rate != null) etaParts.push(`${pipeline.rate.toFixed(1)}/s`);
+  if (pipeline?.eta_seconds != null) etaParts.push(`~${Math.ceil(pipeline.eta_seconds)}s left`);
 
   const projected: Record<string, number> = { ...stageTotals };
-  if (data && data.status === 'running' && data.stage && data.stage_t0) {
-    const elapsed = Math.max(0, Date.now() / 1000 - data.stage_t0);
-    projected[data.stage] = (projected[data.stage] || 0) + elapsed;
+  if (pipeline && pipeline.status === 'running' && pipeline.stage && pipeline.stage_t0) {
+    const elapsed = Math.max(0, Date.now() / 1000 - pipeline.stage_t0);
+    projected[pipeline.stage] = (projected[pipeline.stage] || 0) + elapsed;
   }
   const totalDur = Object.values(projected).reduce((a, b) => a + b, 0);
   const bars = totalDur > 0
@@ -103,10 +109,10 @@ export function StatusPanel({ compact = false }: Props = {}) {
       <progress
         className="hidden"
         style={{ display: status === 'running' ? 'block' : 'none', width: '200px', flexShrink: 0, height: '6px' }}
-        value={data?.chunk_idx || 0}
-        max={data?.chunk_total || 1}
+        value={pipeline?.chunk_idx || 0}
+        max={pipeline?.chunk_total || 1}
       />
-      <small className="text-fg-1" style={{ display: data?.eta_seconds != null ? 'inline' : 'none' }}>
+      <small className="text-fg-1" style={{ display: pipeline?.eta_seconds != null ? 'inline' : 'none' }}>
         {etaParts.join(' · ')}
       </small>
       {bars.length > 0 && (

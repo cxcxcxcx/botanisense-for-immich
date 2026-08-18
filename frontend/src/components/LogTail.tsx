@@ -1,30 +1,26 @@
 import { useEffect, useRef, useState } from 'react';
-import { getLogs } from '../api/endpoints';
+import type { EventSnapshot } from '../api/types';
+import { useEventStream } from '../hooks/useEventStream';
 
 interface Props {
-  /** When true (modal open) the polling interval runs; when false it
-   *  cleans up. Same UX as the old <details> toggle but the visibility
-   *  comes from the modal lifecycle rather than a local <details> open. */
+  /** When true (modal open) the stream is consumed; when false the
+   *  log view freezes at its last-rendered lines (and the connection
+   *  is dropped on unmount, courtesy of useEventStream). */
   active: boolean;
 }
 
 export function LogTail({ active }: Props) {
+  // The log tail ships in /api/events under `logs.lines`. The server
+  // pushes a fresh tail only when the log file's mtime changes, so
+  // this hook pays zero cost when nothing is being logged.
+  const { data } = useEventStream<EventSnapshot>('/api/events');
   const [lines, setLines] = useState<string[]>([]);
   const preRef = useRef<HTMLPreElement>(null);
 
   useEffect(() => {
-    if (!active) return;
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const j = await getLogs(200);
-        if (!cancelled) setLines(j.lines);
-      } catch { /* transient */ }
-    };
-    tick();
-    const t = setInterval(tick, 2000);
-    return () => { cancelled = true; clearInterval(t); };
-  }, [active]);
+    if (!active || !data?.logs) return;
+    setLines(data.logs.lines);
+  }, [data, active]);
 
   // Auto-scroll only if user is already at the bottom.
   useEffect(() => {

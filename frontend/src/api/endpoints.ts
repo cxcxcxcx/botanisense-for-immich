@@ -106,9 +106,6 @@ export const previewPlantsAlbum = (min_score?: number) =>
 export const startPlantsAlbum = (p: { min_score?: number; force_recreate?: boolean }) =>
   fetchJson<JobStart>('/api/album/plants', { method: 'POST', body: p });
 
-export const pollPlantsAlbumJob = (job_id: string) =>
-  fetchJson<JobSnapshot>(`/api/album/plants/job/${job_id}`);
-
 export const previewKingdomAlbum = (kingdom: string, min_score?: number) =>
   fetchJson<JobPreview>('/api/album/kingdom/preview', { query: { kingdom, min_score } });
 
@@ -117,9 +114,6 @@ export const startKingdomAlbum = (
   p: { min_score?: number; force_recreate?: boolean },
 ) =>
   fetchJson<JobStart>('/api/album/kingdom', { method: 'POST', body: { kingdom, ...p } });
-
-export const pollKingdomAlbumJob = (job_id: string) =>
-  fetchJson<JobSnapshot>(`/api/album/kingdom/job/${job_id}`);
 
 // ---- Cluster album jobs (per-cluster + sync-all) -----------------------
 
@@ -131,9 +125,6 @@ export const startClusterAlbumSync = (cluster_id: number, force_recreate = false
     method: 'POST',
     body: { force_recreate },
   });
-
-export const pollClusterAlbumJob = (job_id: string) =>
-  fetchJson<JobSnapshot>(`/api/album/cluster/job/${job_id}`);
 
 export const startSyncAllClusterAlbums = (force_recreate = false) =>
   fetchJson<JobStart>('/api/album/cluster/sync-all', {
@@ -185,7 +176,7 @@ export const purgeMissing = () =>
 // each new asset; this is for rows that existed before EXIF capture
 // was added.
 
-export interface BackfillExifJobSnapshot {
+export interface BackfillExifJobSnapshot extends JobSnapshot {
   job_id: string;
   status: 'running' | 'done' | 'error';
   started_at: string;
@@ -206,9 +197,6 @@ export const startBackfillExif = () =>
   fetchJson<{ job_id: string }>('/api/assets/backfill-exif', {
     method: 'POST',
   });
-
-export const pollBackfillExifJob = (job_id: string) =>
-  fetchJson<BackfillExifJobSnapshot>(`/api/assets/backfill-exif/job/${job_id}`);
 
 export const getBackfillExifLogs = (job_id: string, tail = 80) =>
   fetchJson<BackfillExifLogsResponse>('/api/assets/backfill-exif/logs', {
@@ -288,9 +276,6 @@ export const startKnnBuild = (args: KnnBuildArgs) =>
     method: 'POST',
     body: args,
   });
-
-export const pollKnnBuildJob = (job_id: string) =>
-  fetchJson<KnnBuildJobSnapshot>(`/api/knn/build/job/${job_id}`);
 
 export const getKnnBuildLogs = (job_id: string, tail = 50) =>
   fetchJson<KnnBuildLogsResponse>('/api/knn/build/logs', {
