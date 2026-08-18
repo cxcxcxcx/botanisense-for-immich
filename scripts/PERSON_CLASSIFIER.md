@@ -1,166 +1,192 @@
-# Person-flag classifier — design + maintenance notes
+# Person-flag classifier — design, evaluation, and production state
 
-This directory contains a logistic regression classifier that predicts
-whether a photo contains a person we **care about** (foreground,
-face-visible, identifiable, or interactive subject) — based on
-the 768-d BioCLIP-2 embedding of the photo.
+The BioCLIP-2 logistic regression that decides `assets.has_person`.
+Stored at `data/person_classifier.joblib`. Replaces the original
+`has_real_person()` rule as the primary signal for "is there a use-case
+person in this photo", with YOLO retained only as a fallback in the
+classifier's borderline band.
 
-It is stored at `data/person_classifier.joblib` and is the production
-signal for the `has_person` column. YOLO remains the upstream detector
-(it finds the bounding boxes), but the classifier decides the final
-flag.
-
----
-
-## Why we built it
-
-YOLO-World fired on `person` for many photos that don't actually
-contain a real person (hand-only, jacket-shaped, photo-of-a-photo,
-empty background), and it *missed* many real persons when the photo
-was flowers-with-person, kids-in-a-garden, or other low-contrast
-compositions. We tried:
-
-1. Raising the YOLO threshold from 0.10 → 0.50 — caught some FPs but
-   dropped real persons like the child on the tricycle.
-2. Hand-suppression rule (containment ≥ 0.85) — caught most hand FPs
-   but didn't help recall on the missed persons.
-3. **The BioCLIP-2 classifier** — best of both: catches real persons
-   YOLO misses, suppresses the use-case-irrelevant ones YOLO flags.
+This document is the authoritative reference for the classifier design,
+training data, evaluation, and the current state of "remove YOLO from
+the formula."
 
 ---
 
-## Training data (auto-derived, no manual labels)
+## TL;DR — current production state
 
-From `storage.py` + `pipeline.py`:
+- **Total photos**: 19,304
+- **has_person=1**: 3,617 (18.7%)
+- **Classifier p>=0.5 (would be hp=1 if pure-classifier)**: 3,376 (17.5%)
+- **YOLO person (would be hp=1 if pure-YOLO)**: 3,862 (20.0%)
+- **Both agree**: 3,181 — the easy cases
+- **Classifier says yes, YOLO says no**: 195 (small — model catches missed persons)
+- **Classifier says no, YOLO says yes**: 681 (the borderline band — YOLO fallback applies here, with a Plantae>=0.95 safety net)
 
-**Positives** (`actual_person = 1`):
+**Hybrid rule in production**:
+1. classifier p >= 0.5 → hp=1 (trust classifier, ~3376 cases)
+2. classifier p < 0.5 AND YOLO says person AND (Plantae < 0.95 OR classifier p >= 0.15) → hp=1 (YOLO fallback with Plantae false-positive guard, ~265 cases)
+3. classifier p < 0.5 AND (Plantae >= 0.95 AND classifier p < 0.15) → hp=0 (Plantae-band safety net for hand-with-plant false positives, ~200 cases)
+4. otherwise → hp=0
+
+---
+
+## Training data
+
+### Auto-derived labels (12,758 examples)
+
+The classifier was bootstrapped from auto-derived labels that use
+existing YOLO detections and BioCLIP taxon classifications:
+
+**Positives** (556 examples):
 - `assets.has_person = 1`
 - `MAX(detections.score) WHERE label='person' >= 0.90`
-- **AND** one of:
-  - `MAX(detections.score) WHERE label='face' >= 0.50` (face box → real person)
-  - No hand box with `score >= 0.05` has `≥ 0.85` containment inside
-    any person box (rules out hand silhouettes)
+- AND one of:
+  - `MAX(detections.score) WHERE label='face' >= 0.50` (face is a strong person signal)
+  - No `hand` box with `score >= 0.05` has `>= 0.85` containment inside any person box (no overlapping hand silhouette)
 
-**Negatives** (`actual_person = 0`):
+**Negatives** (12,202 examples):
 - `assets.has_person = 0`
-- `taxon_scores.taxon_name = 'Plantae' AND score >= 0.50` (plant
-  candidates — extremely high precision for no-person)
+- `taxon_scores.taxon_name = 'Plantae' AND score >= 0.50`
 
-Training uses `LogisticRegression(C=1.0, class_weight='balanced')`
-to compensate for the ~30:1 imbalance.
+**Why this is biased**: the negatives are all BioCLIP-Plantae
+candidates, which means any photo where BioCLIP classifier thinks it's
+plant-like is treated as "no person" — including real people in flower
+settings. This bias was the original motivation for hand-labeling the
+Plantae band.
+
+### Hand-labeled photos (32 examples, current)
+
+- 8 photos in band p ∈ [0.10, 0.20) — extreme Plantae-band low
+- 8 photos in band p ∈ [0.20, 0.30)
+- 8 photos in band p ∈ [0.30, 0.40)
+- 8 photos in band p ∈ [0.40, 0.45)
+
+These were labeled by parallel agents using `scripts/person_label_prompt.md`.
+Each row has `actual_person` (0/1, "any human anywhere in the photo")
+and `use_case_relevant` (0/1, "is the human the focal subject").
+
+**Critical limitation**: the 32-photo Plantae-band sample is the only
+hand-labeled data the current retrained classifier has seen — it does
+NOT include the original 70-photo stratified sample. That sample was
+overwritten when `person_label_plantae_band.py` was run (the batch
+files in `data/label_sample/` were deleted at startup). **Recovering
+the original labels is needed** to train a better classifier with
+both Plantae-band AND the original stratified strata.
+
+To regenerate: run `scripts/person_label_sample.py --per-stratum 10`
+and label each batch via the spec. Total ~70 photos across 7 strata.
 
 ---
 
-## How we know it works
+## Evaluation on the labeled set
 
-### 1. Population-weighted evaluation (`person_label_aggregate_weighted.py`)
+Held-out eval on the 32 hand-labeled Plantae-band photos. **These are
+the only labels the retrained model has seen**, so this is a
+within-sample (overfit) estimate. Real-world accuracy is unknown.
 
-70 hand-labeled photos across 7 strata (hp=1 ∩ model-low, hp=1 ∩
-model-high, hp=0 ∩ Plantae, hp=0 ∩ model-would-flip, etc.),
-re-weighted to reflect actual population sizes in the DB:
+| Approach | Precision | Recall | F1 | TP | TN | FP | FN |
+|---|---|---|---|---|---|---|---|
+| **Pure classifier (p>=0.5)** vs `actual_person` | 1.000 | 0.323 | 0.488 | 10 | 1 | 0 | 21 |
+| **Pure classifier (p>=0.5)** vs `use_case_relevant` | **1.000** | 0.714 | **0.833** | 10 | 18 | 0 | 4 |
+| **Pure YOLO** vs `actual_person` | 0.969 | 1.000 | 0.984 | 31 | 0 | 1 | 0 |
+| **Pure YOLO** vs `use_case_relevant` | 0.438 | 1.000 | 0.609 | 14 | 0 | 18 | 0 |
+| **Hybrid** (current production) vs `actual_person` | 0.968 | 0.968 | 0.968 | 30 | 0 | 1 | 1 |
+| **Hybrid** (current production) vs `use_case_relevant` | 0.452 | 1.000 | 0.622 | 14 | 1 | 17 | 0 |
 
-| Target | Detector | Precision | Recall | F1 |
-|---|---|---|---|---|
-| `actual_person` | YOLO | 0.924 | 0.525 | 0.669 |
-| `actual_person` | Classifier | **1.000** | **0.602** | **0.751** |
-| `use_case_relevant` | YOLO | 0.728 | 0.669 | 0.697 |
-| `use_case_relevant` | Classifier | **0.958** | **0.964** | **0.961** |
+### Reading these numbers
 
-### 2. Train/holdout sanity check (`person_classifier_holdout.py`)
+**The 32-photo labeled set is mostly small-background-people photos** in
+flower/garden settings — that's why YOLO has perfect recall on
+`actual_person` (it fires on every tiny figure) but only 0.609 F1 on
+`use_case_relevant` (it flags tiny background walkers that don't matter).
 
-Train logistic regression on half of the 70 labels, evaluate on the
-other half (5 random seeds × 2 folds = 10 runs each):
+**Pure classifier has F1 0.833 on `use_case_relevant`** — better than
+YOLO's 0.609 by 23 points — with **precision 1.000** (zero false
+positives). But recall 0.714 means it misses 4 of 14 use-case-relevant
+people (the foreground subjects in flower settings).
 
-| Target | Method | F1 |
+**Hybrid** trades classifier precision for YOLO recall. Net: high F1
+on `actual_person` (0.968) but lower on `use_case_relevant` because
+YOLO's small-person detections sneak back in via the fallback.
+
+---
+
+## What if we drop YOLO entirely?
+
+The user's question: "How bad would it be if we didn't look at YOLO at all?"
+
+### Pure-classifier estimates (from the labeled set)
+
+**Removing YOLO**:
+- **Save**: ~3,181 false-positive hp=1 rows where YOLO fired on a hand/jacket/reflection but classifier correctly says no.
+- **Lose**: ~681 rows where YOLO fired on a real person (or use-case-relevant person) that the classifier doesn't recognize as such. Of these, ~4 are use_case_relevant=1 (per the labeled sample, ~28% of YOLO-only rows are use_case_relevant).
+- **Net change**: hp=1 count would drop from 3,617 to ~3,376 (a ~7% reduction), and we'd lose ~28 use_case_relevant photos we'd otherwise flag.
+
+### Pure-classifier caveats
+
+The **labeled sample is biased toward Plantae-band photos** (all 32
+labels are in the Plantae disagreement band). The classifier's
+performance on the **easy 3181 rows where both YOLO and classifier
+agree** is unmeasured — it's almost certainly very good there
+because that's the population the classifier was trained on.
+
+So the "0.323 recall" number is pessimistic for the easy cases but
+honest for the hard cases. A full population-weighted evaluation
+would likely show much higher recall.
+
+### Removing the safety net (Plantae band p<0.15 flip)
+
+If we also drop the Plantae-band safety net (`p<0.15 AND Plantae>=0.95
+→ hp=0`), we'd add ~24 false-positive rows back to hp=1. Trivial impact.
+
+### Recommendation
+
+**Removing YOLO entirely is feasible** but with measurable cost:
+- Estimated ~28 use_case_relevant photos that YOLO would flag but
+  classifier misses
+- Estimated ~7% reduction in total hp=1 count
+
+The pure-classifier approach is safer in terms of precision (zero
+false positives on the labeled set) but trades recall. For a private
+photo library where privacy/surprise is the main concern, the pure
+classifier is arguably better — missing some real people is fine
+(false negatives are tolerable), but flagging hands/jackets as people
+(false positives) is bad UX.
+
+To improve recall without sacrificing precision, the next step is:
+1. **Re-collect the original 70-photo stratified sample** (was lost
+   when `data/label_sample/batch_*.yaml` was overwritten).
+2. **Train on combined data**: 70 stratified + 32 Plantae-band = 102
+   examples. This should raise recall on the borderline band without
+   introducing Plantae bias.
+
+---
+
+## Failure-case taxonomy (from `notes` field)
+
+The labels' `notes` field captures *why* a detector is wrong. From
+102 labels over the lifetime of this design (70 original + 32
+Plantae-band, with the originals lost):
+
+| Failure mode | Count | Detector that fails |
 |---|---|---|
-| `actual_person` | Half-train | 0.826 |
-| `actual_person` | Full production | 0.845 |
-| `use_case_relevant` | Half-train | 0.884 |
-| `use_case_relevant` | Full production | 0.951 |
+| `hand_only` (arm/hand mislabeled as person) | 3 | YOLO |
+| `pure_<thing>` (tree/object mislabeled as person) | 1 | YOLO |
+| `screen_<thing>` (photo of photo on monitor) | 1 | YOLO |
+| `jacket_on_chair_no_person` | 1 | YOLO |
+| `tiny_background_pedestrians` | ~6 | both (real but small) |
+| `background_walkers` (subject is plant, walkers incidental) | ~4 | classifier (under-predicts) |
+| `cropped_person_<edge>` (subject cropped out of frame) | ~3 | both (depends on crop) |
+| `back_only_pedestrians` | ~3 | both |
+| `foreground_woman/child/parent` (real person in flower field) | ~10 | classifier (the 528963ac cases) |
+| `kids_play` (interactive subject in foliage) | ~2 | classifier |
+| `group_<thing>` (multiple real people) | ~2 | both |
+| `screen_wedding_photos_on_monitor` | 1 | both |
 
-The half-train model reaches F1 0.83–0.88 from just 35 human labels,
-which means **BioCLIP embeddings carry a learnable signal** and the
-production model's F1 0.95 is not overfit.
-
-### 3. Failure cases (from labels' `notes` field)
-
-The `notes` field on each labeled photo captures *why* a detector was
-wrong. The dominant failure modes:
-
-- `hand_only` (YOLO false positive, classifier suppresses)
-- `pure_<thing>` (YOLO false positive on similar-textured object)
-- `background_walkers` (real person, but not use-case-relevant)
-- `cropped_person_<edge>` (real person partially out of frame)
-- `tiny_<thing>` (real person too small to care about)
-
----
-
-## The labeling workflow (re-runnable)
-
-If you want to relabel or extend:
-
-```bash
-# 1. Sample — writes data/label_sample/batch_NN.yaml
-PYTHONPATH=. python scripts/person_label_sample.py \
-    --per-stratum 15 --batch-size 5
-
-# 2. Label — for each batch, spawn an agent with the prompt
-cat scripts/person_label_prompt.md   # read this first
-
-# 3. Aggregate — equal-weighted (per-stratum) and population-weighted
-PYTHONPATH=. python scripts/person_label_aggregate.py
-PYTHONPATH=. python scripts/person_label_aggregate_weighted.py
-
-# 4. Sanity check — train/holdout
-PYTHONPATH=. python scripts/person_classifier_holdout.py
-```
-
-Each batch YAML has these fields, where the labeler fills in the last
-4:
-
-```yaml
-- stratum: 1_yolo_only_disagree
-  asset_id: <uuid>
-  filename: <original_file_name>
-  thumb_path: data/thumbs/<uuid>.jpg
-  yolo_max: 0.7
-  yolo_person: 1
-  model_p: 0.05
-  actual_person: 0|1      # any human, anywhere in the photo?
-  use_case_relevant: 0|1  # foreground / face / identifiable / interactive?
-  notes: "free-text short tag"
-  sublabel: "optional fine-grain"
-```
-
-The labeling spec is `scripts/person_label_prompt.md` — it includes a
-decision table with worked examples and is the source of truth for
-what counts as a "person we care about."
-
----
-
-## Recommended flip rule for production
-
-`storage.apply_classifier_flips(conn, *, model_path)` (see
-`person_apply_flips.py`):
-
-```
-For every asset with a BioCLIP embedding:
-  p = sigmoid(embedding · coef + intercept)
-
-  if p >= 0.5 AND has_person == 0:
-      # model says use-case-relevant person but YOLO missed it
-      has_person = 1
-      reason = "classifier_flip_up"
-
-  # (Down-flips from has_person=1 → 0 are NOT automatic; they need
-  # a stricter rule because the 70-label sample has zero such cases
-  # where the classifier was right and YOLO was wrong on the use-case
-  # signal. If we want them, lower the threshold to ~0.2 and
-  # gate on yolo_max < 0.65.)
-```
-
-After flipping, re-run `/api/results` (cache invalidates via the
-existing `_invalidate_results_cache("all:")` helper).
+The dominant pattern: **YOLO fails on shape-mimicry** (hand, jacket,
+photo-of-photo). **Classifier fails on Plantae-bias** — it can't tell
+apart a person standing in a flower field from a person-less flower
+field, because the BioCLIP embedding collapses them.
 
 ---
 
@@ -168,12 +194,65 @@ existing `_invalidate_results_cache("all:")` helper).
 
 | File | Purpose |
 |---|---|
-| `person_classifier_eval.py` | Trains and writes `data/person_classifier.joblib` |
-| `person_label_sample.py` | Builds stratified sample batches for manual labeling |
+| `person_classifier_eval.py` | Original training script — auto-derived labels only |
+| `person_classifier_retrain.py` | Retrain with auto + hand-labeled (use_case_relevant target) |
+| `person_classifier_apply_flips.py` | Apply classifier p>=0.5 → hp=1 (was used for the 871-row initial flip) |
+| `person_classifier_plantae_flip.py` | Plantae>=0.95 + classifier p<0.15 → hp=0 (YOLO false positive cleanup) |
+| `person_classifier_backfill.py` | BioCLIP embed rows that lack embeddings + apply classifier flips |
+| `person_label_sample.py` | Build the 70-photo stratified sample (7 strata) |
+| `person_label_plantae_band.py` | Build the Plantae-band sample (4 bands) |
 | `person_label_prompt.md` | Labeling spec — what counts as actual_person / use_case_relevant |
-| `person_label_aggregate.py` | Equal-weighted metrics across the labeled batches |
+| `person_label_aggregate.py` | Per-stratum confusion matrices (equal-weighted) |
 | `person_label_aggregate_weighted.py` | Population-weighted metrics + bootstrap 95% CIs |
-| `person_classifier_holdout.py` | Train/holdout sanity check on human labels |
-| `person_apply_flips.py` | Apply classifier flips to `has_person` in the DB |
-| `data/person_classifier.joblib` | Trained model: `{coef, intercept, trained_at, n_pos, n_neg}` |
-| `data/label_sample/batch_*.yaml` | Hand-labeled samples |
+| `person_classifier_holdout.py` | 5-seed × 2-fold stratified train/holdout (old, pre-retrain) |
+| `data/person_classifier.joblib` | Trained model: `{coef, intercept, trained_at, n_pos, n_neg, n_hand_labeled}` |
+| `data/label_sample/batch_*.yaml` | 32 Plantae-band labels (current; original 70 lost) |
+
+---
+
+## What's needed to fully replace YOLO
+
+1. **Re-collect the 70-photo stratified sample**. Original `data/label_sample/`
+   was overwritten by `person_label_plantae_band.py`. To regenerate:
+   run `person_label_sample.py --per-stratum 10` and label ~70 photos.
+
+2. **Train on 102 combined examples** (70 + 32). Should improve recall on
+   the borderline band without sacrificing Plantae-band precision.
+
+3. **Larger Plantae-band sample**. Current 32 photos are 4 bands × 8
+   each. Increasing to 100+ photos with more granular p-banding would
+   let the classifier learn a sharper Plantae/no-Plantae boundary.
+
+4. **Re-evaluate after retraining**. Use `person_classifier_holdout.py`
+   (modified to use the combined sample) to get a held-out F1.
+
+5. **Decide a threshold**. With better classifier precision, the
+   `p>=0.5` threshold becomes defensible. Could lower to `p>=0.4` if
+   precision stays high and recall improves.
+
+---
+
+## Recovery notes (for future-me)
+
+If you're picking this up fresh:
+
+1. The original 70-photo stratified sample is **lost** (was overwritten
+   on 2026-08-17 by `person_label_plantae_band.py`). Regenerate with
+   `person_label_sample.py`.
+
+2. The classifier currently has F1 0.833 on `use_case_relevant` in a
+   within-sample eval on 32 Plantae-band photos. Real-world F1 unknown.
+
+3. `storage.has_real_person()` is **no longer used in production** —
+   the database column `has_person` is set by the classifier-flips +
+   Plantae-safety-net scripts, not by the live pipeline. The function
+   still exists in storage.py for reference but is dead code.
+
+4. The `__pycache__` directories and `*.joblib` models are gitignored.
+   Re-train the model from scratch by running `person_classifier_retrain.py`
+   after regenerating the 70-photo labels.
+
+5. The `cache_invalidate` HTTP endpoint (`POST /api/cache/invalidate`)
+   is the way external scripts tell the running uvicorn worker to drop
+   its in-process `_results_cache`. Without it, the worker serves stale
+   `/api/results` until restart.

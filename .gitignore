@@ -10,6 +10,10 @@ weights/
 yolov8s-world.pt
 lock_wal.db
 
+# But the hand-labeled photo batches are source-code-like data we want
+# to keep reproducible. Force-track just this directory.
+!data/label_sample/
+
 # Secrets / local config
 .env
 
