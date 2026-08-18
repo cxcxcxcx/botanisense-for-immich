@@ -370,20 +370,25 @@ async def list_runs() -> dict:
 
 @app.get("/api/clusters")
 async def clusters_endpoint() -> dict:
-    with storage.connect(DB_PATH) as conn:
-        rows = storage.cluster_summary(conn)
-        # Augment each cluster with a human-readable name computed from
-        # its top-1 prediction distribution (see storage.compute_cluster_names).
-        # ensure_cluster_names() lazily computes & caches the names on
-        # the first call, then reuses them until invalidate_cluster_names().
-        names = storage.ensure_cluster_names(conn)
-        for r in rows:
-            cid = r["cluster_id"]
-            info = names.get(cid, {})
-            r["name"] = info.get("name", "")
-            r["top_species"] = info.get("top_species", [])[:2]
-            r["top_genus"] = info.get("top_genus", [])[:2]
-        return {"clusters": rows}
+    # cluster_summary + ensure_cluster_names can take ~100-500ms once
+    # the name cache is cold (walks every prediction). Offload so the
+    # event loop stays free for the SSE generator.
+    def _build():
+        with storage.connect(DB_PATH) as conn:
+            rows = storage.cluster_summary(conn)
+            # Augment each cluster with a human-readable name computed from
+            # its top-1 prediction distribution (see storage.compute_cluster_names).
+            # ensure_cluster_names() lazily computes & caches the names on
+            # the first call, then reuses them until invalidate_cluster_names().
+            names = storage.ensure_cluster_names(conn)
+            for r in rows:
+                cid = r["cluster_id"]
+                info = names.get(cid, {})
+                r["name"] = info.get("name", "")
+                r["top_species"] = info.get("top_species", [])[:2]
+                r["top_genus"] = info.get("top_genus", [])[:2]
+            return {"clusters": rows}
+    return await asyncio.to_thread(_build)
 
 
 @app.post("/api/clusters/recompute")
@@ -514,20 +519,41 @@ async def events_stream(request: Request) -> StreamingResponse:
     when the client closes the tab — no dangling coroutine."""
 
     async def gen():
-        # Initial flush so a freshly-connected client doesn't wait up
-        # to 200ms before seeing the current state.
-        snap = _build_event_snapshot()
-        snap["logs"] = _snapshot_logs()
-        last_payload = json.dumps(snap, default=str)
+        # Wrap the snapshot build so a single bad source (e.g. a typo
+        # in a registry lock name — happened once during the SSE
+        # rollout) doesn't hang the entire stream. We log + emit an
+        # error event so the client at least sees something instead
+        # of an empty body that closes after timeout.
+        import logging as _logging
+        _log = _logging.getLogger(__name__)
+
+        def build_payload() -> str:
+            snap = _build_event_snapshot()
+            snap["logs"] = _snapshot_logs()
+            return json.dumps(snap, default=str)
+
+        try:
+            last_payload = build_payload()
+        except Exception as e:
+            _log.exception("[events] initial snapshot failed")
+            err = json.dumps({"error": f"{type(e).__name__}: {e}"})
+            yield f"data: {err}\n\n"
+            return
         yield f"data: {last_payload}\n\n"
         last_keepalive = time.monotonic()
 
         while True:
             if await request.is_disconnected():
                 break
-            snap = _build_event_snapshot()
-            snap["logs"] = _snapshot_logs()
-            payload = json.dumps(snap, default=str)
+            try:
+                payload = build_payload()
+            except Exception as e:
+                # Don't kill the stream on a transient snapshot error
+                # — log + skip this tick so the next change still
+                # reaches the client.
+                _log.exception("[events] snapshot build failed")
+                await asyncio.sleep(0.5)
+                continue
             if payload != last_payload:
                 yield f"data: {payload}\n\n"
                 last_payload = payload
@@ -618,60 +644,69 @@ async def get_results(
             }
             return payload
 
-    # Cache miss → build from SQLite.
-    with storage.connect(DB_PATH) as conn:
-        results, total = storage.get_all_results(
-            conn,
-            page=0,
-            page_size=10_000_000,  # fetch all matching, slice in memory
-            cluster_id=cluster_id,
-            species=species,
-            genus=genus,
-            family=family,
-            has_person=has_person,
-        )
-        taxonomy = storage.get_global_taxonomy_summary(conn)
-        if total == 0:
-            return {"error": "no assets match this filter", "results": []}
-        # Server-side time sort. Without this, the client-side sortRows()
-        # would only re-order the page slice the server already picked by
-        # rank — recent photos with low Immich rank never appear. Split +
-        # sort-with-reverse + concat puts NULLs last without a custom
-        # comparator; ISO 8601 strings sort chronologically
-        # lexicographically.
-        if sort == "time":
-            with_ts = [r for r in results if r.get("captured_at")]
-            without_ts = [r for r in results if not r.get("captured_at")]
-            with_ts.sort(key=lambda r: r["captured_at"], reverse=True)
-            results = with_ts + without_ts
-        elif sort == "added":
-            # "added ↓" — newest first_seen_at first. first_seen_at is
-            # set by `DEFAULT (datetime('now'))` on the initial INSERT
-            # and is never overwritten by upsert, so it's the most
-            # recently *ingested* asset. NULLs sort last (shouldn't
-            # happen given the schema, but defensive).
-            with_ts = [r for r in results if r.get("first_seen_at")]
-            without_ts = [r for r in results if not r.get("first_seen_at")]
-            with_ts.sort(key=lambda r: r["first_seen_at"], reverse=True)
-            results = with_ts + without_ts
-        start = page * page_size
-        end = start + page_size
-        page_results = results[start:end]
-        payload = _serialize_global(
-            page_results,
-            pagination={
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-                "total_pages": (total + page_size - 1) // page_size if total else 0,
-            },
-            taxonomy=taxonomy,
-        )
-    with _results_lock:
-        # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
-        full_payload = dict(payload)
-        full_payload["results"] = results
-        _results_cache[cache_key] = full_payload
+    # Cache miss → build from SQLite. The query asks for ALL matching
+    # rows (page_size=10M) so we can sort/filter in Python once, then
+    # slice per-page. For a 19k-row DB this is ~500ms of sync work —
+    # offload so the event loop can keep ticking the SSE generator and
+    # serve other requests in parallel.
+    def _build():
+        with storage.connect(DB_PATH) as conn:
+            results, total = storage.get_all_results(
+                conn,
+                page=0,
+                page_size=10_000_000,  # fetch all matching, slice in memory
+                cluster_id=cluster_id,
+                species=species,
+                genus=genus,
+                family=family,
+                has_person=has_person,
+            )
+            taxonomy = storage.get_global_taxonomy_summary(conn)
+            if total == 0:
+                return {"error": "no assets match this filter", "results": []}, results
+            # Server-side time sort. Without this, the client-side sortRows()
+            # would only re-order the page slice the server already picked by
+            # rank — recent photos with low Immich rank never appear. Split +
+            # sort-with-reverse + concat puts NULLs last without a custom
+            # comparator; ISO 8601 strings sort chronologically
+            # lexicographically.
+            if sort == "time":
+                with_ts = [r for r in results if r.get("captured_at")]
+                without_ts = [r for r in results if not r.get("captured_at")]
+                with_ts.sort(key=lambda r: r["captured_at"], reverse=True)
+                results = with_ts + without_ts
+            elif sort == "added":
+                # "added ↓" — newest first_seen_at first. first_seen_at is
+                # set by `DEFAULT (datetime('now'))` on the initial INSERT
+                # and is never overwritten by upsert, so it's the most
+                # recently *ingested* asset. NULLs sort last (shouldn't
+                # happen given the schema, but defensive).
+                with_ts = [r for r in results if r.get("first_seen_at")]
+                without_ts = [r for r in results if not r.get("first_seen_at")]
+                with_ts.sort(key=lambda r: r["first_seen_at"], reverse=True)
+                results = with_ts + without_ts
+            start = page * page_size
+            end = start + page_size
+            page_results = results[start:end]
+            payload = _serialize_global(
+                page_results,
+                pagination={
+                    "page": page,
+                    "page_size": page_size,
+                    "total": total,
+                    "total_pages": (total + page_size - 1) // page_size if total else 0,
+                },
+                taxonomy=taxonomy,
+            )
+        return payload, results
+
+    payload, results = await asyncio.to_thread(_build)
+    if "results" in payload and not payload.get("error"):
+        with _results_lock:
+            # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
+            full_payload = dict(payload)
+            full_payload["results"] = results
+            _results_cache[cache_key] = full_payload
     return payload
 
 
@@ -684,80 +719,91 @@ async def asset_detail(asset_id: str) -> dict:
     404 if the asset isn't known to the local DB — e.g. it was deleted
     from Immich or never made it through the pipeline.
     """
-    with storage.connect(DB_PATH) as conn:
-        # 1. Asset row metadata.
-        asset_row = conn.execute(
-            """SELECT asset_id, original_file_name, original_url,
-                      thumbnail_url, cluster_id,
-                      captured_at, latitude, longitude,
-                      has_person
-               FROM assets WHERE asset_id = ?""",
-            (asset_id,),
-        ).fetchone()
-        if asset_row is None:
-            raise HTTPException(status_code=404, detail=f"asset {asset_id} not found in DB")
+    # The body does several SQLite queries + a numpy brute-force nearest-
+    # neighbor search. On a large DB this can take 100-300ms — offload
+    # so the event loop stays free for the SSE generator + other tabs.
+    # HTTPException raised inside the thread doesn't propagate cleanly,
+    # so we return a (status, body) tuple and translate after.
+    def _build():
+        with storage.connect(DB_PATH) as conn:
+            # 1. Asset row metadata.
+            asset_row = conn.execute(
+                """SELECT asset_id, original_file_name, original_url,
+                          thumbnail_url, cluster_id,
+                          captured_at, latitude, longitude,
+                          has_person
+                   FROM assets WHERE asset_id = ?""",
+                (asset_id,),
+            ).fetchone()
+            if asset_row is None:
+                return 404, {"detail": f"asset {asset_id} not found in DB"}
 
-        meta = dict(asset_row)
-        # 2. Top-K full-image predictions (species rank).
-        top_preds = storage.fetch_predictions(conn, asset_id=asset_id, rank="species")
-        # 3. Kingdom taxon scores.
-        ts_map = storage.fetch_taxon_scores(conn, asset_ids=[asset_id], rank="kingdom")
-        taxon_scores = ts_map.get(asset_id) or {}
-        # 4. YOLO detections with bbox-BioCLIP joined (filtered by min_score).
-        detections = storage.fetch_detections(
-            conn, asset_id=asset_id, min_score=0.10, rank="species"
-        )
-        # Detections carry int id and bbox floats — JSON-friendly as-is.
-        # 4b. Top-K nearest neighbors across the whole processed library.
-        # Naive brute-force is fast enough at our scale (~12k assets × 512 dim
-        # = ~10-20ms with numpy). Returns [] if the asset has no embedding.
-        library_neighbors = storage.find_library_neighbors(conn, asset_id=asset_id, k=12)
-        # 5. KNN: pick the most-populated (index_version, k) and read the row.
-        versions = storage.list_knn_versions(conn)
-        knn_payload = None
-        if versions:
-            top_version = max(versions, key=lambda v: v.get("n", 0))
-            index_version = top_version["index_version"]
-            k = top_version["k"]
-            knn_map = storage.fetch_knn_predictions(
-                conn, asset_ids=[asset_id], index_version=index_version, k=k
+            meta = dict(asset_row)
+            # 2. Top-K full-image predictions (species rank).
+            top_preds = storage.fetch_predictions(conn, asset_id=asset_id, rank="species")
+            # 3. Kingdom taxon scores.
+            ts_map = storage.fetch_taxon_scores(conn, asset_ids=[asset_id], rank="kingdom")
+            taxon_scores = ts_map.get(asset_id) or {}
+            # 4. YOLO detections with bbox-BioCLIP joined (filtered by min_score).
+            detections = storage.fetch_detections(
+                conn, asset_id=asset_id, min_score=0.10, rank="species"
             )
-            if asset_id in knn_map:
-                knn_row = knn_map[asset_id]
-                knn_payload = {
-                    "top_species": knn_row["top_species"],
-                    "common_name": knn_row["common_name"],
-                    "score": knn_row["score"],
-                    "kingdom": knn_row["kingdom"],
-                    "family": knn_row["family"],
-                    "genus": knn_row["genus"],
-                    "neighbors": knn_row["neighbors"],
-                    "index_version": index_version,
-                    "k": k,
-                    "computed_at": knn_row["computed_at"],
-                }
-        return {
-            "asset_id": meta["asset_id"],
-            "original_file_name": meta["original_file_name"],
-            "original_url": meta["original_url"],
-            "thumbnail_url": meta["thumbnail_url"],
-            "cluster_id": meta["cluster_id"],
-            "captured_at": meta.get("captured_at"),
-            "latitude": meta.get("latitude"),
-            "longitude": meta.get("longitude"),
-            # has_person: True / False / None (None = unscanned).
-            # Drives the asset-detail "👤" chip in the frontend; pairs
-            # with the grid's /api/results has_person filter.
-            "has_person": (
-                None if meta.get("has_person") is None
-                else bool(meta["has_person"])
-            ),
-            "top_predictions": top_preds,
-            "taxon_scores": taxon_scores,
-            "detections": detections,
-            "library_neighbors": library_neighbors,
-            "knn": knn_payload,
-        }
+            # Detections carry int id and bbox floats — JSON-friendly as-is.
+            # 4b. Top-K nearest neighbors across the whole processed library.
+            # Naive brute-force is fast enough at our scale (~12k assets × 512 dim
+            # = ~10-20ms with numpy). Returns [] if the asset has no embedding.
+            library_neighbors = storage.find_library_neighbors(conn, asset_id=asset_id, k=12)
+            # 5. KNN: pick the most-populated (index_version, k) and read the row.
+            versions = storage.list_knn_versions(conn)
+            knn_payload = None
+            if versions:
+                top_version = max(versions, key=lambda v: v.get("n", 0))
+                index_version = top_version["index_version"]
+                k = top_version["k"]
+                knn_map = storage.fetch_knn_predictions(
+                    conn, asset_ids=[asset_id], index_version=index_version, k=k
+                )
+                if asset_id in knn_map:
+                    knn_row = knn_map[asset_id]
+                    knn_payload = {
+                        "top_species": knn_row["top_species"],
+                        "common_name": knn_row["common_name"],
+                        "score": knn_row["score"],
+                        "kingdom": knn_row["kingdom"],
+                        "family": knn_row["family"],
+                        "genus": knn_row["genus"],
+                        "neighbors": knn_row["neighbors"],
+                        "index_version": index_version,
+                        "k": k,
+                        "computed_at": knn_row["computed_at"],
+                    }
+            return 200, {
+                "asset_id": meta["asset_id"],
+                "original_file_name": meta["original_file_name"],
+                "original_url": meta["original_url"],
+                "thumbnail_url": meta["thumbnail_url"],
+                "cluster_id": meta["cluster_id"],
+                "captured_at": meta.get("captured_at"),
+                "latitude": meta.get("latitude"),
+                "longitude": meta.get("longitude"),
+                # has_person: True / False / None (None = unscanned).
+                # Drives the asset-detail "👤" chip in the frontend; pairs
+                # with the grid's /api/results has_person filter.
+                "has_person": (
+                    None if meta.get("has_person") is None
+                    else bool(meta["has_person"])
+                ),
+                "top_predictions": top_preds,
+                "taxon_scores": taxon_scores,
+                "detections": detections,
+                "library_neighbors": library_neighbors,
+                "knn": knn_payload,
+            }
+
+    status, body = await asyncio.to_thread(_build)
+    if status != 200:
+        raise HTTPException(status_code=status, detail=body["detail"])
+    return body
 
 
 # ---- Plants album management --------------------------------------------
@@ -1098,6 +1144,10 @@ class KnnBuildArgs(BaseModel):
 # In-memory job registry. Jobs are short-lived (~minutes-to-hours);
 # the log file outlives the process so users can grep later.
 _knn_build_jobs: dict[str, dict] = {}
+# Lock for /api/events to read the registry safely. The worker thread
+# writes here without holding a lock (single writer) but the SSE
+# snapshot in app.py reads it concurrently, so we need to gate that.
+_knn_build_jobs_lock = threading.Lock()
 
 
 def _knn_build_worker(job_id: str, args: KnnBuildArgs) -> None:
@@ -2050,64 +2100,69 @@ async def clustering_status() -> dict:
     """Report the clusterer state + growth since last fit + recent
     refit audit rows. Cheap: one SELECT against clusterer_state +
     one COUNT(*) on embeddings + one ORDER BY id DESC on cluster_remap."""
-    with storage.connect(DB_PATH) as conn:
-        state = storage.get_clusterer_state(conn)
-        n_current_row = conn.execute(
-            "SELECT COUNT(DISTINCT asset_id) AS n FROM embeddings"
-        ).fetchone()
-        n_current = int(n_current_row["n"]) if n_current_row else 0
-        recent = storage.recent_cluster_remap(conn, limit=10)
-        pending_refit = any(
-            j.get("status") == "running"
-            for j in _clustering_jobs.values()
+    # COUNT(DISTINCT asset_id) on embeddings can be slow on a 19k-row
+    # table; offload so it doesn't stall the SSE generator's tick.
+    def _build():
+        with storage.connect(DB_PATH) as conn:
+            state = storage.get_clusterer_state(conn)
+            n_current_row = conn.execute(
+                "SELECT COUNT(DISTINCT asset_id) AS n FROM embeddings"
+            ).fetchone()
+            n_current = int(n_current_row["n"]) if n_current_row else 0
+            recent = storage.recent_cluster_remap(conn, limit=10)
+            pending_refit = any(
+                j.get("status") == "running"
+                for j in _clustering_jobs.values()
+            )
+
+        n_at_fit = state["n_assets_at_fit"] if state else 0
+        growth_pct = (
+            (n_current - n_at_fit) / n_at_fit if n_at_fit > 0 else 0.0
         )
 
-    n_at_fit = state["n_assets_at_fit"] if state else 0
-    growth_pct = (
-        (n_current - n_at_fit) / n_at_fit if n_at_fit > 0 else 0.0
-    )
+        # Latest refit job (if any still in registry). Lets the UI show
+        # "Refit finished" / "Refit failed: ..." without a separate
+        # job-status endpoint.
+        latest_refit: dict | None = None
+        with _clustering_jobs_lock:
+            if _clustering_jobs:
+                latest = max(
+                    _clustering_jobs.values(),
+                    key=lambda j: j.get("started_at") or 0.0,
+                )
+                latest_refit = {
+                    "status": latest.get("status"),
+                    "started_at": latest.get("started_at"),
+                    "finished_at": latest.get("finished_at"),
+                    "n_clusters": latest.get("n_clusters"),
+                    "n_assets": latest.get("n_assets"),
+                    "error": latest.get("error"),
+                    "threshold_pct": latest.get("threshold_pct"),
+                }
 
-    # Latest refit job (if any still in registry). Lets the UI show
-    # "Refit finished" / "Refit failed: ..." without a separate
-    # job-status endpoint.
-    latest_refit: dict | None = None
-    with _clustering_jobs_lock:
-        if _clustering_jobs:
-            latest = max(
-                _clustering_jobs.values(),
-                key=lambda j: j.get("started_at") or 0.0,
-            )
-            latest_refit = {
-                "status": latest.get("status"),
-                "started_at": latest.get("started_at"),
-                "finished_at": latest.get("finished_at"),
-                "n_clusters": latest.get("n_clusters"),
-                "n_assets": latest.get("n_assets"),
-                "error": latest.get("error"),
-                "threshold_pct": latest.get("threshold_pct"),
-            }
+        return {
+            "clusterer_loaded": state is not None,
+            "last_refit_at": state["fitted_at"] if state else None,
+            "n_at_refit": n_at_fit,
+            "n_current": n_current,
+            "growth_pct": growth_pct,
+            "pending_refit": pending_refit,
+            "latest_refit": latest_refit,
+            "recent_remaps": [
+                {
+                    "old_cluster_id": int(r["old_cluster_id"]),
+                    "new_cluster_id": int(r["new_cluster_id"]),
+                    "overlap_count": int(r["overlap_count"]),
+                    "union_count": int(r["union_count"]),
+                    "jaccard": float(r["jaccard"]),
+                    "kind": r["kind"],
+                    "refit_at": r["refit_at"],
+                }
+                for r in recent
+            ],
+        }
 
-    return {
-        "clusterer_loaded": state is not None,
-        "last_refit_at": state["fitted_at"] if state else None,
-        "n_at_refit": n_at_fit,
-        "n_current": n_current,
-        "growth_pct": growth_pct,
-        "pending_refit": pending_refit,
-        "latest_refit": latest_refit,
-        "recent_remaps": [
-            {
-                "old_cluster_id": int(r["old_cluster_id"]),
-                "new_cluster_id": int(r["new_cluster_id"]),
-                "overlap_count": int(r["overlap_count"]),
-                "union_count": int(r["union_count"]),
-                "jaccard": float(r["jaccard"]),
-                "kind": r["kind"],
-                "refit_at": r["refit_at"],
-            }
-            for r in recent
-        ],
-    }
+    return await asyncio.to_thread(_build)
 
 
 # Immich only recognises these thumbnail sizes. Anything else (e.g. a
@@ -2247,6 +2302,8 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
 # for the tail.
 
 _backfill_exif_jobs: dict[str, dict] = {}
+# Lock for /api/events — same reason as _knn_build_jobs_lock above.
+_backfill_exif_jobs_lock = threading.Lock()
 
 
 def _backfill_exif_worker(job_id: str) -> None:
