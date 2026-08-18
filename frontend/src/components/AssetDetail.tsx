@@ -5,7 +5,7 @@ import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
 import { DetectionBlock } from './DetectionBlock';
-import { BboxOverlay } from './BboxOverlay';
+import { BboxImage } from './BboxImage';
 import { useToasts } from './ToastProvider';
 import { plantaeColorClass } from '../lib/plantae';
 import { formatPct } from '../lib/format';
@@ -18,6 +18,10 @@ export function AssetDetail({ assetId }: Props) {
   const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [copied, setCopied] = useState(false);
+  // If the 'fullsize' thumb fails to load, fall back to the smaller
+  // 'preview' size. Reset on asset change so each asset tries fullsize
+  // first.
+  const [usePreview, setUsePreview] = useState(false);
   const push = useToasts();
 
   useEffect(() => {
@@ -25,6 +29,7 @@ export function AssetDetail({ assetId }: Props) {
     setData(null);
     setError(null);
     setCopied(false);
+    setUsePreview(false);
     getAsset(assetId)
       .then(d => { if (!cancelled) setData(d); })
       .catch(e => { if (!cancelled) setError(e); });
@@ -58,29 +63,25 @@ export function AssetDetail({ assetId }: Props) {
 
   return (
     <div className="text-[13px]">
-      <figure className="m-0 mb-2 bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] flex items-center justify-center min-h-[120px] max-h-[220px] relative">
-        <img
-          src={thumbUrl(data.asset_id, 'fullsize')}
-          alt={data.original_file_name}
-          loading="eager"
-          decoding="async"
-          className="block max-w-full max-h-[220px] w-auto h-auto object-contain"
-          onError={e => {
-            const img = e.currentTarget;
-            if (!img.dataset.fallback) {
-              img.dataset.fallback = '1';
-              img.src = thumbUrl(data.asset_id, 'preview');
-            }
-          }}
-        />
-        {/* YOLO detection boxes overlaid on the image so the user can
-            see exactly where YOLO saw each label. Color-coded by
-            label — person/face/human in warm colors (high signal),
-            hand in yellow (visible but doesn't count as has_person),
-            plants in green. Same component used by the photo grid
-            cards (Card.tsx) so behaviour is consistent. */}
-        <BboxOverlay detections={data.detections} />
-      </figure>
+      {/* Image + YOLO boxes are drawn on a single <canvas> by
+          BboxImage (contain mode), so there is no separate overlay to
+          align — the boxes and the photo share one coordinate system
+          and are guaranteed to line up. The canvas lays out like an
+          <img>: max-h 220px, max-w 100%, aspect ratio preserved. The
+          text-center wrapper keeps it horizontally centered. A failed
+          fullsize load falls back to the preview size. */}
+      <div className="text-center mb-2">
+        <figure className="m-0 inline-block bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] max-w-full align-top">
+          <BboxImage
+            src={thumbUrl(data.asset_id, usePreview ? 'preview' : 'fullsize')}
+            detections={data.detections}
+            fit="contain"
+            maxHeight={220}
+            ariaLabel={data.original_file_name}
+            onError={() => setUsePreview(true)}
+          />
+        </figure>
+      </div>
 
       <p className="mb-0.5">
         <strong>{data.original_file_name}</strong>

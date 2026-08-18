@@ -1,7 +1,6 @@
 import type { ResultRow } from '../api/types';
 import { useApp } from '../state/AppContext';
 import { thumbUrl } from '../lib/thumb';
-import { BboxOverlay } from './BboxOverlay';
 import { plantaeColorClass } from '../lib/plantae';
 import { formatPct } from '../lib/format';
 
@@ -29,40 +28,54 @@ export function Card({ row }: Props) {
       onClick={handleOpen}
       className="bg-black overflow-hidden flex flex-col cursor-pointer relative rounded-sm border border-line2 hover:border-[#3a8a52] transition-colors m-0 p-0"
     >
+      {/* The 4:5 frame. A plain <img> with object-cover does the job
+          here — the grid doesn't overlay YOLO boxes (only the asset-
+          detail modal does, via BboxImage). Using <img> means the
+          browser handles the lazy load, decode, cache, and natural
+          sizing, and users get right-click "save image". */}
       <div className="relative bg-black aspect-[4/5] overflow-hidden">
         <img
-          src={thumbUrl(row.asset_id)}
+          src={thumbUrl(row.asset_id, 'preview')}
           alt={row.original_file_name}
           loading="lazy"
           decoding="async"
-          className="w-full h-full block object-cover object-center"
+          className="absolute inset-0 w-full h-full object-cover"
         />
         {row.cluster_id != null && (
-          <span className="absolute top-1.5 left-1.5 bg-black/60 text-[#cfb] font-mono text-[11px] py-0.5 px-1.5 rounded">
+          <span className="absolute top-1.5 left-1.5 bg-black/60 text-[#cfb] font-mono text-[11px] py-0.5 px-1.5 rounded z-10">
             cluster {row.cluster_id}
           </span>
         )}
         {row.rank != null && (
-          <span className="absolute top-1.5 right-1.5 bg-bg-2 text-white font-mono text-[11px] py-0.5 px-1.5 rounded shadow">
+          <span className="absolute top-1.5 right-1.5 bg-bg-2 text-white font-mono text-[11px] py-0.5 px-1.5 rounded shadow z-10">
             #{row.rank + 1}
           </span>
         )}
         {plantaeScore != null && (
-          <span className={`absolute top-[34px] right-1.5 font-mono text-[11px] py-0.5 px-1.5 rounded shadow font-bold ${plantaeTier}`}>
+          <span className={`absolute top-[34px] right-1.5 font-mono text-[11px] py-0.5 px-1.5 rounded shadow font-bold z-10 ${plantaeTier}`}>
             Plantae {(plantaeScore * 100).toFixed(1)}%
           </span>
         )}
+        {/* Person indicator. Sits just below the rank pill on the
+           right, matching the asset-detail modal's "👤 person" chip
+           so users learn one symbol. Only shown when the person stage
+           has classified this asset (has_person === true). */}
+        {row.has_person === true && (
+          <span
+            className="absolute top-[34px] left-1.5 bg-black/70 text-[#5cc078] font-mono text-[11px] py-0.5 px-1.5 rounded z-10"
+            title="YOLO detected a person in this image"
+          >👤 person</span>
+        )}
         {row.near_dups && row.near_dups.length > 0 && (
           <span
-            className="absolute top-1.5 left-1.5 bg-score-red text-white font-mono font-bold text-[11px] py-0.5 px-1.5 rounded shadow"
+            className="absolute top-1.5 left-1.5 bg-score-red text-white font-mono font-bold text-[11px] py-0.5 px-1.5 rounded shadow z-10"
             title={`${row.near_dups.length} similar photo(s)`}
           >{row.near_dups.length}×</span>
         )}
-        <BboxOverlay detections={row.detections} />
         {/* Bottom-of-photo overlay: top-1 prediction + score + kingdom
            chips on a translucent gradient. No filename — it lives in
            the asset-detail modal. */}
-        <div className="absolute left-0 right-0 bottom-0 px-2.5 pt-8 pb-3.5 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-1 pointer-events-none">
+        <div className="absolute left-0 right-0 bottom-0 px-2.5 pt-8 pb-3.5 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-1 pointer-events-none z-10">
           {fullTop1 && (
             <div className="flex justify-between items-baseline gap-2">
               <span className="italic font-semibold text-[13px]/[1.2] drop-shadow overflow-hidden text-ellipsis whitespace-nowrap">
