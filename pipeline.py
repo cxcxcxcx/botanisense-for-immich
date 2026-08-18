@@ -1417,21 +1417,30 @@ def run_pipeline(
             _stage_begin("person")
             try:
                 n_total = 0
+                page_num = 0
                 # Outer page loop — 500 unscanned assets per page keeps
-                # memory low and progress visible.
-                outer_offset = 0
+                # memory low and progress visible. Uses cursor pagination
+                # (matching get_assets_without_person_scan's signature) so
+                # a SIGKILL between pages can't cause the next run to
+                # re-scan the same asset — see storage.py for why we
+                # abandoned OFFSET for this query.
+                cursor_ts: str | None = None
+                cursor_id: str | None = None
                 outer_page = 500
                 while True:
                     check_stop()
                     todo = storage.get_assets_without_person_scan(
-                        conn, limit=outer_page, offset=outer_offset
+                        conn, limit=outer_page,
+                        after_first_seen_at=cursor_ts,
+                        after_asset_id=cursor_id,
                     )
                     if not todo:
                         break
+                    page_num += 1
                     # Inner batch loop — chunked for the YOLO forward
                     # pass (matches batch_size used elsewhere).
-                    todo_paths: list[tuple[str, Path]] = []
-                    for asset_id, _fn in todo:
+                    todo_paths: list[tuple[str, Path, str]] = []
+                    for asset_id, _fn, _ts in todo:
                         p = thumb_dir / f"{asset_id}.jpg"
                         if not p.exists():
                             thumb_bytes = client.download_bytes(
@@ -1439,20 +1448,19 @@ def run_pipeline(
                                 f"?size={THUMBNAIL_SIZE}"
                             )
                             p.write_bytes(thumb_bytes)
-                        todo_paths.append((asset_id, p))
+                        todo_paths.append((asset_id, p, _ts))
                     # Process in chunks of `batch_size`. YOLO-World's
                     # first forward pass here rebakes the 17-label
                     # embedding table under the singleton's _LOCK; the
                     # previous yolo stage's finally already unloaded so
                     # we get the fresh 17-class init.
-                    n_chunks = (len(todo_paths) + batch_size - 1) // batch_size
                     person_t0 = time.monotonic()
                     for i in range(0, len(todo_paths), batch_size):
                         check_stop()
                         chunk = todo_paths[i : i + batch_size]
-                        pil_images = [Image.open(p).convert("RGB") for _, p in chunk]
+                        pil_images = [Image.open(p).convert("RGB") for _, p, _ in chunk]
                         detections = _yolo.detect(pil_images, conf=yolo_conf)
-                        for (asset_id, _), dets in zip(chunk, detections):
+                        for (asset_id, _, _ts), dets in zip(chunk, detections):
                             # Class-agnostic IoU merge — same as yolo
                             # stage. A photo with overlapping person +
                             # face boxes collapses to one detection.
@@ -1502,11 +1510,14 @@ def run_pipeline(
                     n_total += len(todo_paths)
                     elapsed = time.monotonic() - person_t0
                     _log.info(
-                        f"[person] page {(outer_offset // outer_page) + 1} "
+                        f"[person] page {page_num} "
                         f"items={len(todo_paths)}  scanned_so_far={n_total}  "
                         f"elapsed={_fmt_eta(elapsed)}"
                     )
-                    outer_offset += outer_page
+                    # Advance cursor to the last row of this page so a
+                    # SIGKILL/OOM between pages resumes where we left off.
+                    cursor_ts = todo_paths[-1][2]
+                    cursor_id = todo_paths[-1][0]
                     # Periodic commit so a 70-min backfill flushes
                     # progress to disk and survives a SIGKILL/OOM
                     # between pages. The pipeline's outer commit at
