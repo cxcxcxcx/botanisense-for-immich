@@ -2,28 +2,19 @@
 
 React + Vite + TypeScript SPA. Talks to the FastAPI backend over JSON.
 
-## Dev (two terminals)
+**👉 Full setup, run, and refresh instructions are in
+[`../DEVELOPMENT.md`](../DEVELOPMENT.md)** — including the difference
+between the Vite dev server (:5173) and the uvicorn-served build
+(:8765), and how to see your changes on each.
+
+Quick reference:
 
 ```bash
-# Terminal A — backend on :8765
-uv run app.py
-
-# Terminal B — frontend on :5173 (proxies /api and /thumb to :8765)
-cd frontend
 npm install
-npm run dev
+npm run dev        # Vite on :5173 with HMR (proxies /api, /thumb → :8765)
+npm run build      # writes dist/, served by uvicorn at :8765
+npm run typecheck  # tsc -b --noEmit
 ```
 
-Open http://localhost:5173.
-
-## Prod
-
-```bash
-cd frontend
-npm ci
-npm run build      # writes frontend/dist/
-cd ..
-uv run app.py      # serves dist/ at / and the API at /api/*
-```
-
-Open http://localhost:8765.
+The backend must be running on :8765 for the dev server to work (Vite
+proxies API and thumbnail requests to it).
