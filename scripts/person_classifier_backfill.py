@@ -68,9 +68,12 @@ def has_thumb(aid: str) -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--filter-no-plantae", action="store_true", default=True,
-                    help="Skip Plantae candidates (default: True — Plantae photos "
-                         "almost never have people, save embedding cost)")
+    ap.add_argument("--filter-no-plantae", action="store_true", default=False,
+                    help="Skip Plantae candidates (default: False — the classifier "
+                         "needs to see them too. Some Plantae photos are actually "
+                         "hand-with-plant or person-in-garden photos that the "
+                         "Plantae score misclassified; without re-embedding those, "
+                         "the classifier can't overrule YOLO.)")
     ap.add_argument("--batch-size", type=int, default=32)
     ap.add_argument("--limit", type=int, default=None,
                     help="Limit how many rows to embed (for testing)")
