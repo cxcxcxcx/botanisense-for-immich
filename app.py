@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -65,6 +66,8 @@ PORT = int(os.environ.get("PORT", "8765"))
 # serving. Default is off — the server starts in browse-only mode and
 # the user (or a follow-up curl /api/run) triggers a refresh.
 RUN_ON_STARTUP = os.environ.get("RUN_ON_STARTUP", "0") == "1"
+
+_log = logging.getLogger("app")
 # KNN reclassification — separate from the zero-shot pipeline. Set
 # KNN_INVENTORY_DIR to the directory holding tol200m_bioclip2.faiss +
 # labels.parquet + INDEX_VERSION.txt. Leave it unset / pointing at a
@@ -175,14 +178,14 @@ def _knn_status_dict() -> dict:
     out["version"] = meta.get("version")
     out["n_rows"] = int(idx.ntotal)
     out["dim"] = int(idx.d)
-    try:
-        with storage.connect(DB_PATH) as conn:
-            rows = storage.list_knn_versions(conn)
-        total = sum(r["n"] for r in rows)
-        out["cached_assets"] = int(total)
-        out["cached_versions"] = rows
-    except Exception:
-        pass
+    # Let DB errors bubble — a misleading `cached_assets: 0` is worse
+    # than a 500 here, since the UI uses this to decide whether the
+    # index has usable data.
+    with storage.connect(DB_PATH) as conn:
+        rows = storage.list_knn_versions(conn)
+    total = sum(r["n"] for r in rows)
+    out["cached_assets"] = int(total)
+    out["cached_versions"] = rows
     return out
 
 
@@ -342,8 +345,13 @@ async def lifespan(_app: FastAPI):
     if RUN_ON_STARTUP:
         try:
             await _start_run(QUERY, N_SAMPLES, TOP_K, BATCH_SIZE)
-        except HTTPException:
-            pass
+        except HTTPException as e:
+            # Don't crash startup, but log it — otherwise the user
+            # wonders why the auto-run never happened.
+            _log.warning(
+                "startup auto-run failed: %s — %s",
+                e.status_code, e.detail,
+            )
     yield
 
 
@@ -2259,6 +2267,8 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
     if not ids:
         return {"queued": 0}
     import threading
+    import logging
+    _worker_log = logging.getLogger("reclassify_sample")
     def _worker():
         for aid in ids:
             try:
@@ -2266,7 +2276,13 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
                 from pipeline import run_knn_reclassify
                 run_knn_reclassify([aid])
             except Exception:
-                pass
+                # The HTTP response has already returned; we cannot
+                # bubble this to the caller. Log it so a per-asset
+                # failure (e.g. a missing embedding row) is visible
+                # instead of vanishing into a daemon thread.
+                _worker_log.warning(
+                    "reclassify-sample failed for %s", aid, exc_info=True
+                )
     threading.Thread(target=_worker, daemon=True).start()
     return {"queued": len(ids)}
 
@@ -2355,7 +2371,11 @@ async def _backfill_exif_async(job_id: str) -> None:
                             limits=httpx.Limits(max_connections=200),
                         ) as ac:
                             r = await ac.get(f"/api/assets/{aid}")
-                    except httpx.HTTPError:
+                    except httpx.RequestError as e:
+                        # Transport error — log and treat as missing so a
+                        # 17k-asset batch keeps running; the missing
+                        # count in the summary surfaces the magnitude.
+                        logger.warning("[backfill-exif] %s fetch failed: %s", aid, e)
                         return None
                     return (aid, r.json()) if r.status_code == 200 else None
 
@@ -2372,7 +2392,15 @@ async def _backfill_exif_async(job_id: str) -> None:
             for coro in asyncio.as_completed(tasks):
                 try:
                     result = await coro
-                except Exception:
+                except Exception as e:
+                    # Backstop: fetch_one swallows httpx.RequestError,
+                    # so anything reaching here is genuinely unexpected
+                    # (e.g. JSON decode failure). Log it loudly so we
+                    # don't silently count a programming error as a
+                    # "missing" asset.
+                    logger.warning(
+                        "[backfill-exif] fetch_one raised: %s", e, exc_info=True
+                    )
                     result = None
                 results.append(result)
                 done += 1
@@ -2611,7 +2639,14 @@ def _person_backfill_child_entry(
                 "error": f"{type(e).__name__}: {e}",
             }))
         except Exception:
-            pass
+            # The status JSON is what the UI polls to see what
+            # happened. If we can't write it, log loudly so the user
+            # can see the failure mode (full disk, bad path, ...) —
+            # otherwise the job just looks stuck.
+            logger.warning(
+                "[person-backfill] could not write error status to %s",
+                status_path, exc_info=True,
+            )
     finally:
         handler.close()
         logger.removeHandler(handler)

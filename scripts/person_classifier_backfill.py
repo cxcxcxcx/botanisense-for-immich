@@ -129,7 +129,15 @@ def main():
                     im = Image.open(p).convert("RGB")
                     pil_images.append(im)
                     kept.append((aid, fn))
-                except Exception:
+                except Exception as e:
+                    # Surface the reason — a corrupt thumbnail or OOM
+                    # should be visible, not counted silently among
+                    # "skipped".
+                    print(
+                        f"  WARN: skipped {fn} (Image.open failed: "
+                        f"{type(e).__name__}: {e})",
+                        flush=True,
+                    )
                     skipped += 1
             if not pil_images:
                 continue
@@ -140,8 +148,13 @@ def main():
                 embedded += 1
             # free memory
             for im in pil_images:
-                try: im.close()
-                except Exception: pass
+                try:
+                    im.close()
+                except Exception as e:
+                    print(
+                        f"  WARN: image close failed ({type(e).__name__}: {e})",
+                        flush=True,
+                    )
             del feats, feats_np
 
             # Commit every CHECKPOINT_EVERY batches so progress is durable

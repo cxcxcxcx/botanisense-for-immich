@@ -91,6 +91,16 @@ if not _log.handlers:
     _log.propagate = False
 
 
+def _close_image(im) -> None:
+    """Best-effort PIL image close. Closes can fail on already-freed
+    images or unusual file types; we log at debug instead of silently
+    passing so teardown regressions are still traceable."""
+    try:
+        im.close()
+    except Exception:
+        _log.debug("image close failed", exc_info=True)
+
+
 # Shared pipeline state. Thread-safe: the pipeline thread writes under
 # _state_lock; the FastAPI thread reads via /api/status. Keys:
 #   status:        "idle" | "running" | "done" | "error"
@@ -1093,10 +1103,7 @@ def run_pipeline(
 
                     # Free the PIL decodes — yolo.detect will reopen them.
                     for im in pil_images:
-                        try:
-                            im.close()
-                        except Exception:
-                            pass
+                        _close_image(im)
                     del pil_images, feats_np, raw, preds_by_file
                     gc.collect()
 
@@ -1287,10 +1294,7 @@ def run_pipeline(
                         scores=scores,
                     )
                 for im in pil_images:
-                    try:
-                        im.close()
-                    except Exception:
-                        pass
+                    _close_image(im)
                 del pil_images, raw_kingdom, kingdom_by_file
                 gc.collect()
                 _chunk_log(
@@ -1377,10 +1381,7 @@ def run_pipeline(
                             )
                             n_dets += len(new_ids)
                         for im in pil_images:
-                            try:
-                                im.close()
-                            except Exception:
-                                pass
+                            _close_image(im)
                         _chunk_log(
                             "yolo",
                             (i // batch_size) + 1,
@@ -1501,10 +1502,7 @@ def run_pipeline(
                                 has_person=has_real_person(dets),
                             )
                         for im in pil_images:
-                            try:
-                                im.close()
-                            except Exception:
-                                pass
+                            _close_image(im)
                         del pil_images
                         gc.collect()
                     n_total += len(todo_paths)
@@ -1618,10 +1616,7 @@ def run_pipeline(
                             crop_meta.append((det_id, src))
                     finally:
                         for im in by_src.values():
-                            try:
-                                im.close()
-                            except Exception:
-                                pass
+                            _close_image(im)
 
                     if not crops:
                         i = j
@@ -1647,10 +1642,7 @@ def run_pipeline(
 
                     n_crops = len(crops)
                     for im in crops:
-                        try:
-                            im.close()
-                        except Exception:
-                            pass
+                        _close_image(im)
                     _chunk_log(
                         "bbox-bioclip",
                         (i // batch_size) + 1,
@@ -1904,10 +1896,7 @@ def run_person_backfill(
                         else:
                             n_without_person += 1
                     for im in pil_images:
-                        try:
-                            im.close()
-                        except Exception:
-                            pass
+                        _close_image(im)
                     del pil_images
                     gc.collect()
                 if progress_cb is not None:
@@ -1928,7 +1917,10 @@ def run_person_backfill(
         try:
             _yolo.unload_model()
         except Exception:
-            pass
+            # Teardown in a finally block — must NOT re-raise, or it
+            # would mask the primary exception. Log so a stuck teardown
+            # doesn't disappear silently.
+            _log.warning("yolo unload failed", exc_info=True)
         _write_status("finished")
     return {
         "scanned_count": n_total_scanned,
@@ -1996,13 +1988,18 @@ def _format_search_error(e: Exception) -> str:
     if isinstance(e, httpx.HTTPStatusError):
         try:
             body = e.response.json()
-        except Exception:
+        except Exception as je:
+            # Could be HTML, plain text, or truncated JSON — log so
+            # the raw shape is recoverable when debugging "Immich said
+            # something the user can't see" reports.
+            _log.debug("immich smart-search body not JSON: %s", je)
             body = None
         msg = _flatten(body).strip()
         if not msg:
             try:
                 msg = (e.response.text or "").strip()
-            except Exception:
+            except Exception as te:
+                _log.debug("immich smart-search body unreadable: %s", te)
                 msg = ""
         if not msg:
             msg = "(no body)"

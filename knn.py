@@ -252,10 +252,12 @@ def build_faiss_index(
                 emb_col.cast(pa.list_(pa.float32())),
                 dtype=np.float32,
             ).reshape(-1, EMB_DIM)
-        except Exception:
+        except (pa.ArrowNotImplementedError, pa.ArrowInvalid) as e:
             # Fallback for older pyarrow versions that don't allow the
             # list_ cast cheaply: go through python list. ~3x slower
-            # but still works.
+            # but still works. Narrow the catch so an unrelated error
+            # (e.g. a bad reshape) still surfaces.
+            _log.debug("pyarrow list cast unavailable, using pylist fallback: %s", e)
             raw = emb_col.to_pylist()
             emb_arr = np.asarray(raw, dtype=np.float32).reshape(-1, EMB_DIM)
         pending_embs.append(emb_arr)
@@ -403,7 +405,8 @@ def _emb_column_to_numpy(
                 chunk.cast(pa.list_(pa.float32())),
                 dtype=np.float32,
             ).reshape(m, EMB_DIM)
-        except Exception:
+        except (pa.ArrowNotImplementedError, pa.ArrowInvalid) as e:
+            _log.debug("pyarrow list cast unavailable, using pylist fallback: %s", e)
             sub = np.asarray(chunk.to_pylist(), dtype=np.float32).reshape(
                 m, EMB_DIM
             )

@@ -41,12 +41,15 @@ rows are overwritten on the next pass for that asset.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
+_log = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -681,11 +684,19 @@ def load_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     for r in rows:
         try:
             top_sp = _json.loads(r["top_species_json"])
-        except Exception:
+        except Exception as e:
+            _log.warning(
+                "cluster %s: bad top_species_json (%s); defaulting to []",
+                r["cluster_id"], e,
+            )
             top_sp = []
         try:
             top_ge = _json.loads(r["top_genus_json"])
-        except Exception:
+        except Exception as e:
+            _log.warning(
+                "cluster %s: bad top_genus_json (%s); defaulting to []",
+                r["cluster_id"], e,
+            )
             top_ge = []
         out[int(r["cluster_id"])] = {
             "name": r["name"],
@@ -724,7 +735,8 @@ def get_album_meta(conn: sqlite3.Connection, key: str) -> dict | None:
         return None
     try:
         return _json.loads(row["value_json"])
-    except Exception:
+    except Exception as e:
+        _log.warning("album_meta key %r: bad value_json (%s)", key, e)
         return None
 
 
@@ -1870,7 +1882,11 @@ def fetch_knn_predictions(
     for r in rows:
         try:
             neighbors = _json.loads(r["neighbors"])
-        except Exception:
+        except Exception as e:
+            _log.warning(
+                "knn %s: bad neighbors json (%s); defaulting to []",
+                r["asset_id"], e,
+            )
             neighbors = []
         out[r["asset_id"]] = {
             "top_species": r["top_species"] or None,

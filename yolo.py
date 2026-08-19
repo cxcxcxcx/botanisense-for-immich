@@ -83,7 +83,8 @@ def unload_model() -> None:
             try:
                 del _MODEL.model
                 del _MODEL.ckpt
-            except Exception:
+            except AttributeError:
+                # Re-entrant unload — model.ckpt already gone. Safe.
                 pass
         _MODEL = None
     import gc

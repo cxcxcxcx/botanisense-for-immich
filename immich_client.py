@@ -17,11 +17,14 @@ All endpoints accept either `x-api-key: <key>` (preferred for API keys) or
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+_log = logging.getLogger("immich_client")
 
 
 @dataclass
@@ -199,14 +202,28 @@ class ImmichClient:
             return self._exif_cache[asset_id]
         try:
             r = self._client.get(f"/api/assets/{asset_id}")
-        except httpx.HTTPError:
+        except httpx.RequestError as e:
+            # Transport-level error (DNS, connect, timeout). Treat as
+            # "no EXIF this run" so a long ingest isn't aborted, but
+            # log so the user can see why their EXIF never landed.
+            _log.warning("get_asset_metadata %s: %s", asset_id, e)
             return None
-        if r.status_code != 200:
+        if r.status_code == 200:
+            data = r.json()
+            self._exif_cache[asset_id] = data
+            return data
+        if r.status_code == 404:
+            # Asset genuinely gone — not worth warning for, since the
+            # caller will treat as "no EXIF" and the next ingest run
+            # will skip it via FK behaviour.
             self._exif_cache[asset_id] = None
             return None
-        data = r.json()
-        self._exif_cache[asset_id] = data
-        return data
+        _log.warning(
+            "get_asset_metadata %s: unexpected status %s",
+            asset_id, r.status_code,
+        )
+        self._exif_cache[asset_id] = None
+        return None
 
     @staticmethod
     def extract_exif(asset_payload: dict | None) -> dict:
@@ -276,10 +293,12 @@ class ImmichClient:
         ) as ac:
             async def probe(aid: str) -> str | None:
                 async with sem:
-                    try:
-                        r = await ac.head(f"/api/assets/{aid}")
-                    except httpx.HTTPError:
-                        return None
+                    # Transport errors MUST bubble — if Immich is
+                    # unreachable and we silently return None, the
+                    # purge endpoint would mark every asset as missing
+                    # and DELETE them. A non-200 response (e.g. 404)
+                    # is the correct signal to treat as missing.
+                    r = await ac.head(f"/api/assets/{aid}")
                     return aid if r.status_code == 200 else None
 
             results = await asyncio.gather(*(probe(a) for a in asset_ids))
