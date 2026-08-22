@@ -21,7 +21,9 @@ import logging
 import os
 import threading
 import time
+import tracemalloc
 import uuid
+from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,11 +56,32 @@ N_SAMPLES = int(os.environ.get("N_SAMPLES", "10000"))
 TOP_K = int(os.environ.get("TOP_K", "5"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "16"))
 DB_PATH = os.environ.get("DB_PATH", "data/state.db")
+# Pickled near-dup map (~1 MB for 19k assets). Loaded at startup so
+# the first hit after a fresh uvicorn is fast. Saved after the warm
+# at pipeline end. Deleted when the embeddings change (manual
+# invalidation scripts should `rm data/near_dup_cache.pkl`).
+NEAR_DUP_CACHE_PATH = Path(DB_PATH).parent / "near_dup_cache.pkl"
 # Plantae confidence thresholds for the per-image badge. Defaults
 # chosen for BioCLIP-2 kingdom-rank scores (typically 0.40-0.95 for
 # clearly-plant images; non-plants usually <0.30).
 PLANTAE_GREEN = float(os.environ.get("PLANTAE_GREEN", "0.60"))
 PLANTAE_YELLOW = float(os.environ.get("PLANTAE_YELLOW", "0.35"))
+# Fungi kingdom scores are noisier than Plantae's (BioCLIP-2 was
+# trained primarily on plants); default to the same 0.60 floor but
+# let the user override via env. Used by the per-kingdom defaults
+# surfaced by /api/settings/sync-defaults.
+FUNGI_MIN_SCORE_DEFAULT = float(os.environ.get("FUNGI_MIN_SCORE_DEFAULT", "0.60"))
+# People-filter default for the Run page "Sync to IMMICH" section.
+# None = "doesn't matter" (apply to every photo). 0 = "without
+# people". 1 = "with people". Parsed from env because there's no
+# natural float for "no filter" — we accept "any"/"0"/"1" or "".
+_sync_people_default_raw = os.environ.get("SYNC_PEOPLE_FILTER_DEFAULT", "").strip().lower()
+if _sync_people_default_raw in ("1", "with", "with_people"):
+    SYNC_PEOPLE_FILTER_DEFAULT: int | None = 1
+elif _sync_people_default_raw in ("0", "without", "without_people", "no_people"):
+    SYNC_PEOPLE_FILTER_DEFAULT = 0
+else:
+    SYNC_PEOPLE_FILTER_DEFAULT = None
 N_CLUSTERS_DEFAULT = int(os.environ.get("N_CLUSTERS", "0"))  # 0 = unknown
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8765"))
@@ -95,10 +118,64 @@ attach_log_file(Path(DB_PATH).parent / "pipeline.log")
 _lock = threading.Lock()
 _classifier = None
 
-# Per-process cache for /api/results. Keyed by run_id, value is the full
-# JSON payload. Invalidated whenever a new pipeline run completes.
-_results_cache: dict[int, dict] = {}
+# Per-process cache for /api/results. Capped at _RESULTS_CACHE_MAX
+# entries via OrderedDict LRU semantics — the unbounded dict that used
+# to live here would grow to several GB after a few hours of UI
+# browsing (one entry per (filter, sort) combo, each ~2 MB). Reads
+# promote to the back; insertions push the oldest out the front.
+# Invalidated whenever a new pipeline run completes (and on demand).
+_RESULTS_CACHE_MAX = 8
+_results_cache: OrderedDict[str, dict] = OrderedDict()
 _results_lock = threading.Lock()
+
+
+# Same idea for /api/clusters: cache the full payload per filter combo.
+# The result depends only on (plantae, plantae_green, plantae_yellow)
+# and the underlying cluster assignment, so a single entry per
+# (plantae, threshold) tuple covers the UI's typical interaction
+# pattern. Invalidated when a pipeline run completes.
+_clusters_cache: dict[tuple, dict] = {}
+_clusters_cache_lock = threading.Lock()
+
+
+def _results_cache_get(key: str) -> dict | None:
+    """Return the cached payload for `key`, or None. Promotes the key
+    to the back of the LRU on hit so the most-recently-used entries
+    survive eviction."""
+    with _results_lock:
+        if key in _results_cache:
+            _results_cache.move_to_end(key)
+            return _results_cache[key]
+    return None
+
+
+def _results_cache_put(key: str, value: dict) -> None:
+    """Insert a payload, evicting the oldest entry if we'd exceed
+    _RESULTS_CACHE_MAX. Combined with the move-to-end in GET, this
+    makes the cache a strict LRU."""
+    with _results_lock:
+        _results_cache[key] = value
+        while len(_results_cache) > _RESULTS_CACHE_MAX:
+            _results_cache.popitem(last=False)
+
+
+# ---- Profiling infrastructure --------------------------------------------
+# /api/mem uses tracemalloc (stdlib) to attribute Python heap usage to
+# specific source lines. It is lazy-started on the first call so the
+# steady-state cost is zero, and it can be hard-disabled with
+# MEM_TRACE=0 if the ~10-30% per-allocation overhead is unwelcome.
+#
+# /api/perf reads a per-request duration ring buffer (sampled by the
+# HTTP middleware below; ~1µs per request). The two endpoints together
+# answer "what is eating memory" and "what is slow" without re-running
+# the workload under memray.
+MEM_TRACE = os.environ.get("MEM_TRACE", "1") == "1"
+_TRACEMALLOC_ACTIVE = False
+_TRACEMALLOC_BASELINE = None  # type: ignore[var-annotated]  # tracemalloc.Snapshot
+_MEM_LOCK = threading.Lock()
+
+_TIMING: deque[dict] = deque(maxlen=500)
+_TIMING_LOCK = threading.Lock()
 
 
 def _invalidate_results_cache(prefix: str = "all:") -> None:
@@ -239,6 +316,11 @@ def _serialize_global(
 
 def _run_and_store(*, query: str, n_samples: int, top_k: int,
                    batch_size: int) -> dict:
+    # Pass `classifier=None` so the BioCLIP model isn't loaded unless a
+    # run actually has BioCLIP work to do. The pipeline resolves the
+    # singleton lazily on first predict() — for fully-cached runs (n_new
+    # == 0 across kingdom, species, and bbox-bioclip) the model never
+    # loads, saving ~5.5 GB of resident memory.
     out = run_pipeline(
         base_url=BASE_URL,
         api_key=API_KEY,
@@ -246,7 +328,7 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
         n_samples=n_samples,
         top_k=top_k,
         db_path=DB_PATH,
-        classifier=_get_classifier(),
+        classifier=None,
         batch_size=batch_size,
     )
     if out is None:
@@ -281,6 +363,39 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
                 ],
                 "detections": r.detections,
                 "taxon_scores": r.taxon_scores,
+                # Slim attribution for the run payload — same shape as
+                # the grid row, uses the whole-image top-K plus
+                # taxon_scores. The YOLO bbox-bioclip join is too
+                # expensive to ship with every run result; the asset
+                # detail endpoint already carries the full version.
+                "plant_attribution": storage.compute_plant_attribution(
+                    taxon_scores=r.taxon_scores,
+                    top_predictions=[
+                        {
+                            "species": p.species,
+                            "common_name": p.common_name,
+                            "score": p.score,
+                            "kingdom": p.kingdom,
+                            "family": p.family,
+                            "genus": p.genus,
+                        }
+                        for p in r.top_predictions
+                    ],
+                    detections=r.detections,
+                ) if r.detections else storage.compute_plant_attribution(
+                    taxon_scores=r.taxon_scores,
+                    top_predictions=[
+                        {
+                            "species": p.species,
+                            "common_name": p.common_name,
+                            "score": p.score,
+                            "kingdom": p.kingdom,
+                            "family": p.family,
+                            "genus": p.genus,
+                        }
+                        for p in r.top_predictions
+                    ],
+                ),
             }
             for r in out.results
         ],
@@ -289,13 +404,33 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
     }
     # Drop cache entries: the global "all" view (the run may have added
     # new photos) and any per-run entry (kept for backwards compat with
-    # the old /api/results?run=... path). Also invalidate the near-dup
-    # cache — new embeddings change which photos are near-duplicates —
-    # and the cluster-names cache — HDBSCAN may reassign cluster_ids.
+    # the old /api/results?run=... path). Also invalidate the cluster
+    # names cache — HDBSCAN may reassign cluster_ids.
     with _results_lock:
         _invalidate_results_cache("all:")
-        _results_cache.pop(out.run_id, None)
-    storage.invalidate_global_near_dup_cache()
+        _results_cache.pop(str(out.run_id), None)
+    _invalidate_clusters_cache()
+    # Precompute the near-dup map so the user's first /api/results after
+    # the pipeline finishes hits the cache. compute_near_dup_groups is
+    # ~3.6s with 19k assets (chunked matmul); we run it here, in the
+    # pipeline thread, instead of making the first page load pay it.
+    # The on-disk cache is invalidated first so the next save reflects
+    # the post-pipeline embeddings. Wrapped in try/except so a warm
+    # failure doesn't break the pipeline response — the cache just
+    # stays cold.
+    t0 = time.perf_counter()
+    try:
+        storage.invalidate_global_near_dup_cache()
+        storage.delete_near_dup_cache(NEAR_DUP_CACHE_PATH)
+        with storage.connect(DB_PATH) as conn:
+            storage.get_global_near_dup_groups(conn)
+        storage.save_near_dup_cache(NEAR_DUP_CACHE_PATH)
+        _log.info(
+            "near-dup cache rewarmed after pipeline run in %.1fs",
+            time.perf_counter() - t0,
+        )
+    except Exception:
+        _log.exception("near-dup cache warm failed; cache stays cold")
     with storage.connect(DB_PATH) as conn:
         storage.invalidate_cluster_names(conn)
     return payload
@@ -330,7 +465,7 @@ async def _start_run(query: str, n_samples: int, top_k: int,
                 detail=f"pipeline failed: {state.get('last_error')}",
             )
         with _results_lock:
-            _results_cache[data["run_id"]] = data
+            _results_cache_put(str(data["run_id"]), data)
         return data
     finally:
         _pipeline_lock.release()
@@ -342,6 +477,49 @@ async def lifespan(_app: FastAPI):
     # (~200 MB) is the default and we don't want to pay the ~3 GB cost
     # of model weights until the user actually hits POST /api/run.
     # The classifier is lazily constructed on first _run_and_store().
+    #
+    # The near-dup map (compute_near_dup_groups) is persisted to
+    # `data/near_dup_cache.pkl` (1 MB for 19k assets) at the end of
+    # every pipeline run. At startup we try to load it first — that
+    # covers the common case where the DB hasn't changed since the
+    # last warm. If the file is missing or corrupt, fall back to a
+    # fresh compute (3.6s with 19k assets).
+    if storage._GLOBAL_NEAR_DUP_CACHE is None:
+        try:
+            def _load_or_warm():
+                # Try disk first.
+                loaded = storage.load_near_dup_cache(NEAR_DUP_CACHE_PATH)
+                if loaded is not None:
+                    storage._GLOBAL_NEAR_DUP_CACHE = loaded
+                    return ("loaded", len(loaded))
+                # Nothing on disk — compute from SQLite.
+                with storage.connect(DB_PATH) as conn:
+                    n = conn.execute(
+                        "SELECT COUNT(*) AS n FROM embeddings"
+                    ).fetchone()["n"]
+                if n == 0:
+                    return ("empty", 0)
+                storage.invalidate_global_near_dup_cache()
+                with storage.connect(DB_PATH) as conn:
+                    storage.get_global_near_dup_groups(conn)
+                # Persist for next start.
+                storage.save_near_dup_cache(NEAR_DUP_CACHE_PATH)
+                return ("computed", n)
+            t0 = time.perf_counter()
+            how, n = await asyncio.to_thread(_load_or_warm)
+            dt = time.perf_counter() - t0
+            if how == "loaded":
+                _log.info(
+                    "near-dup cache loaded from %s in %.2fs (%d entries)",
+                    NEAR_DUP_CACHE_PATH, dt, n,
+                )
+            elif how == "computed":
+                _log.info(
+                    "near-dup cache computed at startup: %d embeddings in %.1fs",
+                    n, dt,
+                )
+        except Exception:
+            _log.exception("startup near-dup load/warm failed; cache stays cold")
     if RUN_ON_STARTUP:
         try:
             await _start_run(QUERY, N_SAMPLES, TOP_K, BATCH_SIZE)
@@ -356,6 +534,34 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Immich × BioCLIP", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def _timing_middleware(request: Request, call_next):
+    """Record per-request duration into the /api/perf ring buffer.
+
+    Excludes the profiling endpoints themselves (so polling /api/perf
+    doesn't drown out real work) and the long-lived SSE stream (one
+    entry per connection lifetime, not useful for slow-load diagnosis).
+    """
+    path = request.url.path
+    if path in ("/api/perf", "/api/mem", "/api/events"):
+        return await call_next(request)
+    t0 = time.perf_counter()
+    status = 500
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    finally:
+        _TIMING.append({
+            "t": t0,
+            "method": request.method,
+            "path": path,
+            "status": status,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+        })
+
 
 # Serve the React SPA at /. Only mounts when frontend/dist/ exists (i.e.
 # someone has run `npm run build`). The mount happens at the very end of
@@ -377,13 +583,32 @@ async def list_runs() -> dict:
 
 
 @app.get("/api/clusters")
-async def clusters_endpoint() -> dict:
+async def clusters_endpoint(
+    plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
+) -> dict:
+    # cluster_summary walks every (cluster_id, top-1 prediction) pair
+    # with 3 nested sub-queries per cluster — ~450 ms for ~700 clusters.
+    # The result is cacheable across requests because it depends only
+    # on (plantae, plantae_green, plantae_yellow), which are exactly
+    # the inputs the UI sends. The cache is invalidated when a pipeline
+    # run completes (HDBSCAN may reassign cluster_ids).
+    cache_key = (plantae, PLANTAE_GREEN, PLANTAE_YELLOW)
+    with _clusters_cache_lock:
+        cached = _clusters_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     # cluster_summary + ensure_cluster_names can take ~100-500ms once
     # the name cache is cold (walks every prediction). Offload so the
     # event loop stays free for the SSE generator.
     def _build():
         with storage.connect(DB_PATH) as conn:
-            rows = storage.cluster_summary(conn)
+            rows = storage.cluster_summary(
+                conn,
+                plantae=plantae,
+                plantae_green=PLANTAE_GREEN,
+                plantae_yellow=PLANTAE_YELLOW,
+            )
             # Augment each cluster with a human-readable name computed from
             # its top-1 prediction distribution (see storage.compute_cluster_names).
             # ensure_cluster_names() lazily computes & caches the names on
@@ -396,7 +621,18 @@ async def clusters_endpoint() -> dict:
                 r["top_species"] = info.get("top_species", [])[:2]
                 r["top_genus"] = info.get("top_genus", [])[:2]
             return {"clusters": rows}
-    return await asyncio.to_thread(_build)
+
+    payload = await asyncio.to_thread(_build)
+    with _clusters_cache_lock:
+        _clusters_cache[cache_key] = payload
+    return payload
+
+
+def _invalidate_clusters_cache() -> None:
+    """Drop the /api/clusters cache. Called after a pipeline run
+    (HDBSCAN may have reassigned cluster_ids) and on demand."""
+    with _clusters_cache_lock:
+        _clusters_cache.clear()
 
 
 @app.post("/api/clusters/recompute")
@@ -596,6 +832,7 @@ async def cache_invalidate(prefix: str = Query(default="all:")) -> dict:
     keeps serving the pre-update payload until it is restarted.
     """
     _invalidate_results_cache(prefix)
+    _invalidate_clusters_cache()
     return {"invalidated_prefix": prefix}
 
 
@@ -608,6 +845,7 @@ async def get_results(
     genus: str | None = Query(default=None),
     family: str | None = Query(default=None),
     has_person: int | None = Query(default=None, ge=0, le=1),
+    plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
     sort: str = Query(default="rank", pattern="^(rank|time|added)$"),
 ) -> dict:
     """Return a paginated slice of every indexed asset. The `run` param
@@ -620,37 +858,45 @@ async def get_results(
       label of the same value
     - has_person: 0 (no person) or 1 (has person). Plain WHERE on
       assets.has_person; NULL rows (unscanned) are excluded by both.
+    - plantae: "plant" (≥PLANTAE_GREEN), "uncertain" (≥PLANTAE_YELLOW
+      and <PLANTAE_GREEN), or "non_plant" (<PLANTAE_YELLOW). Uses the
+      kingdom score stored in taxon_scores (already on every asset).
     - sort: 'rank' (default, server-defined order — Immich rank then
       cluster_id tiebreak), 'time' (newest captured_at first, NULLs
       last), or 'added' (newest first_seen_at first, NULLs last).
       Time/added sort happens server-side so the page slice is the
       actual most-recent N photos, not the top-N by rank re-sorted.
+
+    `pagination.total` is the raw file count (every photo, pre-dedup)
+    so the breadcrumb and "all" tile match. `pagination.total_pages`
+    is computed from representative-card count so page buttons reflect
+    what's actually browsable.
     """
     # Cache key includes every filter + sort param so different filter
-    # combinations can't poison each other. has_person is included so
-    # has_person=0 and has_person=1 each get their own cached slice.
-    has_filter = any(v is not None for v in (cluster_id, species, genus, family, has_person))
+    # combinations can't poison each other. has_person and plantae are
+    # included so each value gets its own cached slice.
+    has_filter = any(v is not None for v in (cluster_id, species, genus, family, has_person, plantae))
     cache_key = (
-        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:sort={sort}"
-        if has_filter else f"all:hp={has_person}:sort={sort}"
+        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:sort={sort}"
+        if has_filter else f"all:hp={has_person}:pl={plantae}:sort={sort}"
     )
 
-    with _results_lock:
-        cached = _results_cache.get(cache_key)
-        if cached is not None:
-            all_results = cached.get("results", [])
-            total = len(all_results)
-            start = page * page_size
-            end = start + page_size
-            payload = dict(cached)
-            payload["results"] = all_results[start:end]
-            payload["pagination"] = {
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-                "total_pages": (total + page_size - 1) // page_size if total else 0,
-            }
-            return payload
+    cached = _results_cache_get(cache_key)
+    if cached is not None:
+        all_results = cached.get("results", [])
+        total_assets = cached["pagination"]["total"]
+        total_reps = len(all_results)
+        start = page * page_size
+        end = start + page_size
+        payload = dict(cached)
+        payload["results"] = all_results[start:end]
+        payload["pagination"] = {
+            "page": page,
+            "page_size": page_size,
+            "total": total_assets,
+            "total_pages": (total_reps + page_size - 1) // page_size if total_reps else 0,
+        }
+        return payload
 
     # Cache miss → build from SQLite. The query asks for ALL matching
     # rows (page_size=10M) so we can sort/filter in Python once, then
@@ -659,7 +905,7 @@ async def get_results(
     # serve other requests in parallel.
     def _build():
         with storage.connect(DB_PATH) as conn:
-            results, total = storage.get_all_results(
+            results, total_reps, total_assets = storage.get_all_results(
                 conn,
                 page=0,
                 page_size=10_000_000,  # fetch all matching, slice in memory
@@ -668,9 +914,17 @@ async def get_results(
                 genus=genus,
                 family=family,
                 has_person=has_person,
+                plantae=plantae,
+                plantae_green=PLANTAE_GREEN,
+                plantae_yellow=PLANTAE_YELLOW,
             )
-            taxonomy = storage.get_global_taxonomy_summary(conn)
-            if total == 0:
+            taxonomy = storage.get_global_taxonomy_summary(
+                conn,
+                plantae=plantae,
+                plantae_green=PLANTAE_GREEN,
+                plantae_yellow=PLANTAE_YELLOW,
+            )
+            if total_assets == 0:
                 return {"error": "no assets match this filter", "results": []}, results
             # Server-side time sort. Without this, the client-side sortRows()
             # would only re-order the page slice the server already picked by
@@ -701,8 +955,8 @@ async def get_results(
                 pagination={
                     "page": page,
                     "page_size": page_size,
-                    "total": total,
-                    "total_pages": (total + page_size - 1) // page_size if total else 0,
+                    "total": total_assets,
+                    "total_pages": (total_reps + page_size - 1) // page_size if total_reps else 0,
                 },
                 taxonomy=taxonomy,
             )
@@ -710,11 +964,11 @@ async def get_results(
 
     payload, results = await asyncio.to_thread(_build)
     if "results" in payload and not payload.get("error"):
-        with _results_lock:
-            # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
-            full_payload = dict(payload)
-            full_payload["results"] = results
-            _results_cache[cache_key] = full_payload
+        # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
+        # The LRU cache (max _RESULTS_CACHE_MAX entries) bounds total memory.
+        full_payload = dict(payload)
+        full_payload["results"] = results
+        _results_cache_put(cache_key, full_payload)
     return payload
 
 
@@ -753,8 +1007,20 @@ async def asset_detail(asset_id: str) -> dict:
             ts_map = storage.fetch_taxon_scores(conn, asset_ids=[asset_id], rank="kingdom")
             taxon_scores = ts_map.get(asset_id) or {}
             # 4. YOLO detections with bbox-BioCLIP joined (filtered by min_score).
+            # Bumped from 0.10 to 0.20: the new "plants in this image"
+            # summary (compute_plant_attribution) absorbs the noise and
+            # only surfaces boxes that justify drawing on the canvas.
             detections = storage.fetch_detections(
-                conn, asset_id=asset_id, min_score=0.10, rank="species"
+                conn, asset_id=asset_id, min_score=0.20, rank="species"
+            )
+            # 4a. Plant attribution summary — combines whole-image top-K
+            # with YOLO bbox crops into a single "plants in this image"
+            # list. The asset-detail modal renders this block first; the
+            # top-K and YOLO sections below it move to a "debug" panel.
+            plant_attribution = storage.compute_plant_attribution(
+                taxon_scores=taxon_scores,
+                top_predictions=top_preds,
+                detections=detections,
             )
             # Detections carry int id and bbox floats — JSON-friendly as-is.
             # 4b. Top-K nearest neighbors across the whole processed library.
@@ -804,6 +1070,7 @@ async def asset_detail(asset_id: str) -> dict:
                 "top_predictions": top_preds,
                 "taxon_scores": taxon_scores,
                 "detections": detections,
+                "plant_attribution": plant_attribution,
                 "library_neighbors": library_neighbors,
                 "knn": knn_payload,
             }
@@ -829,6 +1096,9 @@ async def asset_detail(asset_id: str) -> dict:
 class PlantsAlbumParams(BaseModel):
     min_score: float | None = None     # default → PLANTAE_GREEN at call site
     force_recreate: bool = False       # set True to drop the saved id and create
+    # Membership filter for the Sync-to-IMMICH UX. None = any (default),
+    # 0 = without people (also matches unscanned), 1 = with people.
+    people_filter: int | None = None
 
 
 # In-memory job registry. Keyed by job_id (uuid4). The state dict is
@@ -856,18 +1126,30 @@ def _immich_client() -> ImmichClient:
     return ImmichClient(base_url=BASE_URL, api_key=API_KEY, timeout=60.0)
 
 
-def _plants_album_worker(job_id: str, min_score: float, force_recreate: bool) -> None:
+def _plants_album_worker(
+    job_id: str,
+    min_score: float,
+    force_recreate: bool,
+    people_filter: int | None = None,
+) -> None:
     """Body of the background job. Reads asset_ids, opens the album (or
     creates one), and chunked-PUTs the assets while updating `job`
     progress in-place. Owns the ImmichClient lifecycle and persists the
     final `album_meta` row at the end.
+
+    `people_filter` narrows the asset set BEFORE bulk-add (any /
+    without people / with people). Same semantics as the kingdom picker;
+    threaded through so the Sync-to-IMMICH section can scope Plantae
+    albums by membership without duplicating the album-create flow.
     """
     import time as _time
     chunk_size = 1000
     PLANTS_ALBUM_NAME = "Plantae (BioCLIP)"
     try:
         with storage.connect(DB_PATH) as conn:
-            asset_ids = storage.find_plantae_assets(conn, min_score=min_score)
+            asset_ids = storage.find_plantae_assets(
+                conn, min_score=min_score, people_filter=people_filter
+            )
             saved = storage.get_album_meta(conn, "plants_album_id") or {}
             saved_album_id = (
                 saved.get("album_id") if not force_recreate else None
@@ -877,6 +1159,7 @@ def _plants_album_worker(job_id: str, min_score: float, force_recreate: bool) ->
             _plants_jobs[job_id]["n_assets"] = len(asset_ids)
             _plants_jobs[job_id]["n_chunks"] = max(1, (len(asset_ids) + chunk_size - 1) // chunk_size)
             _plants_jobs[job_id]["min_score"] = min_score
+            _plants_jobs[job_id]["people_filter"] = people_filter
 
         client = _immich_client()
         try:
@@ -978,10 +1261,13 @@ async def start_plants_album(params: PlantsAlbumParams) -> dict:
     show a confirm dialog with the actual number of photos to tag.
     """
     min_score = params.min_score if params.min_score is not None else PLANTAE_GREEN
+    people_filter = params.people_filter
     # Pre-count so the confirm dialog knows the size. Cheap (one SQL
     # query); the worker re-runs it but we want a stable preview.
     with storage.connect(DB_PATH) as conn:
-        preview_ids = storage.find_plantae_assets(conn, min_score=min_score)
+        preview_ids = storage.find_plantae_assets(
+            conn, min_score=min_score, people_filter=people_filter
+        )
         saved = storage.get_album_meta(conn, "plants_album_id") or {}
 
     job_id = uuid.uuid4().hex
@@ -991,6 +1277,7 @@ async def start_plants_album(params: PlantsAlbumParams) -> dict:
             "status": "running",
             "min_score": min_score,
             "force_recreate": params.force_recreate,
+            "people_filter": people_filter,
             "n_assets": len(preview_ids),
             "n_chunks": max(1, (len(preview_ids) + 999) // 1000),
             "chunks_done": 0,
@@ -1005,7 +1292,7 @@ async def start_plants_album(params: PlantsAlbumParams) -> dict:
 
     t = threading.Thread(
         target=_plants_album_worker,
-        args=(job_id, min_score, params.force_recreate),
+        args=(job_id, min_score, params.force_recreate, people_filter),
         daemon=True,
         name=f"plants-album-{job_id[:8]}",
     )
@@ -1014,6 +1301,7 @@ async def start_plants_album(params: PlantsAlbumParams) -> dict:
     return {
         "job_id": job_id,
         "min_score": min_score,
+        "people_filter": people_filter,
         "n_assets": len(preview_ids),
         "n_chunks": max(1, (len(preview_ids) + 999) // 1000),
         "reused_existing": None,  # resolved by worker
@@ -1022,18 +1310,28 @@ async def start_plants_album(params: PlantsAlbumParams) -> dict:
 
 
 @app.get("/api/album/plants/preview")
-async def plants_album_preview(min_score: float | None = None) -> dict:
+async def plants_album_preview(
+    min_score: float | None = None,
+    people_filter: int | None = None,
+) -> dict:
     """Count-only preview for the Plants-album button. Lets the UI show
     'Tag N photos' in its confirmation panel WITHOUT actually starting a
     job (so the user can cancel without spawning a background thread).
+
+    `people_filter` (None / 0 / 1) narrows the count to the chosen
+    membership scope so the per-action confirm modal shows the real
+    number that the click will produce.
     """
     ms = min_score if min_score is not None else PLANTAE_GREEN
     with storage.connect(DB_PATH) as conn:
-        ids = storage.find_plantae_assets(conn, min_score=ms)
+        ids = storage.find_plantae_assets(
+            conn, min_score=ms, people_filter=people_filter
+        )
         saved = storage.get_album_meta(conn, "plants_album_id") or {}
     chunk_size = 1000
     return {
         "min_score": ms,
+        "people_filter": people_filter,
         "n_assets": len(ids),
         "n_chunks": max(1, (len(ids) + chunk_size - 1) // chunk_size),
         "saved_album_id": saved.get("album_id"),
@@ -1293,6 +1591,7 @@ async def reclassify(params: ReclassifyParams) -> dict:
     # the new KNN rows.
     with _results_lock:
         _invalidate_results_cache("all:")
+    _invalidate_clusters_cache()
     return {"stats": stats, "results": fresh}
 
 
@@ -1333,12 +1632,18 @@ def run_knn_reclassify_sync(asset_ids: list[str], k: int) -> dict:
 
 class ClusterAlbumSyncParams(BaseModel):
     force_recreate: bool = False
+    # Membership filter — None = any, 0 = without people, 1 = with
+    # people. Applied via storage.get_assets_in_cluster(...,
+    # people_filter=...) so an unscanned asset counts as "without
+    # people" until the person stage runs.
+    people_filter: int | None = None
 
 
 class KingdomAlbumParams(BaseModel):
     kingdom: str = "Plantae"     # "Plantae" | "Fungi" | ...
     min_score: float | None = None  # default → kingdom-specific at call site
     force_recreate: bool = False
+    people_filter: int | None = None
 
 
 class ClusteringRefitParams(BaseModel):
@@ -1374,18 +1679,27 @@ def _prune_locked(registry: dict, ttl_s: float) -> None:
 
 
 def _cluster_album_worker(
-    job_id: str, cluster_id: int, force_recreate: bool
+    job_id: str,
+    cluster_id: int,
+    force_recreate: bool,
+    people_filter: int | None = None,
 ) -> None:
     """Body of the per-cluster album sync job. Mirrors the Plants worker
     but: (a) reads assets via `cluster_albums`, (b) names the album
     "Cluster {id} ({cluster_name})", (c) persists the mapping via
     `set_cluster_album` instead of `set_album_meta`.
+
+    `people_filter` narrows the asset set BEFORE bulk-add (any /
+    without people / with people). Same NULL-as-without-people semantics
+    as the kingdom picker so unscanned assets don't drop silently.
     """
     import time as _time
     chunk_size = 1000
     try:
         with storage.connect(DB_PATH) as conn:
-            asset_ids = storage.get_assets_in_cluster(conn, cluster_id)
+            asset_ids = storage.get_assets_in_cluster(
+                conn, cluster_id, people_filter=people_filter
+            )
             saved = storage.get_cluster_album(conn, cluster_id)
             # Look up cluster name for the album title (best-effort; fall
             # back to "Cluster {id}" if names haven't been computed yet).
@@ -1408,6 +1722,7 @@ def _cluster_album_worker(
             _cluster_album_jobs[job_id]["n_chunks"] = max(
                 1, (len(asset_ids) + chunk_size - 1) // chunk_size
             )
+            _cluster_album_jobs[job_id]["people_filter"] = people_filter
 
         client = _immich_client()
         try:
@@ -1487,16 +1802,27 @@ def _cluster_album_worker(
 
 
 @app.get("/api/album/cluster/{cluster_id}/preview")
-async def cluster_album_preview(cluster_id: int) -> dict:
+async def cluster_album_preview(
+    cluster_id: int,
+    people_filter: int | None = None,
+) -> dict:
     """Count-only preview for the per-cluster sync button. Lets the UI
     show 'Tag N photos as cluster album' in its confirm panel without
     spawning a background job (so the user can cancel without any work
-    happening)."""
+    happening).
+
+    `people_filter` (None / 0 / 1) narrows the count to the chosen
+    membership scope so the per-action confirm modal shows the real
+    number that the click will produce.
+    """
     with storage.connect(DB_PATH) as conn:
-        n = storage.count_assets_in_cluster(conn, cluster_id)
+        n = storage.count_assets_in_cluster(
+            conn, cluster_id, people_filter=people_filter
+        )
         saved = storage.get_cluster_album(conn, cluster_id)
     return {
         "cluster_id": cluster_id,
+        "people_filter": people_filter,
         "n_assets": n,
         "saved_album_id": saved["album_id"] if saved else None,
     }
@@ -1511,7 +1837,9 @@ async def start_cluster_album_sync(
     by cluster_id. Returns immediately with a `job_id`; the UI polls
     /api/album/cluster/job/{job_id} for progress."""
     with storage.connect(DB_PATH) as conn:
-        n = storage.count_assets_in_cluster(conn, cluster_id)
+        n = storage.count_assets_in_cluster(
+            conn, cluster_id, people_filter=params.people_filter
+        )
         saved = storage.get_cluster_album(conn, cluster_id)
 
     if n == 0:
@@ -1527,6 +1855,7 @@ async def start_cluster_album_sync(
             "status": "running",
             "cluster_id": cluster_id,
             "force_recreate": params.force_recreate,
+            "people_filter": params.people_filter,
             "n_assets": n,
             "n_chunks": max(1, (n + 999) // 1000),
             "chunks_done": 0,
@@ -1540,7 +1869,7 @@ async def start_cluster_album_sync(
         }
     threading.Thread(
         target=_cluster_album_worker,
-        args=(job_id, cluster_id, params.force_recreate),
+        args=(job_id, cluster_id, params.force_recreate, params.people_filter),
         daemon=True,
         name=f"cluster-album-{cluster_id}-{job_id[:8]}",
     ).start()
@@ -1548,6 +1877,7 @@ async def start_cluster_album_sync(
     return {
         "job_id": job_id,
         "cluster_id": cluster_id,
+        "people_filter": params.people_filter,
         "n_assets": n,
         "n_chunks": max(1, (n + 999) // 1000),
         "reused_existing": None,
@@ -1573,7 +1903,11 @@ async def cluster_album_job_status(job_id: str) -> dict:
 # ---- sync-all-clusters --------------------------------------------------
 
 
-def _cluster_album_sync_all_worker(job_id: str, force_recreate: bool) -> None:
+def _cluster_album_sync_all_worker(
+    job_id: str,
+    force_recreate: bool,
+    people_filter: int | None = None,
+) -> None:
     """Body of the bulk 'sync every cluster as an album' job. Iterates
     over every cluster in `cluster_summary()` and runs the same flow as
     `_cluster_album_worker` for each, persisting the cluster→album
@@ -1582,6 +1916,11 @@ def _cluster_album_sync_all_worker(job_id: str, force_recreate: bool) -> None:
     Progress is tracked at the cluster level (clusters_done / n_clusters)
     and asset level (photos_added / n_assets_total). The UI shows both
     in the progress bar text so the user knows the bulk run is moving.
+
+    `people_filter` narrows each cluster's asset list before bulk-add.
+    A cluster that becomes empty after the filter is SKIPPED (not
+    synced as an empty album) so the Run page "Sync clusters (all)"
+    button doesn't produce phantom albums for filtered-out clusters.
     """
     import time as _time
     chunk_size = 1000
@@ -1612,6 +1951,7 @@ def _cluster_album_sync_all_worker(job_id: str, force_recreate: bool) -> None:
             _cluster_album_jobs[job_id]["n_assets_total"] = n_assets_total
             _cluster_album_jobs[job_id]["clusters_done"] = 0
             _cluster_album_jobs[job_id]["photos_added"] = 0
+            _cluster_album_jobs[job_id]["people_filter"] = people_filter
 
         client = _immich_client()
         try:
@@ -1626,9 +1966,21 @@ def _cluster_album_sync_all_worker(job_id: str, force_recreate: bool) -> None:
                 )
 
                 # Per-cluster album: same reuse-or-create logic as the
-                # single-cluster worker.
+                # single-cluster worker. The picker applies the same
+                # people_filter for every cluster so the user gets a
+                # uniform membership scope across the bulk run.
                 with storage.connect(DB_PATH) as conn:
-                    asset_ids = storage.get_assets_in_cluster(conn, cluster_id)
+                    asset_ids = storage.get_assets_in_cluster(
+                        conn, cluster_id, people_filter=people_filter
+                    )
+                    # Skip clusters that became empty after the filter
+                    # — creating an empty Immich album adds noise
+                    # without contributing to the requested scope.
+                    if not asset_ids:
+                        with _cluster_album_jobs_lock:
+                            _cluster_album_jobs[job_id]["clusters_done"] = idx + 1
+                            _cluster_album_jobs[job_id]["current_cluster_id"] = cluster_id
+                        continue
                     saved = storage.get_cluster_album(conn, cluster_id)
 
                 reused = False
@@ -1716,7 +2068,15 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
     every cluster in the DB. Returns a `job_id`; poll
     /api/album/cluster/job/{job_id} for progress (cluster-level +
     asset-level). Useful when you want to tag every visible cluster
-    without clicking each pill individually."""
+    without clicking each pill individually.
+
+    `people_filter` (optional, from the Sync-to-IMMICH defaults) is
+    applied per-cluster inside the worker — clusters that have no assets
+    matching the filter are skipped to avoid empty albums. The preview
+    numbers below reflect the unfiltered counts so the confirm modal
+    can show the "before" picture; the worker reports the actual
+    filtered counts as it goes.
+    """
     with storage.connect(DB_PATH) as conn:
         # Quick cluster-count preview so the UI can show "Sync N
         # clusters (M total photos)?" in its confirm panel.
@@ -1744,6 +2104,7 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
             "status": "running",
             "scope": "all",
             "force_recreate": params.force_recreate,
+            "people_filter": params.people_filter,
             "n_clusters": len(clusters),
             "n_assets_total": n_assets_total,
             "clusters_done": 0,
@@ -1755,7 +2116,7 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
         }
     threading.Thread(
         target=_cluster_album_sync_all_worker,
-        args=(job_id, params.force_recreate),
+        args=(job_id, params.force_recreate, params.people_filter),
         daemon=True,
         name=f"cluster-album-all-{job_id[:8]}",
     ).start()
@@ -1763,6 +2124,7 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
     return {
         "job_id": job_id,
         "scope": "all",
+        "people_filter": params.people_filter,
         "n_clusters": len(clusters),
         "n_assets_total": n_assets_total,
     }
@@ -1799,6 +2161,97 @@ async def delete_cluster_album(
     return {"deleted": True, "remote_deleted": remote_deleted}
 
 
+class ClusterAlbumsRemoveParams(BaseModel):
+    """Body for POST /api/album/cluster/remove. `cluster_ids=None`
+    means "all currently synced clusters" (the default Run-page
+    action). Pass an explicit list to scope the removal; the endpoint
+    validates each id against the existing cluster_albums rows so a
+    typo'd id is silently ignored rather than producing a confusing
+    error.
+    """
+    cluster_ids: list[int] | None = None
+    delete_in_immich: bool = False
+
+
+@app.post("/api/album/cluster/remove")
+async def bulk_remove_cluster_albums(
+    params: ClusterAlbumsRemoveParams,
+) -> dict:
+    """Bulk-remove cluster→album mappings. One round-trip replaces N
+    DELETE /api/album/cluster/{id} calls for the Sync-to-IMMICH
+    "Remove synced clusters" button.
+
+    Behaviour:
+      - `cluster_ids=None` → every currently synced cluster
+      - `delete_in_immich=True` → also DELETE the album in Immich
+        (404 is treated as already-gone, same as the single DELETE)
+      - Per-cluster errors are collected in `errors` so one failure
+        (e.g. transient network) doesn't abort the whole bulk
+
+    Returns `{removed, remote_deleted, errors: [{cluster_id, error}]}`.
+    """
+    with storage.connect(DB_PATH) as conn:
+        if params.cluster_ids is None:
+            all_rows = storage.list_cluster_albums(conn)
+            target_ids = [int(r["cluster_id"]) for r in all_rows]
+        else:
+            target_ids = [int(c) for c in params.cluster_ids]
+
+    if not target_ids:
+        return {"removed": 0, "remote_deleted": 0, "errors": []}
+
+    removed = 0
+    remote_deleted = 0
+    errors: list[dict] = []
+
+    # Single ImmichClient lifecycle for the whole batch — opening /
+    # closing per cluster would burn ~30ms × N on the LAN.
+    client = _immich_client() if params.delete_in_immich else None
+    try:
+        for cluster_id in target_ids:
+            try:
+                with storage.connect(DB_PATH) as conn:
+                    saved = storage.get_cluster_album(conn, cluster_id)
+                    if saved is None:
+                        # No mapping — quietly skip. Tells the caller
+                        # this id was already gone; the UI's "sync
+                        # status" list will refresh on the next read.
+                        continue
+                    storage.delete_cluster_album(conn, cluster_id)
+                removed += 1
+                if client is not None:
+                    try:
+                        client.delete_album(album_id=saved["album_id"])
+                        remote_deleted += 1
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 404:
+                            # already gone in Immich — local row was
+                            # the source of truth; count it as success
+                            remote_deleted += 1
+                        else:
+                            errors.append({
+                                "cluster_id": cluster_id,
+                                "error": (
+                                    f"DELETE /api/albums/{saved['album_id']} → "
+                                    f"HTTP {e.response.status_code}"
+                                ),
+                            })
+            except Exception as e:  # noqa: BLE001 — surface anything else
+                errors.append({
+                    "cluster_id": cluster_id,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+    finally:
+        if client is not None:
+            client.close()
+
+    return {
+        "removed": removed,
+        "remote_deleted": remote_deleted,
+        "errors": errors,
+    }
+
+
 @app.get("/api/album/cluster")
 async def list_cluster_albums() -> dict:
     """All current cluster→album mappings, joined with cluster_names so
@@ -1825,18 +2278,30 @@ async def list_cluster_albums() -> dict:
 
 
 def _kingdom_album_worker(
-    job_id: str, kingdom: str, min_score: float, force_recreate: bool
+    job_id: str,
+    kingdom: str,
+    min_score: float,
+    force_recreate: bool,
+    people_filter: int | None = None,
 ) -> None:
     """Body of the kingdom-album job. Mirrors the Plants worker but
     parameterized by kingdom (Plantae / Fungi / ...). Album name is
-    "{kingdom} (BioCLIP)"; meta is persisted by kingdom name."""
+    "{kingdom} (BioCLIP)"; meta is persisted by kingdom name.
+
+    `people_filter` narrows the asset set BEFORE bulk-add (any /
+    without people / with people). Threaded through so the Fungi and
+    Plantae buttons can independently scope by membership.
+    """
     import time as _time
     chunk_size = 1000
     album_name = f"{kingdom} (BioCLIP)"
     try:
         with storage.connect(DB_PATH) as conn:
             asset_ids = storage.find_kingdom_assets(
-                conn, kingdom=kingdom, min_score=min_score
+                conn,
+                kingdom=kingdom,
+                min_score=min_score,
+                people_filter=people_filter,
             )
             saved = storage.get_kingdom_album_meta(conn, kingdom) or {}
             saved_album_id = (
@@ -1849,6 +2314,7 @@ def _kingdom_album_worker(
             j["n_chunks"] = max(
                 1, (len(asset_ids) + chunk_size - 1) // chunk_size
             )
+            j["people_filter"] = people_filter
 
         client = _immich_client()
         try:
@@ -1935,18 +2401,36 @@ def _kingdom_album_worker(
 async def kingdom_album_preview(
     kingdom: str = Query(default="Plantae"),
     min_score: float | None = Query(default=None),
+    people_filter: int | None = Query(default=None),
 ) -> dict:
     """Count-only preview for the kingdom-album button. Lets the UI show
     'Tag N photos as Plantae album' in its confirm panel without spawning
     a job. Default threshold mirrors the env config for Plantae; Fungi
-    callers should pass an explicit min_score."""
-    ms = min_score if min_score is not None else PLANTAE_GREEN
+    callers should pass an explicit min_score.
+
+    `people_filter` narrows the count to the chosen membership scope so
+    the per-action confirm modal shows the real number the click will
+    produce.
+    """
+    # Kingdom-specific default threshold when caller leaves it blank.
+    # Plantae uses the legacy PLANTAE_GREEN; every other kingdom
+    # (Fungi / Animalia / ...) falls back to FUNGI_MIN_SCORE_DEFAULT
+    # which is also the right ballpark for BioCLIP-2 kingdom scores.
+    if min_score is not None:
+        ms = min_score
+    elif kingdom == "Plantae":
+        ms = PLANTAE_GREEN
+    else:
+        ms = FUNGI_MIN_SCORE_DEFAULT
     with storage.connect(DB_PATH) as conn:
-        n = storage.count_kingdom_assets(conn, kingdom=kingdom, min_score=ms)
+        n = storage.count_kingdom_assets(
+            conn, kingdom=kingdom, min_score=ms, people_filter=people_filter
+        )
         saved = storage.get_kingdom_album_meta(conn, kingdom) or {}
     return {
         "kingdom": kingdom,
         "min_score": ms,
+        "people_filter": people_filter,
         "n_assets": n,
         "n_chunks": max(1, (n + 999) // 1000),
         "saved_album_id": saved.get("album_id"),
@@ -1958,11 +2442,24 @@ async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
     """Start a kingdom-album job. Mirrors /api/album/plants but takes
     kingdom + min_score as parameters so it works for Plantae, Fungi,
     Animalia, etc. Returns a `job_id`; the UI polls
-    /api/album/kingdom/job/{job_id} for progress."""
-    min_score = params.min_score if params.min_score is not None else PLANTAE_GREEN
+    /api/album/kingdom/job/{job_id} for progress.
+
+    Kingdom-specific default threshold mirrors the preview endpoint so
+    the worker doesn't re-derive the threshold after the preview was
+    already computed (and to keep the album_meta value consistent).
+    """
+    if params.min_score is not None:
+        min_score = params.min_score
+    elif params.kingdom == "Plantae":
+        min_score = PLANTAE_GREEN
+    else:
+        min_score = FUNGI_MIN_SCORE_DEFAULT
     with storage.connect(DB_PATH) as conn:
         n = storage.count_kingdom_assets(
-            conn, kingdom=params.kingdom, min_score=min_score
+            conn,
+            kingdom=params.kingdom,
+            min_score=min_score,
+            people_filter=params.people_filter,
         )
         saved = storage.get_kingdom_album_meta(conn, params.kingdom) or {}
 
@@ -1974,6 +2471,7 @@ async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
             "kingdom": params.kingdom,
             "min_score": min_score,
             "force_recreate": params.force_recreate,
+            "people_filter": params.people_filter,
             "n_assets": n,
             "n_chunks": max(1, (n + 999) // 1000),
             "chunks_done": 0,
@@ -1987,7 +2485,13 @@ async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
         }
     threading.Thread(
         target=_kingdom_album_worker,
-        args=(job_id, params.kingdom, min_score, params.force_recreate),
+        args=(
+            job_id,
+            params.kingdom,
+            min_score,
+            params.force_recreate,
+            params.people_filter,
+        ),
         daemon=True,
         name=f"kingdom-album-{params.kingdom}-{job_id[:8]}",
     ).start()
@@ -1996,6 +2500,7 @@ async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
         "job_id": job_id,
         "kingdom": params.kingdom,
         "min_score": min_score,
+        "people_filter": params.people_filter,
         "n_assets": n,
         "n_chunks": max(1, (n + 999) // 1000),
         "reused_existing": None,
@@ -2035,6 +2540,132 @@ async def kingdom_album_status(kingdom: str = Query(default="Plantae")) -> dict:
         "n_assets": int(saved.get("n_assets", 0)),
         "min_score": float(saved.get("min_score", PLANTAE_GREEN)),
     }
+
+
+# ============================================================
+# Sync-to-IMMICH user defaults
+# ============================================================
+# Persisted on the server (album_meta key="sync_defaults") so they
+# survive browser changes and are visible to non-browser callers
+# (curl / scripts). Seeded from env on first read so the user gets a
+# sensible starting point without clicking Save.
+#
+# Shape:
+#   {
+#     "plants":   {"people_filter": None|0|1, "min_score": float},
+#     "fungi":    {"people_filter": None|0|1, "min_score": float},
+#     "clusters": {"people_filter": None|0|1},
+#     "sync_all": {"people_filter": None|0|1},
+#   }
+# `clusters` is the per-cluster card button; `sync_all` is the
+# bulk "Sync every cluster" button. They could diverge in the future
+# (e.g., sync_all might want a different default scope), so we keep
+# them separate slots.
+_SYNC_DEFAULTS_KEY = "sync_defaults"
+
+
+class SyncDefaultsPayload(BaseModel):
+    """Body for PUT /api/settings/sync-defaults. Each slot is optional
+    so a partial PUT (e.g. only update the Fungi score) doesn't reset
+    the others; we merge into the existing row on the server."""
+    plants: dict | None = None
+    fungi: dict | None = None
+    clusters: dict | None = None
+    sync_all: dict | None = None
+
+
+def _sync_defaults_seeded() -> dict:
+    """Build the seed defaults from env vars. Used on first read when
+    the album_meta row doesn't exist yet."""
+    return {
+        "plants": {
+            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
+            "min_score": PLANTAE_GREEN,
+        },
+        "fungi": {
+            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
+            "min_score": FUNGI_MIN_SCORE_DEFAULT,
+        },
+        "clusters": {
+            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
+        },
+        "sync_all": {
+            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
+        },
+    }
+
+
+def _sync_defaults_normalize(stored: dict) -> dict:
+    """Merge stored defaults with the current seed so newly-added
+    fields (e.g. a future `force_recreate_default`) appear in the
+    payload without forcing a Save round-trip. Also clamps invalid
+    `people_filter` values to None so a stale row from an older
+    client can't crash the UI.
+    """
+    seed = _sync_defaults_seeded()
+    out: dict = {}
+    for slot, defaults in seed.items():
+        merged = dict(defaults)
+        stored_slot = stored.get(slot) if isinstance(stored, dict) else None
+        if isinstance(stored_slot, dict):
+            for k, v in stored_slot.items():
+                if k in merged:
+                    merged[k] = v
+        # Clamp people_filter to None | 0 | 1
+        if "people_filter" in merged and merged["people_filter"] not in (None, 0, 1):
+            merged["people_filter"] = None
+        # Clamp min_score to a sane float
+        if "min_score" in merged:
+            try:
+                merged["min_score"] = float(merged["min_score"])
+            except (TypeError, ValueError):
+                merged["min_score"] = defaults["min_score"]
+        out[slot] = merged
+    return out
+
+
+@app.get("/api/settings/sync-defaults")
+async def get_sync_defaults() -> dict:
+    """Return the persisted Sync-to-IMMICH defaults, seeded from env
+    on first read so the UI always has a complete shape to render.
+
+    `seeded: bool` is True when the server just wrote the seed row,
+    so the frontend can show "Defaults initialised from environment"
+    on the very first page load after upgrade.
+    """
+    with storage.connect(DB_PATH) as conn:
+        stored = storage.get_album_meta(conn, _SYNC_DEFAULTS_KEY)
+    if stored is None:
+        seed = _sync_defaults_seeded()
+        with storage.connect(DB_PATH) as conn:
+            storage.set_album_meta(conn, _SYNC_DEFAULTS_KEY, seed)
+        return {"defaults": seed, "seeded": True}
+    return {"defaults": _sync_defaults_normalize(stored), "seeded": False}
+
+
+@app.put("/api/settings/sync-defaults")
+async def put_sync_defaults(payload: SyncDefaultsPayload) -> dict:
+    """Upsert a partial payload over the existing defaults. Missing
+    slots are preserved, so a client can update only the Fungi score
+    without resetting the other slots.
+
+    Returns the merged defaults so the client can re-render with the
+    authoritative values (clamps applied server-side).
+    """
+    incoming = payload.model_dump(exclude_none=True)
+    with storage.connect(DB_PATH) as conn:
+        stored = storage.get_album_meta(conn, _SYNC_DEFAULTS_KEY) or _sync_defaults_seeded()
+    merged = dict(stored)
+    for slot, updates in incoming.items():
+        if not isinstance(updates, dict):
+            continue
+        merged.setdefault(slot, {})
+        for k, v in updates.items():
+            merged[slot][k] = v
+    normalised = _sync_defaults_normalize(merged)
+    with storage.connect(DB_PATH) as conn:
+        storage.set_album_meta(conn, _SYNC_DEFAULTS_KEY, normalised)
+    return {"defaults": normalised}
 
 
 # ---------- clustering refit worker + status ---------------------------
@@ -2784,6 +3415,7 @@ async def poll_person_backfill_job(job_id: str) -> dict:
                     if not job.get("_cache_invalidated"):
                         with _results_lock:
                             _invalidate_results_cache("all:")
+                        _invalidate_clusters_cache()
                         job["_cache_invalidated"] = True
         except FileNotFoundError:
             pass  # child hasn't written its first snapshot yet
@@ -2884,6 +3516,220 @@ async def purge_missing_assets(
         return payload
     finally:
         client.close()
+
+
+# ---- Profiling endpoints -----------------------------------------------
+# Used during development to attribute memory and time without
+# re-running the workload under memray + py-spy. Both are safe to
+# poll, both skip themselves in the timing middleware.
+
+
+@app.get("/api/mem")
+async def _mem_endpoint(
+    top: int = Query(default=25, ge=1, le=200),
+    reset: bool = Query(default=False),
+) -> dict:
+    """Live memory stats.
+
+    Returns:
+      - `rss_mb / vms_mb / peak_mb / data_mb`: process memory from
+        /proc/self/status — no Python overhead, available even when
+        tracemalloc is disabled.
+      - `top_by_line`: the top-N allocation sites (file + line), traced
+        by `tracemalloc`. Lazy-started on the first call.
+      - `top_by_module`: the same data, grouped by top-level package.
+      - `growth_vs_baseline`: net allocation since the first call (or
+        the last `?reset=1`). Reads new minus old per file:line.
+
+    `tracemalloc` adds ~10-30% overhead per allocation. Disable with
+    `MEM_TRACE=0` in the env to get only the /proc stats.
+
+    Typical workflow for "what did this request just allocate?"::
+        curl 'localhost:8765/api/mem?reset=1'   # set baseline
+        curl -X POST 'localhost:8765/api/run'  # trigger the heavy call
+        curl 'localhost:8765/api/mem'          # see growth_vs_baseline
+    """
+    # /proc/self/status gives process-level memory without touching
+    # any Python allocator. Works even with tracemalloc off.
+    rss_mb = vms_mb = peak_mb = data_mb = 0.0
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmSize:", "VmPeak:", "VmData:")):
+                    label = line.split(":")[0]
+                    val = float(line.split()[1]) / 1024.0  # KB → MB
+                    if label == "VmRSS": rss_mb = val
+                    elif label == "VmSize": vms_mb = val
+                    elif label == "VmPeak": peak_mb = val
+                    elif label == "VmData": data_mb = val
+    except OSError:
+        pass
+
+    payload: dict = {
+        "rss_mb": round(rss_mb, 1),
+        "vms_mb": round(vms_mb, 1),
+        "peak_mb": round(peak_mb, 1),
+        "data_mb": round(data_mb, 1),
+        "tracemalloc_active": False,
+        "top_by_line": [],
+        "top_by_module": [],
+        "growth_vs_baseline": [],
+    }
+
+    if not MEM_TRACE:
+        return payload
+
+    # Tracemalloc start is one-shot lazy. Frame depth 1 (just the
+    # leaf frame) keeps the per-allocation overhead small (~5%);
+    # the previous depth of 25 was the reason /api/mem stalled over
+    # hours of running — every tracemalloc bookkeeping struct was
+    # 25× larger. Set `MEM_TRACE=0` in the env to skip entirely.
+    global _TRACEMALLOC_ACTIVE, _TRACEMALLOC_BASELINE
+    with _MEM_LOCK:
+        if not _TRACEMALLOC_ACTIVE:
+            tracemalloc.start(1)
+            _TRACEMALLOC_ACTIVE = True
+            _TRACEMALLOC_BASELINE = tracemalloc.take_snapshot()
+        if reset:
+            _TRACEMALLOC_BASELINE = tracemalloc.take_snapshot()
+
+    snap = tracemalloc.take_snapshot()
+
+    by_line = [
+        {
+            "file": str(s.traceback[0].filename),
+            "line": s.traceback[0].lineno,
+            "size_mb": round(s.size / 1024 / 1024, 3),
+            "count": s.count,
+        }
+        for s in snap.statistics("lineno")[:top]
+    ]
+    payload["top_by_line"] = by_line
+
+    # Group by top-level package so the response stays scannable when
+    # the line-level list is long. `site-packages/<pkg>/...` →
+    # `<pkg>`. Local code under `/immich_bioclip/<module>.py` → module.
+    by_module: dict[str, dict] = {}
+    for entry in by_line:
+        fname = entry["file"]
+        if "site-packages/" in fname:
+            mod = fname.split("site-packages/")[1].split("/")[0]
+        elif "/immich_bioclip/" in fname:
+            mod = fname.split("/immich_bioclip/")[1].split("/")[0].split(".")[0]
+        elif "/.venv/lib/" in fname or "/lib/python" in fname:
+            mod = "stdlib"
+        else:
+            mod = "other"
+        agg = by_module.setdefault(mod, {"size_mb": 0.0, "count": 0})
+        agg["size_mb"] += entry["size_mb"]
+        agg["count"] += entry["count"]
+    payload["top_by_module"] = sorted(
+        [{"module": m, **v} for m, v in by_module.items()],
+        key=lambda x: x["size_mb"], reverse=True,
+    )[:top]
+
+    # Diff against the baseline. `size_diff` is bytes added by an
+    # allocation site since the baseline; negative values mean code
+    # freed more than it allocated at that site.
+    if _TRACEMALLOC_BASELINE is not None:
+        diff = snap.compare_to(_TRACEMALLOC_BASELINE, "lineno")
+        payload["growth_vs_baseline"] = [
+            {
+                "file": str(s.traceback[0].filename),
+                "line": s.traceback[0].lineno,
+                "size_diff_mb": round(s.size_diff / 1024 / 1024, 3),
+                "count_diff": s.count_diff,
+            }
+            for s in diff[:top]
+        ]
+
+    payload["tracemalloc_active"] = _TRACEMALLOC_ACTIVE
+    return payload
+
+
+@app.get("/api/perf")
+async def _perf_endpoint(
+    window: int = Query(default=500, ge=1, le=5000),
+    route: str | None = Query(
+        default=None,
+        description="Filter to a single route, e.g. 'POST /api/run'",
+    ),
+) -> dict:
+    """Per-request timing for the ring buffer.
+
+    `by_route` aggregates the last `window` requests by (method, path):
+      - `first_ms`: duration of the first hit — the "first load" cost
+        (model load, FAISS mmap, near-dup matmul, etc.)
+      - `mean_ms` / `max_ms` / `last_ms`: steady-state latency
+      - `first_at` / `last_at`: monotonic timestamps so you can see
+        whether the slow first hit just happened or was 10 minutes ago.
+
+    `slowest_recent` is the top 20 individual requests across the
+    window — useful when a single weird request skews the aggregate.
+
+    Filter to a single route with `?route=POST%20%2Fapi%2Frun`.
+    """
+    with _TIMING_LOCK:
+        records = [
+            r for r in _TIMING
+            if route is None or f"{r['method']} {r['path']}" == route
+        ][-window:]
+
+    by_route: dict[str, dict] = {}
+    for r in records:
+        key = f"{r['method']} {r['path']}"
+        agg = by_route.setdefault(key, {
+            "method": r["method"],
+            "path": r["path"],
+            "count": 0,
+            "first_ms": 0.0,
+            "first_status": 0,
+            "first_at": None,
+            "total_ms": 0.0,
+            "max_ms": 0.0,
+            "last_ms": 0.0,
+            "last_status": 0,
+            "last_at": None,
+        })
+        agg["count"] += 1
+        agg["total_ms"] += r["duration_ms"]
+        if r["duration_ms"] > agg["max_ms"]:
+            agg["max_ms"] = r["duration_ms"]
+        agg["last_ms"] = r["duration_ms"]
+        agg["last_status"] = r["status"]
+        agg["last_at"] = r["t"]
+        if agg["first_at"] is None or r["t"] < agg["first_at"]:
+            agg["first_at"] = r["t"]
+            agg["first_ms"] = r["duration_ms"]
+            agg["first_status"] = r["status"]
+
+    by_route_list = []
+    for v in by_route.values():
+        v["mean_ms"] = round(v["total_ms"] / v["count"], 3) if v["count"] else 0.0
+        v["total_ms"] = round(v["total_ms"], 3)
+        v["max_ms"] = round(v["max_ms"], 3)
+        v["last_ms"] = round(v["last_ms"], 3)
+        v["first_ms"] = round(v["first_ms"], 3)
+        by_route_list.append(v)
+    by_route_list.sort(key=lambda x: x["total_ms"], reverse=True)
+
+    slowest = sorted(records, key=lambda r: r["duration_ms"], reverse=True)[:20]
+
+    return {
+        "window_size": len(records),
+        "buffer_capacity": _TIMING.maxlen,
+        "by_route": by_route_list,
+        "slowest_recent": [
+            {
+                "method": r["method"],
+                "path": r["path"],
+                "status": r["status"],
+                "duration_ms": r["duration_ms"],
+                "ts": r["t"],
+            }
+            for r in slowest
+        ],
+    }
 
 
 # ---- SPA mount (LAST) ---------------------------------------------------

@@ -159,6 +159,12 @@ CREATE TABLE IF NOT EXISTS search_results (
 );
 CREATE INDEX IF NOT EXISTS idx_search_results_run
   ON search_results(run_id, rank_position);
+-- The correlated subquery in get_all_results filters by asset_id
+-- and orders by run_id DESC; the PK is (run_id, asset_id) so this
+-- query is O(N) per asset without a matching index. 19k × N
+-- subqueries is the cause of a 60s first-hit on /api/results.
+CREATE INDEX IF NOT EXISTS idx_search_results_asset
+  ON search_results(asset_id, run_id DESC);
 
 -- KNN reclassification results from a labeled reference inventory
 -- (currently TreeOfLife-200M-Embeddings via knn.py). Stored SEPARATELY
@@ -348,6 +354,56 @@ def upsert_asset(
     )
 
 
+def asset_row_matches(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+    original_file_name: str,
+    original_url: str,
+    thumbnail_url: str,
+) -> bool:
+    """Cheap pre-check for the no-op UPDATE case. Returns True when the
+    asset row already exists AND every URL/filename field matches what
+    the pipeline is about to write — so the caller can skip the
+    `upsert_asset` round-trip entirely.
+
+    The pipeline emits these fields with deterministic templates
+    (`/api/assets/{id}/...`) so matches are the common case on a stable
+    Immich installation. Mismatches still trigger the normal
+    `upsert_asset` to refresh name/URLs.
+    """
+    row = conn.execute(
+        """
+        SELECT 1
+          FROM assets
+         WHERE asset_id = ?
+           AND original_file_name = ?
+           AND original_url = ?
+           AND thumbnail_url = ?
+         LIMIT 1
+        """,
+        (asset_id, original_file_name, original_url, thumbnail_url),
+    ).fetchone()
+    return row is not None
+
+
+def asset_has_captured_at(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+) -> bool:
+    """True iff the asset row exists with a non-null captured_at. The
+    pipeline uses this to skip the `client.get_asset_metadata` HTTP
+    round-trip on cache misses where EXIF was already captured by an
+    earlier run (EXIF backfill, smart-search ingest, etc.).
+    """
+    row = conn.execute(
+        "SELECT 1 FROM assets WHERE asset_id = ? AND captured_at IS NOT NULL LIMIT 1",
+        (asset_id,),
+    ).fetchone()
+    return row is not None
+
+
 def update_asset_exif(
     conn: sqlite3.Connection,
     *,
@@ -484,52 +540,112 @@ def set_cluster_ids(
     )
 
 
-def cluster_summary(conn: sqlite3.Connection) -> list[dict]:
-    # One SQL aggregate per cluster: count + representative sample + the
-    # most recent capture time in the cluster (lets the FilterCards UI
-    # sort by "latest" so clusters with recent photos bubble to the top).
-    # The representative is the asset in the cluster whose top-1 BioCLIP
-    # prediction has the highest score (tie-break by filename for
-    # deterministic ordering across reloads). The frontend renders this
-    # as a thumbnail on the cluster filter card.
+def cluster_summary(
+    conn: sqlite3.Connection,
+    *,
+    plantae: str | None = None,
+    plantae_green: float = 0.60,
+    plantae_yellow: float = 0.35,
+) -> list[dict]:
+    """One SQL aggregate per cluster: count + representative sample + the
+    most recent capture time in the cluster (lets the FilterCards UI
+    sort by "latest" so clusters with recent photos bubble to the top).
+
+    The representative is the asset in the cluster with the highest top-1
+    BioCLIP score (ties broken by captured_at DESC then filename ASC).
+    The representative pool is tier-scoped — when `plantae` is set, the
+    sample comes from among the same assets counted in `n`, so a
+    non-plant thumbnail doesn't bleed into a plants-only cluster card.
+
+    `plantae` narrows both the count and the representative so card
+    counts reconcile with the grid breadcrumb for the same facet.
+    """
+    # The query has 1 outer tier predicate + 3 inner tier predicates (one
+    # per sample subquery). Each `?` placeholder needs its own bind,
+    # even when the bound value is the same threshold. Build the SQL
+    # first so we know how many placeholders; then build a params list
+    # of matching length.
+    tier_outer = _plantae_score_expr("a")
+    tier_inner = _plantae_score_expr("a2")
+    if plantae == "plant":
+        outer_pred = f"{tier_outer} >= ?"
+        inner_pred = f"{tier_inner} >= ?"
+        # 1 outer + 3 inner = 4 placeholders, all bound to plantae_green
+        bind_values = [plantae_green]
+    elif plantae == "uncertain":
+        outer_pred = f"{tier_outer} >= ? AND {tier_outer} < ?"
+        inner_pred = f"{tier_inner} >= ? AND {tier_inner} < ?"
+        # 2 outer + 6 inner = 8 placeholders
+        bind_values = [plantae_yellow, plantae_green]
+    elif plantae == "non_plant":
+        outer_pred = f"{tier_outer} < ?"
+        inner_pred = f"{tier_inner} < ?"
+        # 1 outer + 3 inner = 4 placeholders
+        bind_values = [plantae_yellow]
+    else:
+        outer_pred = "1=1"
+        inner_pred = "1=1"
+        bind_values = []
+    # How many times does each tier predicate appear? 1× outer + 3× inner.
+    # `bind_values` already contains one value per `?` in the predicate
+    # (it was built to match the predicate), so just extend it once per
+    # occurrence — do NOT multiply by `n_outer`/`n_inner`.
+    params: list = list(bind_values) + list(bind_values) * 3
+
+    # The sample subquery picks a single best asset over the same tier
+    # using a LEFT JOIN on predictions so non-plant clusters (no
+    # predictions) still get a thumbnail. `p.score IS NULL ASC` puts
+    # prediction-less assets last; secondary sort by captured_at DESC
+    # ranks recent photos first so a freshly-ingested non-plant surfaces
+    # instead of an old one with no species label.
     rows = conn.execute(
-        """
+        f"""
         SELECT
           a.cluster_id,
           COUNT(*) AS n,
           MAX(a.captured_at) AS latest_captured_at,
           (
-            SELECT p.asset_id
-            FROM predictions p
-            JOIN assets a2 ON a2.asset_id = p.asset_id
+            SELECT a2.asset_id
+            FROM assets a2
+            LEFT JOIN predictions p
+              ON p.asset_id = a2.asset_id
+             AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
-              AND p.rank = 'species' AND p.position = 0
-            ORDER BY p.score DESC, a2.original_file_name ASC
+              AND {inner_pred}
+            ORDER BY p.score IS NULL ASC, p.score DESC,
+                     a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_asset_id,
           (
             SELECT a2.thumbnail_url
-            FROM predictions p
-            JOIN assets a2 ON a2.asset_id = p.asset_id
+            FROM assets a2
+            LEFT JOIN predictions p
+              ON p.asset_id = a2.asset_id
+             AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
-              AND p.rank = 'species' AND p.position = 0
-            ORDER BY p.score DESC, a2.original_file_name ASC
+              AND {inner_pred}
+            ORDER BY p.score IS NULL ASC, p.score DESC,
+                     a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_thumbnail_url,
           (
             SELECT a2.original_file_name
-            FROM predictions p
-            JOIN assets a2 ON a2.asset_id = p.asset_id
+            FROM assets a2
+            LEFT JOIN predictions p
+              ON p.asset_id = a2.asset_id
+             AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
-              AND p.rank = 'species' AND p.position = 0
-            ORDER BY p.score DESC, a2.original_file_name ASC
+              AND {inner_pred}
+            ORDER BY p.score IS NULL ASC, p.score DESC,
+                     a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_original_file_name
         FROM assets a
-        WHERE a.cluster_id IS NOT NULL
+        WHERE a.cluster_id IS NOT NULL AND {outer_pred}
         GROUP BY a.cluster_id
         ORDER BY a.cluster_id ASC
         """,
+        params,
     ).fetchall()
     return [dict(r) for r in rows]
 
@@ -994,16 +1110,48 @@ def list_cluster_albums(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+# People-filter SQL fragment. `None` means "no filter" (default).
+# `0` means "without people" — treats unscanned (NULL) assets as
+# without-people so the gate stays inclusive while a YOLO person
+# backfill is still in progress (otherwise an unscanned asset would
+# be silently dropped from "without people" → double-counting risk
+# with the has_person=0 chip on the toolbar).
+# `1` means "with people" — strict equality, since unscanned assets
+# have no person evidence yet and shouldn't be inferred as "has".
+#
+# The fragment references `has_person` unqualified so it works whether
+# the surrounding query uses `FROM assets a` (cluster pickers, joins)
+# or `FROM assets` (cluster-kingdom variant). Same column either way.
+_PEOPLE_FILTER_SQL = {
+    None: "",
+    0: " AND (has_person = 0 OR has_person IS NULL)",
+    1: " AND has_person = 1",
+}
+
+
 def get_assets_in_cluster(
-    conn: sqlite3.Connection, cluster_id: int
+    conn: sqlite3.Connection,
+    cluster_id: int,
+    *,
+    people_filter: int | None = None,
 ) -> list[str]:
     """Asset_ids belonging to a cluster, in alphabetical order (stable
     for bulk-add idempotency). Used by the per-cluster album sync
-    worker to drive PUT /api/albums/{id}/assets."""
+    worker to drive PUT /api/albums/{id}/assets.
+
+    `people_filter`:
+      - None (default): no filter — every asset in the cluster
+      - 0: only assets with no person detected (or unscanned)
+      - 1: only assets with a detected person
+    The unscanned-NULL case is treated as "without people" so the
+    gate doesn't silently drop photos whose person stage hasn't run
+    yet.
+    """
+    extra = _PEOPLE_FILTER_SQL[people_filter]
     rows = conn.execute(
-        """
+        f"""
         SELECT asset_id FROM assets
-        WHERE cluster_id = ?
+        WHERE cluster_id = ?{extra}
         ORDER BY asset_id ASC
         """,
         (int(cluster_id),),
@@ -1012,12 +1160,17 @@ def get_assets_in_cluster(
 
 
 def count_assets_in_cluster(
-    conn: sqlite3.Connection, cluster_id: int
+    conn: sqlite3.Connection,
+    cluster_id: int,
+    *,
+    people_filter: int | None = None,
 ) -> int:
     """SQL COUNT(*) variant. Cheap; used by the per-cluster sync
-    preview endpoint."""
+    preview endpoint. Same `people_filter` semantics as
+    `get_assets_in_cluster`."""
+    extra = _PEOPLE_FILTER_SQL[people_filter]
     row = conn.execute(
-        "SELECT COUNT(*) AS n FROM assets WHERE cluster_id = ?",
+        f"SELECT COUNT(*) AS n FROM assets WHERE cluster_id = ?{extra}",
         (int(cluster_id),),
     ).fetchone()
     return int(row["n"]) if row else 0
@@ -1031,16 +1184,32 @@ def count_assets_in_cluster(
 
 
 def find_kingdom_assets(
-    conn: sqlite3.Connection, *, kingdom: str, min_score: float
+    conn: sqlite3.Connection,
+    *,
+    kingdom: str,
+    min_score: float,
+    people_filter: int | None = None,
 ) -> list[str]:
     """Distinct asset_ids whose kingdom-rank score for `kingdom` is at
     least `min_score`. Mirrors the green-leg threshold on the card grid
-    but parameterized by kingdom (Plantae / Fungi / Animalia / ...)."""
+    but parameterized by kingdom (Plantae / Fungi / Animalia / ...).
+
+    `people_filter`:
+      - None (default): no filter — every kingdom-qualified asset
+      - 0: only assets with no person detected (or unscanned)
+      - 1: only assets with a detected person
+    `has_person` lives on `assets`, so a people-filter INNER JOINs to
+    `assets`; assets absent from `assets` are still excluded by the
+    outer WHERE on taxon_scores (FK CASCADE).
+    """
+    extra = _PEOPLE_FILTER_SQL[people_filter]
+    join_assets = " JOIN assets a ON a.asset_id = t.asset_id" if extra else ""
     rows = conn.execute(
-        """
-        SELECT DISTINCT asset_id
-        FROM taxon_scores
-        WHERE rank = 'kingdom' AND taxon_name = ? AND score >= ?
+        f"""
+        SELECT DISTINCT t.asset_id
+        FROM taxon_scores t{join_assets}
+        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND t.score >= ?
+        {extra}
         """,
         (kingdom, float(min_score)),
     ).fetchall()
@@ -1048,15 +1217,23 @@ def find_kingdom_assets(
 
 
 def count_kingdom_assets(
-    conn: sqlite3.Connection, *, kingdom: str, min_score: float
+    conn: sqlite3.Connection,
+    *,
+    kingdom: str,
+    min_score: float,
+    people_filter: int | None = None,
 ) -> int:
     """Count-only variant of find_kingdom_assets for the preview
-    endpoint (avoids materializing the asset_id list)."""
+    endpoint (avoids materializing the asset_id list). Same
+    `people_filter` semantics as `find_kingdom_assets`."""
+    extra = _PEOPLE_FILTER_SQL[people_filter]
+    join_assets = " JOIN assets a ON a.asset_id = t.asset_id" if extra else ""
     row = conn.execute(
-        """
-        SELECT COUNT(DISTINCT asset_id) AS n
-        FROM taxon_scores
-        WHERE rank = 'kingdom' AND taxon_name = ? AND score >= ?
+        f"""
+        SELECT COUNT(DISTINCT t.asset_id) AS n
+        FROM taxon_scores t{join_assets}
+        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND t.score >= ?
+        {extra}
         """,
         (kingdom, float(min_score)),
     ).fetchone()
@@ -1582,6 +1759,297 @@ def fetch_detections(
     return out
 
 
+# ---------- plant attribution --------------------------------------------
+# A small pure function that combines the whole-image BioCLIP top-K with
+# the YOLO bbox / BioCLIP-on-crop predictions into a single "plants in
+# this image" answer. The rule is described in the plan at
+# ~/.claude/plans/sparkling-strolling-sparkle.md — short version:
+#   - When the whole-image Plantae kingdom score is at or above
+#     PLANTAE_FLOOR (default 0.10), the whole-image top-K species are
+#     the attribution. The YOLO bbox is shown only when a YOLO crop
+#     added a species the whole image missed.
+#   - When the whole image is below PLANTAE_FLOOR, fall back to YOLO
+#     crops whose top-1 BioCLIP species is Plantae (any score) OR any
+#     BioCLIP species with score >= CROP_SCORE_FLOOR. The bbox is then
+#     "justified" because there is no whole-image signal to anchor it.
+#   - YOLO candidates below YOLO_BBOX_FLOOR (default 0.20) are dropped
+#     entirely — they're usually spurious.
+#
+# The function is deliberately a pure transformer over already-fetched
+# rows so it works on both the per-asset detail endpoint (which has the
+# full detections payload) and the grid endpoint (which has only the
+# whole-image top-K). Both call sites build the same dict shape so the
+# frontend renders one consistent component.
+
+# Default constants. Override per-call from app.py if needed.
+_PLANTAE_FLOOR_DEFAULT = 0.10
+_YOLO_BBOX_FLOOR_DEFAULT = 0.20
+_CROP_SCORE_FLOOR_DEFAULT = 0.50
+# Per-row minimum score for whole-image species to appear in the
+# summary. BioCLIP's species-rank top-K is exhaustive (typically 5
+# rows descending from a confident top-1 down to ~1%) — listing the
+# tail as "plants in this image" is noise. 5% is a reasonable cutoff:
+# a real second candidate on a 6k-species tree sits well above this,
+# while plausible-but-wrong confusion barely reaches it.
+_WHOLE_IMAGE_SPECIES_FLOOR_DEFAULT = 0.05
+# Per-row minimum score for a YOLO crop to contribute. Looser than the
+# whole-image floor because the bbox label already restricts the
+# candidate to a plant-sized object, but still needs SOMETHING — a
+# 0.03 crop means BioCLIP saw a uniform blob.
+_YOLO_CROP_FLOOR_DEFAULT = 0.05
+
+
+def _attribution_seed_whole_image(
+    *,
+    taxon_scores: dict,
+    top_predictions: list[dict],
+    plantae_floor: float,
+    species_floor: float,
+) -> list[dict]:
+    """Return the whole-image rows if Plantae >= plantae_floor, else [].
+
+    Each row is shaped like a PlantAttributionRow with source="whole_image"
+    and no detection_id / yolo_score. The species order from the backend
+    (BioCLIP top-K descending) is preserved. Two filters apply:
+      - kingdom must be Plantae (the summary is plant-focused), and
+      - score must be >= species_floor (drops the long tail of the
+        top-K — typically 1-5% mass on candidates the model wasn't
+        really considering).
+    """
+    plantae = (taxon_scores or {}).get("Plantae")
+    if plantae is None or plantae < plantae_floor:
+        return []
+    rows: list[dict] = []
+    for p in top_predictions or []:
+        kingdom = (p.get("kingdom") or "").strip()
+        if kingdom.lower() != "plantae":
+            continue
+        score = float(p.get("score", 0.0))
+        if score < species_floor:
+            continue
+        rows.append(
+            {
+                "species": p.get("species", ""),
+                "common_name": p.get("common_name") or None,
+                "score": score,
+                "kingdom": p.get("kingdom") or None,
+                "family": p.get("family") or None,
+                "genus": p.get("genus") or None,
+                "source": "whole_image",
+                "detection_id": None,
+                "yolo_score": None,
+            }
+        )
+    return rows
+
+
+def _attribution_seed_yolo(
+    *,
+    taxon_scores: dict,
+    detections: list[dict],
+    yolo_bbox_floor: float,
+    crop_score_floor: float,
+    crop_floor: float,
+) -> list[dict]:
+    """Return YOLO+bbox-bioclip rows whose crop justifies attribution.
+
+    A YOLO detection contributes its top-1 crop species when:
+      - the YOLO box score is >= yolo_bbox_floor (drops noise), AND
+      - the crop's top-1 BioCLIP species is Plantae (any score above
+        crop_floor) OR has score >= crop_score_floor.
+
+    Plantae-on-crop is more permissive than the whole-image floor (it
+    uses crop_floor, default 0.05) because the bbox label already
+    restricts the candidate to a plant-sized object — a 0.03 Plantae
+    crop means BioCLIP saw a uniform blob, not a real plant, so we
+    still drop it. The non-Plantae branch is gated on crop_score_floor
+    (default 0.50) so generic YOLO boxes only contribute when the
+    whole image is also strong plantae.
+    """
+    plantae = (taxon_scores or {}).get("Plantae")
+    has_plantae = plantae is not None and plantae >= 0.10
+    rows: list[dict] = []
+    for d in detections or []:
+        yolo_score = float(d.get("score", 0.0))
+        if yolo_score < yolo_bbox_floor:
+            continue
+        bbox_preds = d.get("bbox_predictions") or []
+        if not bbox_preds:
+            continue
+        top = bbox_preds[0]
+        species = (top.get("species") or "").strip()
+        if not species:
+            continue
+        crop_score = float(top.get("score", 0.0))
+        kingdom = (top.get("kingdom") or "").strip()
+        is_plantae_crop = kingdom.lower() == "plantae"
+        # A crop is "justified" (i.e. the bbox is a real plant candidate)
+        # when either:
+        #   - the crop is Plantae AND its own score >= crop_floor (a
+        #     real plant, even a weak one), OR
+        #   - the whole image has Plantae context AND the crop itself
+        #     is high-confidence (>= crop_score_floor). Whole-image
+        #     Plantae alone isn't enough — without the bbox label being
+        #     agreed to be a plant, it's just a generic YOLO box.
+        # The crop_score >= crop_score_floor alone branch is
+        # deliberately NOT included: a non-plant photo (e.g. person /
+        # car) has no business contributing rows to a "plants in this
+        # image" summary.
+        justified = (
+            (is_plantae_crop and crop_score >= crop_floor)
+            or (has_plantae and crop_score >= crop_score_floor)
+        )
+        if not justified:
+            continue
+        rows.append(
+            {
+                "species": species,
+                "common_name": top.get("common_name") or None,
+                "score": crop_score,
+                "kingdom": top.get("kingdom") or None,
+                "family": top.get("family") or None,
+                "genus": top.get("genus") or None,
+                "source": "yolo",
+                "detection_id": d.get("id"),
+                "yolo_score": yolo_score,
+            }
+        )
+    return rows
+
+
+def _merge_attribution_rows(
+    whole_rows: list[dict], yolo_rows: list[dict]
+) -> list[dict]:
+    """Merge whole-image + YOLO rows, deduping by species.
+
+    Match key is case-insensitive species. Score is the max of the two
+    contributing scores; source is the higher-priority of the two
+    sources (`whole_image > mixed > yolo`). When the species came from
+    both sources, the merged row keeps the detection_id / yolo_score
+    from the YOLO row (so the bbox can be drawn) and is tagged
+    source="mixed".
+    """
+    # Source priority — lower number wins when picking the tag.
+    priority = {"whole_image": 0, "mixed": 1, "yolo": 2}
+
+    by_key: dict[str, dict] = {}
+    by_key_meta: dict[str, dict] = {}
+    for r in whole_rows:
+        key = (r.get("species") or "").strip().lower()
+        if not key:
+            continue
+        by_key[key] = r
+        by_key_meta[key] = {"sources": {"whole_image"}}
+    for r in yolo_rows:
+        key = (r.get("species") or "").strip().lower()
+        if not key:
+            continue
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = r
+            by_key_meta[key] = {"sources": {"yolo"}}
+            continue
+        # Both sources contributed. Keep the higher score for display
+        # but tag as "mixed" and retain the YOLO detection_id so the
+        # bbox is drawn.
+        if r["score"] > existing["score"]:
+            display_score = r["score"]
+        else:
+            display_score = existing["score"]
+        merged = dict(existing)
+        merged["score"] = display_score
+        merged["source"] = "mixed"
+        merged["detection_id"] = r.get("detection_id")
+        merged["yolo_score"] = r.get("yolo_score")
+        # Prefer non-empty taxonomy fields from the row that's contributing
+        # to the display score.
+        donor = r if r["score"] >= existing["score"] else existing
+        for f in ("common_name", "kingdom", "family", "genus"):
+            if not merged.get(f) and donor.get(f):
+                merged[f] = donor[f]
+        by_key[key] = merged
+        by_key_meta[key]["sources"].add("yolo")
+
+    # Stable order: highest score first; source priority breaks ties so
+    # whole-image rows beat YOLO-only rows of the same score.
+    merged_rows = list(by_key.values())
+    merged_rows.sort(
+        key=lambda x: (-float(x.get("score") or 0.0), priority.get(x.get("source", "yolo"), 99))
+    )
+    return merged_rows
+
+
+def compute_plant_attribution(
+    *,
+    taxon_scores: dict | None,
+    top_predictions: list[dict] | None,
+    detections: list[dict] | None = None,
+    plantae_floor: float = _PLANTAE_FLOOR_DEFAULT,
+    yolo_bbox_floor: float = _YOLO_BBOX_FLOOR_DEFAULT,
+    crop_score_floor: float = _CROP_SCORE_FLOOR_DEFAULT,
+    whole_image_species_floor: float = _WHOLE_IMAGE_SPECIES_FLOOR_DEFAULT,
+    yolo_crop_floor: float = _YOLO_CROP_FLOOR_DEFAULT,
+) -> dict:
+    """Combine whole-image + YOLO evidence into a single attribution.
+
+    Pure function — no DB access. The DB-bound helpers (`fetch_taxon_scores`,
+    `fetch_predictions`, `fetch_detections`) need to be called by the
+    caller; this just joins their results.
+
+    Returns a dict shaped like the backend `plant_attribution` field:
+        {
+          "source": "whole_image" | "yolo" | "mixed" | "none",
+          "rows": [PlantAttributionRow, ...],
+          "highlight_detection_ids": [int, ...],
+          "plantae_score": float | None,
+        }
+    """
+    taxon_scores = taxon_scores or {}
+    top_predictions = top_predictions or []
+    detections = detections or []
+    plantae = taxon_scores.get("Plantae")
+
+    whole_rows = _attribution_seed_whole_image(
+        taxon_scores=taxon_scores,
+        top_predictions=top_predictions,
+        plantae_floor=plantae_floor,
+        species_floor=whole_image_species_floor,
+    )
+    yolo_rows = _attribution_seed_yolo(
+        taxon_scores=taxon_scores,
+        detections=detections,
+        yolo_bbox_floor=yolo_bbox_floor,
+        crop_score_floor=crop_score_floor,
+        crop_floor=yolo_crop_floor,
+    )
+    rows = _merge_attribution_rows(whole_rows, yolo_rows)
+
+    # What the canvas should draw. A detection_id is highlighted when
+    # ANY of its YOLO crops contributed to the rows (i.e. source was
+    # yolo or mixed). Whole-image-only rows leave the canvas untouched.
+    highlight_ids = sorted({
+        r["detection_id"]
+        for r in rows
+        if r.get("detection_id") is not None
+    })
+
+    if whole_rows and yolo_rows:
+        source = "mixed"
+    elif whole_rows:
+        source = "whole_image"
+    elif yolo_rows:
+        source = "yolo"
+    else:
+        source = "none"
+
+    return {
+        "source": source,
+        "rows": rows,
+        "highlight_detection_ids": highlight_ids,
+        "plantae_score": float(plantae) if plantae is not None else None,
+    }
+
+
 # ---------- bbox_predictions --------------------------------------------
 
 
@@ -1729,12 +2197,23 @@ def fetch_taxon_scores(
     return out
 
 
-def find_plantae_assets(conn: sqlite3.Connection, *, min_score: float) -> list[str]:
+def find_plantae_assets(
+    conn: sqlite3.Connection,
+    *,
+    min_score: float,
+    people_filter: int | None = None,
+) -> list[str]:
     """Backward-compat shim — delegates to find_kingdom_assets with
     kingdom='Plantae'. Used by the existing Plants-album feature;
     new code should call find_kingdom_assets directly so it works for
-    any kingdom (Fungi / Animalia / ...)."""
-    return find_kingdom_assets(conn, kingdom="Plantae", min_score=min_score)
+    any kingdom (Fungi / Animalia / ...). Accepts `people_filter` for
+    the new sync-defaults UX; passed through unchanged."""
+    return find_kingdom_assets(
+        conn,
+        kingdom="Plantae",
+        min_score=min_score,
+        people_filter=people_filter,
+    )
 
 
 # ---------- runs --------------------------------------------------------
@@ -1996,9 +2475,17 @@ def compute_near_dup_groups(
     three in one group. The returned lists do NOT include the asset
     itself; only its near-dup siblings.
 
-    Cheap: for N=634 assets this is ~200K dot products in a single
-    numpy matmul, well under a second.
+    Memory-aware: computes the upper-triangle of `mat @ mat.T` in row
+    chunks instead of materializing the full N×N matrix. The dense
+    matmul was 1.4 GB at N=19k; the chunked path peaks at ~40 MB
+    (chunk=512 × N × 4 bytes), and the `np.where` + bulk-union
+    replaces the old Python double loop (~180M iterations at N=19k)
+    with a single vectorized pass per chunk.
     """
+    # Chunk size for the row-wise matmul. 512 rows × 19k cols × 4 B
+    # ≈ 39 MB; tweak if your machine's tighter or looser on RAM.
+    _CHUNK = 512
+
     if not asset_ids:
         return {}
     placeholders = ",".join("?" for _ in asset_ids)
@@ -2013,8 +2500,9 @@ def compute_near_dup_groups(
     mat = np.stack(
         [np.frombuffer(r["vector"], dtype="<f4").copy() for r in rows]
     )
-    # Embeddings are L2-normalized so cosine == dot product.
-    sim = mat @ mat.T
+    n = len(ids)
+    if n < 2:
+        return {aid: [] for aid in ids}
 
     # Union-Find with path compression.
     parent = {aid: aid for aid in ids}
@@ -2032,11 +2520,18 @@ def compute_near_dup_groups(
         if px != py:
             parent[px] = py
 
-    n = len(ids)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if sim[i, j] >= threshold:
-                union(ids[i], ids[j])
+    # Chunked row matmul. Each block is (chunk, N) float32 — bounded
+    # by _CHUNK. np.where surfaces all (i_local, j) pairs above the
+    # threshold in one C-level pass; the upper-triangle mask drops
+    # half of them (the other half was captured in an earlier chunk).
+    for i in range(0, n, _CHUNK):
+        sim_block = mat[i:i + _CHUNK] @ mat.T  # (chunk, N) float32
+        rows_idx, cols_idx = np.where(sim_block >= threshold)
+        i_global = i + rows_idx
+        # Only union pairs where j > i_global (upper triangle).
+        mask = cols_idx > i_global
+        for ii, jj in zip(i_global[mask].tolist(), cols_idx[mask].tolist()):
+            union(ids[ii], ids[jj])
 
     # Group by root.
     members: dict[str, list[str]] = {}
@@ -2063,6 +2558,56 @@ _GLOBAL_NEAR_DUP_CACHE: dict[str, list[str]] | None = None
 def invalidate_global_near_dup_cache() -> None:
     global _GLOBAL_NEAR_DUP_CACHE
     _GLOBAL_NEAR_DUP_CACHE = None
+
+
+def save_near_dup_cache(path: str | Path) -> None:
+    """Pickle the current near-dup map to `path`. ~1 MB for 19k assets.
+    Safe to call when the cache is populated; no-op if it's None (the
+    pipeline-end warm should populate then save)."""
+    if _GLOBAL_NEAR_DUP_CACHE is None:
+        return
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file then rename — atomic, so a crash mid-write
+    # doesn't leave a half-baked pickle that the loader would reject.
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    import pickle
+    with open(tmp, "wb") as f:
+        pickle.dump(_GLOBAL_NEAR_DUP_CACHE, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(p)
+
+
+def load_near_dup_cache(path: str | Path) -> dict[str, list[str]] | None:
+    """Load a previously-saved near-dup map. Returns None if the file
+    doesn't exist, is missing/wrong-version, or fails to unpickle (e.g.
+    because the embeddings table changed)."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        import pickle
+        with open(p, "rb") as f:
+            cache = pickle.load(f)
+        # Sanity: dict[str, list[str]]
+        if not isinstance(cache, dict):
+            return None
+        if any(not isinstance(v, list) for v in cache.values()):
+            return None
+        return cache
+    except Exception:
+        # Corrupt or mismatched pickle — treat as missing and let the
+        # caller recompute.
+        return None
+
+
+def delete_near_dup_cache(path: str | Path) -> None:
+    """Remove the on-disk cache. Called when the embeddings change so
+    the next load falls back to a fresh compute."""
+    p = Path(path)
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def get_global_near_dup_groups(
@@ -2324,6 +2869,25 @@ def get_run_taxonomy_summary(
     }
 
 
+# Plantae-kingdom scored expression. The correlated subquery returns at
+# most one row per asset (PRIMARY KEY (asset_id, rank, taxon_name)),
+# so it adds zero rows to the outer query. COALESCE catches the rare
+# asset that has no Plantae score (verified: exactly 1 out of 19,304)
+# and treats it as non_plant.
+def _plantae_score_expr(asset_alias: str = "a") -> str:
+    """Return the SQL expression that yields the Plantae kingdom score
+    for the given asset table alias. Use `a` in the outer query and
+    `a2` inside correlated subqueries that JOIN a different alias."""
+    return (
+        f"COALESCE((SELECT ts.score FROM taxon_scores ts "
+        f"WHERE ts.asset_id = {asset_alias}.asset_id AND ts.rank = 'kingdom' "
+        f"AND ts.taxon_name = 'Plantae'), 0)"
+    )
+
+
+_PLANTAE_SCORE = _plantae_score_expr("a")
+
+
 def get_all_results(
     conn: sqlite3.Connection, *,
     page: int = 0,
@@ -2333,12 +2897,25 @@ def get_all_results(
     genus: str | None = None,
     family: str | None = None,
     has_person: int | None = None,
-) -> tuple[list[dict], int]:
-    """Return (page_of_buckets, total) for every asset with predictions.
+    plantae: str | None = None,
+    plantae_green: float = 0.60,
+    plantae_yellow: float = 0.35,
+) -> tuple[list[dict], int, int]:
+    """Return (page_of_buckets, total_reps, total_assets).
 
-    The "all assets" view replaces the per-run view: an asset is included
-    if it has any row in `predictions`, regardless of which runs it
-    appeared in. Deduplication is automatic since we key by asset_id.
+    `total_assets` is the count of every file matching the filters
+    (pre-dedup). `total_reps` is the count after collapsing near-dup
+    siblings. The grid uses `total_assets` for the breadcrumb + pagination
+    "total" so every photo is reflected, and `total_reps` for page-button
+    count (pages of representative cards). The "all" tile in FilterCards
+    reads `total_assets` so counts reconcile across cluster / genus / the
+    photo grid.
+
+    The base set is every asset in the DB. Previously this was restricted
+    to assets with predictions, which silently dropped 4,830 non-plants
+    (and 7 plants) from the grid even though they were counted on cluster
+    cards. Species/genus/family filters still INNER JOIN predictions, so
+    selecting a taxon still implies predictions.
 
     Sort order: each asset's `rank_position` from its MOST RECENT run
     (so the user sees photos in the order Immich last returned them),
@@ -2353,12 +2930,15 @@ def get_all_results(
       the indexed `assets.has_person` column. NULL rows (not yet
       scanned) are excluded by both 0 and 1 — correct UX: don't claim
       "no person" until you've actually checked.
+    - plantae: "plant" (≥plantae_green), "uncertain" (≥plantae_yellow
+      and <plantae_green), "non_plant" (<plantae_yellow). Cached on
+      every asset via taxon_scores(rank='kingdom', taxon_name='Plantae').
     """
     # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
     # need an INNER JOIN on predictions (position=0); the cluster_id
     # filter is a plain WHERE on assets.
     joins = ""
-    where = ["a.asset_id IN (SELECT DISTINCT asset_id FROM predictions)"]
+    where = ["1=1"]
     params: list = []
     if cluster_id is not None:
         where.append("a.cluster_id = ?")
@@ -2379,13 +2959,18 @@ def get_all_results(
         # 0 or 1 — excludes unscanned (NULL) rows in both cases.
         where.append("a.has_person = ?")
         params.append(has_person)
+    if plantae == "plant":
+        where.append(f"{_PLANTAE_SCORE} >= ?")
+        params.append(plantae_green)
+    elif plantae == "uncertain":
+        where.append(f"{_PLANTAE_SCORE} >= ? AND {_PLANTAE_SCORE} < ?")
+        params.append(plantae_yellow)
+        params.append(plantae_green)
+    elif plantae == "non_plant":
+        where.append(f"{_PLANTAE_SCORE} < ?")
+        params.append(plantae_yellow)
 
     where_sql = " AND ".join(where)
-
-    count_sql = f"SELECT COUNT(*) FROM assets a {joins} WHERE {where_sql}"
-    total = conn.execute(count_sql, params).fetchone()[0]
-    if total == 0:
-        return [], 0
 
     # Fetch ALL matching assets (no LIMIT/OFFSET) so we can apply
     # near-dup dedup BEFORE pagination. Pagination is done in Python
@@ -2413,7 +2998,7 @@ def get_all_results(
     ).fetchall()
 
     if not all_filtered:
-        return [], 0
+        return [], 0, 0
 
     # Near-dup dedup: pick ONE representative per group of cosine>=0.97
     # siblings within this filtered set. Hidden members are excluded
@@ -2447,9 +3032,12 @@ def get_all_results(
             if m != rep:
                 hidden.add(m)
 
-    # Apply dedup before pagination
+    # Apply dedup before pagination. Two totals: total_assets is the
+    # raw file count (the user-facing "all" number), total_reps is the
+    # number of representative cards we'll paginate through.
     deduped_rows = [r for r in all_filtered if r["asset_id"] not in hidden]
-    total = len(deduped_rows)
+    total_assets = len(all_filtered)
+    total_reps = len(deduped_rows)
     start = page * page_size
     end = start + page_size
     rows = deduped_rows[start:end]
@@ -2537,6 +3125,17 @@ def get_all_results(
             "has_person": r["has_person"],
             "top_predictions": preds_by_asset.get(aid, []),
             "taxon_scores": taxon_by_asset.get(aid, {}),
+            # Slim attribution for the grid: whole-image seed only.
+            # The grid payload doesn't join YOLO detections (the
+            # bbox-bioclip query is expensive), so the grid card can't
+            # show a YOLO source chip — it just falls back to the
+            # whole-image top-K. The asset-detail endpoint carries the
+            # full version with YOLO fallback.
+            "plant_attribution": compute_plant_attribution(
+                taxon_scores=taxon_by_asset.get(aid, {}),
+                top_predictions=preds_by_asset.get(aid, []),
+                detections=None,
+            ),
             "near_dups": near_dups,
         })
 
@@ -2544,30 +3143,59 @@ def get_all_results(
     # block without a separate fetch. Auto-detects (version, k).
     enrich_with_knn(conn, buckets)
 
-    return buckets, total
+    return buckets, total_reps, total_assets
 
 
 def get_global_taxonomy_summary(
     conn: sqlite3.Connection,
+    *,
+    plantae: str | None = None,
+    plantae_green: float = 0.60,
+    plantae_yellow: float = 0.35,
 ) -> dict[str, list[dict]]:
-    """Aggregate species/genus/family counts across ALL assets that have
-    predictions. Database-wide — does NOT depend on any run. Used by the
-    filter cards in the global view so counts match the photos in the
-    grid. Also picks a representative asset per (rank, name) using the
-    same heuristic as cluster_summary (highest top-1 score, filename
-    tie-break) so the cards have a thumbnail. Also tracks the most
-    recent captured_at per (rank, name) so the FilterCards UI can sort
-    by "latest" — taxa with recent photos bubble to the top.
+    """Aggregate species/genus/family counts across assets matching the
+    given `plantae` tier (or all assets if None). Database-wide — does
+    NOT depend on any run. Used by the filter cards in the global view
+    so counts match the photos in the grid. Also picks a representative
+    asset per (rank, name) using the same heuristic as cluster_summary
+    (highest top-1 score, filename tie-break) so the cards have a
+    thumbnail. Also tracks the most recent captured_at per (rank, name)
+    so the FilterCards UI can sort by "latest" — taxa with recent photos
+    bubble to the top.
+
+    Counts include `p.rank = 'species'` (all present rows are species
+    today — defensive against future ranks). The plantae tier is
+    applied via a correlated subquery on `taxon_scores`. Non-plants
+    have few/no predictions, so non-plant taxonomy cards are sparse —
+    correct.
     """
+    # Build the tier predicate. The query aliases `a` for assets.
+    tier = _plantae_score_expr("a")
+    params: list = []
+    if plantae == "plant":
+        tier_pred = f"{tier} >= ?"
+        tier_params = [plantae_green]
+    elif plantae == "uncertain":
+        tier_pred = f"{tier} >= ? AND {tier} < ?"
+        tier_params = [plantae_yellow, plantae_green]
+    elif plantae == "non_plant":
+        tier_pred = f"{tier} < ?"
+        tier_params = [plantae_yellow]
+    else:
+        tier_pred = "1=1"
+        tier_params = []
+    params.extend(tier_params)
+
     rows = conn.execute(
-        """
+        f"""
         SELECT p.species, p.genus, p.family, COUNT(*) AS n,
                MAX(a.captured_at) AS latest_captured_at
         FROM predictions p
         JOIN assets a ON a.asset_id = p.asset_id
-        WHERE p.position = 0
+        WHERE p.rank = 'species' AND p.position = 0 AND {tier_pred}
         GROUP BY p.species, p.genus, p.family
         """,
+        params,
     ).fetchall()
 
     species: dict[str, dict] = {}
@@ -2587,14 +3215,15 @@ def get_global_taxonomy_summary(
     # Per (rank, name): the asset with the best (score DESC, filename ASC)
     # top-1 prediction — used as the card thumbnail.
     sample_rows = conn.execute(
-        """
+        f"""
         SELECT p.species, p.genus, p.family,
                p.asset_id, p.score,
                a.original_file_name, a.thumbnail_url
         FROM predictions p
         JOIN assets a ON a.asset_id = p.asset_id
-        WHERE p.rank = 'species' AND p.position = 0
+        WHERE p.rank = 'species' AND p.position = 0 AND {tier_pred}
         """,
+        params,
     ).fetchall()
 
     # best[rank][name] = (score, filename, asset_id, thumbnail_url).

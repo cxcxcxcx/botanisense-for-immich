@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+import threading
 
 # Heavy imports (torch/bioclip/sklearn-via-clusters/ultralytics-via-yolo)
 # are deferred to run_pipeline() so that `import pipeline` stays cheap and
@@ -101,6 +102,34 @@ def _close_image(im) -> None:
         _log.debug("image close failed", exc_info=True)
 
 
+# Process-wide classifier cache. The BioCLIP model on CPU holds ~5.5 GB
+# resident — loading it on every run is wasteful, but loading it on a
+# fully-cached run (where it never gets called) is even worse. Resolving
+# happens lazily inside run_pipeline so an entirely-cached run can
+# finish without ever importing the model.
+#
+# Thread-safe: run_pipeline runs in a worker thread; the lazy-init below
+# uses a lock so two concurrent runs can't double-construct.
+_clf_lock = threading.Lock()
+_clf_cache: "object | None" = None  # TreeOfLifeClassifier instance, lazily
+
+
+def _resolve_classifier() -> "object | None":
+    """Return the cached TreeOfLifeClassifier, instantiating on first
+    call. Returns the same instance for the lifetime of the process so
+    BioCLIP weights stay mmap'd and the second-onwards n_new>0 runs
+    don't pay the load cost again."""
+    global _clf_cache
+    if _clf_cache is not None:
+        return _clf_cache
+    with _clf_lock:
+        if _clf_cache is None:
+            _TreeOfLifeClassifier = globals()["TreeOfLifeClassifier"]
+            _clf_cache = _TreeOfLifeClassifier()
+    return _clf_cache
+
+
+
 # Shared pipeline state. Thread-safe: the pipeline thread writes under
 # _state_lock; the FastAPI thread reads via /api/status. Keys:
 #   status:        "idle" | "running" | "done" | "error"
@@ -111,7 +140,6 @@ def _close_image(im) -> None:
 #   current_run_id: int | None
 #   query, n_new, n_cached, n_requested, started_at, finished_at
 #   last_error: str | None
-import threading
 _state_lock = threading.Lock()
 _state: dict = {
     "status": "idle",
@@ -634,13 +662,53 @@ def discover_plantae_assets(
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
-                # Pull EXIF in the same round-trip family so the local
-                # DB has the capture time + GPS for sort-by-time and
-                # asset-detail display. Cached per-client so re-runs of
-                # the pipeline don't re-fetch.
-                exif = ImmichClient.extract_exif(
-                    client.get_asset_metadata(asset.id)
-                )
+                if storage.taxon_scores_have_asset(
+                    conn, asset_id=asset.id, rank="kingdom"
+                ):
+                    # Cache hit: kingdom score is already stored. Skip
+                    # the GET /api/assets/{id} round-trip (the per-asset
+                    # capture-time + GPS live in the local `assets`
+                    # row from the first run) and only refresh the
+                    # `assets` row when one of the URL/filename fields
+                    # has actually changed.
+                    n_cached += 1
+                    if not storage.asset_row_matches(
+                        conn,
+                        asset_id=asset.id,
+                        original_file_name=asset.original_file_name,
+                        original_url=original_url,
+                        thumbnail_url=thumbnail_url,
+                    ):
+                        # Refresh name/URLs only; keep existing
+                        # captured_at / lat / lng.
+                        storage.upsert_asset(
+                            conn,
+                            asset_id=asset.id,
+                            original_file_name=asset.original_file_name,
+                            original_url=original_url,
+                            thumbnail_url=thumbnail_url,
+                        )
+                    cached = storage.fetch_taxon_scores(
+                        conn, asset_ids=[asset.id], rank="kingdom"
+                    )
+                    d = cached.get(asset.id, {})
+                    plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
+                        "Plantae": float(d.get("Plantae") or 0.0),
+                        "Fungi": float(d.get("Fungi") or 0.0),
+                    }
+                    continue
+                # Cache miss — fetch EXIF so the freshly-inserted row
+                # has the capture time + GPS (captured_at IS NOT NULL
+                # check gates against re-fetching photos we already
+                # know about from an earlier run).
+                if not storage.asset_has_captured_at(
+                    conn, asset_id=asset.id
+                ):
+                    exif = ImmichClient.extract_exif(
+                        client.get_asset_metadata(asset.id)
+                    )
+                else:
+                    exif = {"captured_at": None, "latitude": None, "longitude": None}
                 storage.upsert_asset(
                     conn,
                     asset_id=asset.id,
@@ -651,30 +719,17 @@ def discover_plantae_assets(
                     latitude=exif["latitude"],
                     longitude=exif["longitude"],
                 )
-                if storage.taxon_scores_have_asset(
-                    conn, asset_id=asset.id, rank="kingdom"
-                ):
-                    n_cached += 1
-                    cached = storage.fetch_taxon_scores(
-                        conn, asset_ids=[asset.id], rank="kingdom"
+                n_predict += 1
+                p = thumb_dir / f"{asset.id}.jpg"
+                if not p.exists():
+                    n_thumb_dl += 1
+                    thumb_bytes = client.download_bytes(
+                        f"/api/assets/{asset.id}/thumbnail"
+                        f"?size={THUMBNAIL_SIZE}"
                     )
-                    d = cached.get(asset.id, {})
-                    plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
-                        "Plantae": float(d.get("Plantae") or 0.0),
-                        "Fungi": float(d.get("Fungi") or 0.0),
-                    }
-                else:
-                    n_predict += 1
-                    p = thumb_dir / f"{asset.id}.jpg"
-                    if not p.exists():
-                        n_thumb_dl += 1
-                        thumb_bytes = client.download_bytes(
-                            f"/api/assets/{asset.id}/thumbnail"
-                            f"?size={THUMBNAIL_SIZE}"
-                        )
-                        p.write_bytes(thumb_bytes)
-                    to_predict_paths.append(str(p))
-                    to_predict_assets.append(asset)
+                    p.write_bytes(thumb_bytes)
+                to_predict_paths.append(str(p))
+                to_predict_assets.append(asset)
             # Compact suffix shared by all three log branches below.
             # `n_added` falls out of the branch-local counter; the
             # breakdown is computed once up front.
@@ -685,6 +740,8 @@ def discover_plantae_assets(
 
             # Run BioCLIP kingdom-rank on the misses. Persist each row.
             if to_predict_paths:
+                if clf is None:
+                    clf = classifier if classifier is not None else _resolve_classifier()
                 scores = _score_batch_for_kingdoms(clf, to_predict_paths)
                 for asset, p in zip(to_predict_assets, to_predict_paths):
                     kingdom_scores = scores.get(p, {})
@@ -944,7 +1001,15 @@ def run_pipeline(
     client = ImmichClient(base_url=base_url, api_key=api_key)
     try:
         with storage.connect(db_path) as conn:
-            clf = classifier or _TreeOfLifeClassifier()
+            # Lazy classifier: only construct the TreeOfLifeClassifier
+            # (and load BioCLIP weights + open_clip helpers) the first
+            # time the kingdom stage has real BioCLIP work to do. The
+            # BioCLIP model on CPU is ~5.5 GB resident — loading it for
+            # an entirely-cached run wastes that until the process dies.
+            # Both downstream stages gate on `if needs_bioclip:` /
+            # `if to_predict_paths:`, so the singleton is only created
+            # when inference is genuinely about to run.
+            clf = None
 
             run_id = storage.create_run(
                 conn,
@@ -1038,6 +1103,8 @@ def run_pipeline(
             species_total_chunks = (len(needs_bioclip) + batch_size - 1) // batch_size
 
             if needs_bioclip:
+                if clf is None:
+                    clf = classifier if classifier is not None else _resolve_classifier()
                 _stage_begin("species")
                 species_t0 = time.monotonic()
                 _log.info(
@@ -1247,6 +1314,8 @@ def run_pipeline(
             _stage_begin("kingdom")
             kingdom_t0 = time.monotonic()
             if kingdom_assets:
+                if clf is None:
+                    clf = classifier if classifier is not None else _resolve_classifier()
                 _log.info(
                     f"[kingdom] starting  {len(kingdom_assets)} assets, "
                     f"{kingdom_total_chunks} chunks of {batch_size}"
@@ -1575,6 +1644,8 @@ def run_pipeline(
             bbox_t0 = time.monotonic()
             _stage_begin("bbox-bioclip")
             if all_bbox_targets:
+                if clf is None:
+                    clf = classifier if classifier is not None else _resolve_classifier()
                 _log.info(
                     f"[bbox-bioclip] starting  {len(all_bbox_targets)} detections, "
                     f"{bbox_total_chunks} chunks of {batch_size}"
