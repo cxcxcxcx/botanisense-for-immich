@@ -5,6 +5,8 @@
 import { fetchJson } from './client';
 import type {
   AssetDetail,
+  BulkClusterRemoveParams,
+  BulkClusterRemoveResponse,
   ClusterAlbumMapping,
   ClustersResponse,
   JobPreview,
@@ -21,6 +23,8 @@ import type {
   ResultsQuery,
   ResultsResponse,
   RunParams,
+  SyncDefaults,
+  SyncDefaultsResponse,
 } from './types';
 
 // ---- Reads ---------------------------------------------------------------
@@ -31,8 +35,8 @@ export const getResults   = (q: ResultsQuery) =>
 export const getAsset     = (id: string) =>
   fetchJson<AssetDetail>(`/api/asset/${id}`);
 
-export const getClusters  = () =>
-  fetchJson<ClustersResponse>('/api/clusters');
+export const getClusters  = (plantae?: 'plant' | 'non_plant' | 'uncertain') =>
+  fetchJson<ClustersResponse>('/api/clusters', { query: { plantae } });
 
 export const getKnnStatus = () =>
   fetchJson<KnnStatus>('/api/knn-status');
@@ -100,36 +104,60 @@ export const reclassifyBbox = (params: { asset_id: string; bbox_index: number })
 
 // ---- Plants / Kingdom album jobs ----------------------------------------
 
-export const previewPlantsAlbum = (min_score?: number) =>
-  fetchJson<JobPreview>('/api/album/plants/preview', { query: { min_score } });
+export const previewPlantsAlbum = (min_score?: number, people_filter?: 0 | 1 | null) =>
+  fetchJson<JobPreview>('/api/album/plants/preview', {
+    query: { min_score, people_filter: people_filter ?? undefined },
+  });
 
-export const startPlantsAlbum = (p: { min_score?: number; force_recreate?: boolean }) =>
+export const startPlantsAlbum = (
+  p: { min_score?: number; force_recreate?: boolean; people_filter?: 0 | 1 | null },
+) =>
   fetchJson<JobStart>('/api/album/plants', { method: 'POST', body: p });
 
-export const previewKingdomAlbum = (kingdom: string, min_score?: number) =>
-  fetchJson<JobPreview>('/api/album/kingdom/preview', { query: { kingdom, min_score } });
+export const previewKingdomAlbum = (
+  kingdom: string,
+  min_score?: number,
+  people_filter?: 0 | 1 | null,
+) =>
+  fetchJson<JobPreview>('/api/album/kingdom/preview', {
+    query: { kingdom, min_score, people_filter: people_filter ?? undefined },
+  });
 
 export const startKingdomAlbum = (
   kingdom: string,
-  p: { min_score?: number; force_recreate?: boolean },
+  p: {
+    min_score?: number;
+    force_recreate?: boolean;
+    people_filter?: 0 | 1 | null;
+  },
 ) =>
   fetchJson<JobStart>('/api/album/kingdom', { method: 'POST', body: { kingdom, ...p } });
 
 // ---- Cluster album jobs (per-cluster + sync-all) -----------------------
 
-export const previewClusterAlbum = (cluster_id: number) =>
-  fetchJson<JobPreview>(`/api/album/cluster/${cluster_id}/preview`);
-
-export const startClusterAlbumSync = (cluster_id: number, force_recreate = false) =>
-  fetchJson<JobStart>(`/api/album/cluster/${cluster_id}/sync`, {
-    method: 'POST',
-    body: { force_recreate },
+export const previewClusterAlbum = (
+  cluster_id: number,
+  people_filter?: 0 | 1 | null,
+) =>
+  fetchJson<JobPreview>(`/api/album/cluster/${cluster_id}/preview`, {
+    query: { people_filter: people_filter ?? undefined },
   });
 
-export const startSyncAllClusterAlbums = (force_recreate = false) =>
+export const startClusterAlbumSync = (
+  cluster_id: number,
+  p: { force_recreate?: boolean; people_filter?: 0 | 1 | null } = {},
+) =>
+  fetchJson<JobStart>(`/api/album/cluster/${cluster_id}/sync`, {
+    method: 'POST',
+    body: p,
+  });
+
+export const startSyncAllClusterAlbums = (
+  p: { force_recreate?: boolean; people_filter?: 0 | 1 | null } = {},
+) =>
   fetchJson<JobStart>('/api/album/cluster/sync-all', {
     method: 'POST',
-    body: { force_recreate },
+    body: p,
   });
 
 export const deleteClusterAlbum = (cluster_id: number, delete_in_immich: boolean) =>
@@ -137,6 +165,30 @@ export const deleteClusterAlbum = (cluster_id: number, delete_in_immich: boolean
     `/api/album/cluster/${cluster_id}`,
     { method: 'DELETE', query: { delete_in_immich: String(delete_in_immich) } },
   );
+
+// ---- Bulk-remove synced clusters --------------------------------------
+// One round-trip replaces N single-cluster DELETE calls. The Run
+// page's "Remove synced clusters" button uses this with
+// cluster_ids=null (meaning "all currently synced clusters").
+export const removeClusterAlbums = (p: BulkClusterRemoveParams) =>
+  fetchJson<BulkClusterRemoveResponse>('/api/album/cluster/remove', {
+    method: 'POST',
+    body: p,
+  });
+
+// ---- Sync-to-IMMICH defaults (GET/PUT /api/settings/sync-defaults) ----
+// Persisted on the server so they survive browser changes and are
+// visible to non-browser callers. Seeded from env on first read; the
+// `seeded` flag lets the UI show a one-time "Defaults initialised
+// from environment" hint.
+export const getSyncDefaults = () =>
+  fetchJson<SyncDefaultsResponse>('/api/settings/sync-defaults');
+
+export const putSyncDefaults = (defaults: Partial<SyncDefaults>) =>
+  fetchJson<{ defaults: SyncDefaults }>('/api/settings/sync-defaults', {
+    method: 'PUT',
+    body: defaults,
+  });
 
 // ---- Clustering refit ----------------------------------------------------
 

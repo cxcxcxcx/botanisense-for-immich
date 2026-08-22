@@ -1,5 +1,15 @@
+// Run-page "Pipeline" section. The four pipeline params (query,
+// n_samples, top_k, batch_size) are collapsed by default — most users
+// just want "run with server defaults". Unfolding the disclosure
+// reveals the fields; the Run button always works and uses server
+// defaults for any field left blank.
+//
+// The previous version had a separate "Refresh (server defaults)"
+// button, which was confusing (it did exactly what Run does when all
+// fields are blank). It's gone.
+
 import { useState } from 'react';
-import { runPipeline, refreshPipeline } from '../api/endpoints';
+import { runPipeline } from '../api/endpoints';
 import { useToasts } from './ToastProvider';
 
 interface FieldHelp {
@@ -32,7 +42,7 @@ const FIELDS: Record<string, FieldHelp> = {
   },
   batch_size: {
     label: 'batch',
-    help: 'How many images BioCLIP processes at once. Higher = faster but more GPU memory. Server default is 16. 32 is usually fine on a 12 GB GPU.',
+    help: 'How many images BioCLIP processes at once. Most users run on CPU — 16 is a sensible default (CPUs plateau around 16-32). Lower if you are tight on RAM; GPU users can push higher (32-64) until VRAM fills.',
     placeholder: '16',
     min: 1,
     max: 64,
@@ -45,6 +55,7 @@ export function ParamsForm() {
   const [topK, setTopK] = useState('');
   const [batch, setBatch] = useState('');
   const [busy, setBusy] = useState(false);
+  const [paramsOpen, setParamsOpen] = useState(false);
   const push = useToasts();
 
   const handleRun = async (e: React.FormEvent) => {
@@ -65,97 +76,107 @@ export function ParamsForm() {
     }
   };
 
-  const handleRefresh = async () => {
-    try {
-      await refreshPipeline();
-      push({ kind: 'info', message: 'Refresh queued' }, 2000);
-    } catch (err) {
-      push({ kind: 'info', message: err instanceof Error ? err.message : String(err) }, 4000);
-    }
-  };
-
-  const HelpText = ({ k }: { k: keyof typeof FIELDS }) => (
-    <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-      {FIELDS[k]?.help}
-    </small>
-  );
-
-  // Shared label class — vertical-stack input + help text. min-width
-  // 220px + flex: 1 lets the four fields wrap onto multiple lines on
-  // narrow viewports while sharing the row width.
-  const labelCls = 'text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]';
-  const inputCls = 'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent';
+  const inputCls =
+    'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent';
 
   return (
-    <form onSubmit={handleRun} className="p-0">
-      <fieldset role="group" className="flex flex-wrap items-start gap-x-5 gap-y-3 border-0 p-0 m-0">
-        <label className={labelCls}>
-          {FIELDS.query?.label}
-          <input
-            type="text"
-            className={`${inputCls} min-w-[220px] w-full`}
-            value={query}
-            onChange={e => setQuery(e.target.value)}
-            placeholder={FIELDS.query?.placeholder}
-            title={FIELDS.query?.help}
-          />
-          <HelpText k="query" />
-        </label>
+    <form onSubmit={handleRun} className="border border-line2 rounded-lg bg-bg-1 p-4 flex flex-col gap-3 w-full">
+      <header className="flex items-center justify-between gap-2">
+        <h3 className="m-0 text-base">Pipeline</h3>
+        <button
+          type="button"
+          className="text-fg-1 hover:text-fg text-sm"
+          onClick={() => setParamsOpen(o => !o)}
+          aria-expanded={paramsOpen}
+        >
+          {paramsOpen ? '▼ Hide params' : '▸ Edit params'}
+        </button>
+      </header>
 
-        <label className={labelCls}>
-          {FIELDS.n_samples?.label}
-          <input
-            type="number"
-            className={`${inputCls} w-[110px]`}
-            value={n}
-            onChange={e => setN(e.target.value)}
-            min={FIELDS.n_samples?.min}
-            placeholder={FIELDS.n_samples?.placeholder}
-            title={FIELDS.n_samples?.help}
-          />
-          <HelpText k="n_samples" />
-        </label>
+      {/* Single Run button — uses server defaults unless the user has
+          unfolded the params and edited a field. Blank fields = server
+          default, so the collapsed state is fully functional. */}
+      <div className="flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={busy}
+          className="px-3 py-1.5 min-w-[100px] rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover disabled:opacity-50"
+        >
+          {busy ? 'Running…' : 'Run pipeline'}
+        </button>
+        <small className="text-fg-1">
+          Uses server defaults unless you edit the params.
+        </small>
+      </div>
 
-        <label className={labelCls}>
-          {FIELDS.top_k?.label}
-          <input
-            type="number"
-            className={`${inputCls} w-[110px]`}
-            value={topK}
-            onChange={e => setTopK(e.target.value)}
-            min={FIELDS.top_k?.min}
-            max={FIELDS.top_k?.max}
-            placeholder={FIELDS.top_k?.placeholder}
-            title={FIELDS.top_k?.help}
-          />
-          <HelpText k="top_k" />
-        </label>
+      {paramsOpen && (
+        <fieldset role="group" className="flex flex-wrap items-start gap-x-5 gap-y-3 border-0 p-0 m-0">
+          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
+            {FIELDS.query?.label}
+            <input
+              type="text"
+              className={`${inputCls} min-w-[220px] w-full`}
+              value={query}
+              onChange={e => setQuery(e.target.value)}
+              placeholder={FIELDS.query?.placeholder}
+              title={FIELDS.query?.help}
+            />
+            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
+              {FIELDS.query?.help}
+            </small>
+          </label>
 
-        <label className={labelCls}>
-          {FIELDS.batch_size?.label}
-          <input
-            type="number"
-            className={`${inputCls} w-[110px]`}
-            value={batch}
-            onChange={e => setBatch(e.target.value)}
-            min={FIELDS.batch_size?.min}
-            max={FIELDS.batch_size?.max}
-            placeholder={FIELDS.batch_size?.placeholder}
-            title={FIELDS.batch_size?.help}
-          />
-          <HelpText k="batch_size" />
-        </label>
+          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
+            {FIELDS.n_samples?.label}
+            <input
+              type="number"
+              className={`${inputCls} w-[110px]`}
+              value={n}
+              onChange={e => setN(e.target.value)}
+              min={FIELDS.n_samples?.min}
+              placeholder={FIELDS.n_samples?.placeholder}
+              title={FIELDS.n_samples?.help}
+            />
+            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
+              {FIELDS.n_samples?.help}
+            </small>
+          </label>
 
-        <div className="flex gap-2 items-center mt-2 flex-wrap">
-          <button type="submit" disabled={busy} className="px-2.5 py-1 min-w-[80px] rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover disabled:opacity-50">
-            {busy ? 'Running…' : 'Run'}
-          </button>
-          <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345] hover:border-accent" onClick={handleRefresh}>
-            ↻ Refresh (server defaults)
-          </button>
-          <small className="text-fg-1">empty fields = use server default</small>
-        </div>
-      </fieldset>
+          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
+            {FIELDS.top_k?.label}
+            <input
+              type="number"
+              className={`${inputCls} w-[110px]`}
+              value={topK}
+              onChange={e => setTopK(e.target.value)}
+              min={FIELDS.top_k?.min}
+              max={FIELDS.top_k?.max}
+              placeholder={FIELDS.top_k?.placeholder}
+              title={FIELDS.top_k?.help}
+            />
+            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
+              {FIELDS.top_k?.help}
+            </small>
+          </label>
+
+          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
+            {FIELDS.batch_size?.label}
+            <input
+              type="number"
+              className={`${inputCls} w-[110px]`}
+              value={batch}
+              onChange={e => setBatch(e.target.value)}
+              min={FIELDS.batch_size?.min}
+              max={FIELDS.batch_size?.max}
+              placeholder={FIELDS.batch_size?.placeholder}
+              title={FIELDS.batch_size?.help}
+            />
+            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
+              {FIELDS.batch_size?.help}
+            </small>
+          </label>
+        </fieldset>
+      )}
     </form>
   );
 }

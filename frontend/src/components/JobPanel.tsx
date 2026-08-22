@@ -16,6 +16,18 @@ import {
 } from '../api/endpoints';
 import type { PersonBackfillJobSnapshot } from '../api/endpoints';
 import type { JobSnapshot, PurgeMissingPreview, PurgeMissingResult } from '../api/types';
+
+// Compact human label for the optional membership filter. Mirrors
+// the ImmichSync component's PEOPLE_LABELS so the legacy JobPanel
+// (driven by ClusterAlbumBar's per-cluster pill, purge-missing, etc.)
+// shows the same scope the new Run-page UI uses. Returns '' when no
+// filter is set, so existing call sites that don't carry the field
+// render unchanged.
+function peopleLabel(pf: unknown): string {
+  if (pf === 0) return 'w/o people';
+  if (pf === 1) return 'w/ people';
+  return '';
+}
 import { ApiError } from '../api/client';
 import { useApp, useJob, type JobKind } from '../state/AppContext';
 import type { JobRegistryKey } from '../hooks/useJobStream';
@@ -443,7 +455,20 @@ export function JobPanel() {
 
         {active.state === 'running' && (
           <div>
-            <p>{cfg.runningText(active.progress.added, active.progress.total)}</p>
+            <p>
+              {cfg.runningText(active.progress.added, active.progress.total)}
+              {/* Show the membership scope next to the running text when
+                  the server stored one. For ImmichSync-driven jobs the
+                  scope is already visible in its inline progress, so
+                  this is mostly cosmetic — but it does help when the
+                  legacy ClusterAlbumBar triggers a per-cluster sync
+                  with a non-default people_filter. */}
+              {streamJob && peopleLabel(streamJob.people_filter) && (
+                <small className="text-fg-1 ml-2">
+                  ({peopleLabel(streamJob.people_filter)})
+                </small>
+              )}
+            </p>
             <progress value={active.progress.added} max={Math.max(1, active.progress.total)} className="w-full h-1.5" />
             <p className="flex gap-2">
               <button

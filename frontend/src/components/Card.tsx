@@ -69,7 +69,7 @@ export function Card({ row }: Props) {
         {row.near_dups && row.near_dups.length > 0 && (
           <span
             className="absolute top-1.5 left-1.5 bg-score-red text-white font-mono font-bold text-[11px] py-0.5 px-1.5 rounded shadow z-10"
-            title={`${row.near_dups.length} similar photo(s)`}
+            title={`${row.near_dups.length} similar photo(s) — see thumbnails below`}
           >{row.near_dups.length}×</span>
         )}
         {/* Bottom-of-photo overlay: top-1 prediction + score + kingdom
@@ -102,6 +102,42 @@ export function Card({ row }: Props) {
           )}
         </div>
       </div>
+      {/* Attached near-dup thumbnails. The grid dedups burst shots
+          by hiding one representative per near-dup group; without
+          this strip the hidden photos are unreachable from the grid.
+          Rendered as small buttons so the existing handleOpen guard
+          (which ignores clicks on <button>) prevents the parent's
+          modal open. stopPropagation is belt-and-suspenders. Cap at
+          6 siblings to avoid the grid overflow on large bursts. */}
+      {row.near_dups && row.near_dups.length > 0 && (
+        <div className="flex flex-wrap gap-1 p-1 bg-bg-1 border-t border-line2">
+          {row.near_dups.slice(0, 6).map((sib) => (
+            <button
+              key={sib.asset_id}
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                dispatch({ type: 'OPEN_MODAL', assetId: sib.asset_id });
+              }}
+              title={sib.original_file_name ?? 'similar photo'}
+              className="block w-12 h-12 overflow-hidden rounded-sm border border-line2 hover:border-accent"
+            >
+              <img
+                src={thumbUrl(sib.asset_id, 'preview')}
+                alt={sib.original_file_name ?? 'similar photo'}
+                loading="lazy"
+                decoding="async"
+                className="w-full h-full object-cover"
+              />
+            </button>
+          ))}
+          {row.near_dups.length > 6 && (
+            <span className="self-center text-[10px] text-fg-1 px-1">
+              +{row.near_dups.length - 6} more
+            </span>
+          )}
+        </div>
+      )}
     </article>
   );
 }

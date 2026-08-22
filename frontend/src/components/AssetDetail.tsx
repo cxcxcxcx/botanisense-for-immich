@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { getAsset, reclassifyBbox, reclassify } from '../api/endpoints';
-import type { AssetDetail as AssetDetailType } from '../api/types';
+import type { AssetDetail as AssetDetailType, PlantAttributionRow } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
@@ -12,6 +12,48 @@ import { formatPct } from '../lib/format';
 
 interface Props {
   assetId: string;
+}
+
+// Chip for the "source" of a plant-attribution row. We only render a
+// badge when the species came from a non-default source — YOLO crop
+// (yellow) or mixed (blue). Whole-image BioCLIP is the default
+// pathway, so labelling every row with "whole image" just adds noise.
+// The type stays exhaustive so the lookup at the call site is type-safe
+// even if whole_image is never displayed.
+const ATTRIBUTION_SOURCE_BADGE: Record<PlantAttributionRow['source'], { label: string; className: string; title: string } | null> = {
+  whole_image: null,
+  yolo:        { label: 'yolo crop', className: 'border-[#8a7a3a] text-[#e8c45c]', title: 'Plantae kingdom score < 0.10; below the whole-image confidence floor. Species comes from YOLO crop + BioCLIP-on-crop.' },
+  mixed:       { label: 'mixed',     className: 'border-[#3a6a8a] text-[#7ac8e8]', title: 'Both whole-image BioCLIP and a YOLO crop agree on this species.' },
+};
+
+// Build a Google search URL for a free-form taxonomy term. The query
+// keeps the actual name verbatim — quoted ("...") so Google searches
+// the exact phrase, and prepended with "plant" so a common English
+// word like "Rose" doesn't return recipes / nursery homepages.
+function googleSearchUrl(term: string, hint?: string): string {
+  const q = hint
+    ? `"${term}" ${hint}`
+    : `"${term}"`;
+  return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+}
+
+// Official Google "G" logo as inline SVG. Sized via the `className`.
+// Source: Google's published brand assets (public domain). Stays
+// inline so the icon doesn't break if the bundle is loaded offline.
+function GoogleIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 48 48"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+    >
+      <path fill="#4285F4" d="M43.611 20.083H42V20H24v8h11.303c-1.649 4.657-6.08 8-11.303 8-6.627 0-12-5.373-12-12s5.373-12 12-12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 12.955 4 4 12.955 4 24s8.955 20 20 20 20-8.955 20-20c0-1.341-.138-2.65-.389-3.917z"/>
+      <path fill="#34A853" d="M6.306 14.691l6.571 4.819C14.655 15.108 18.961 12 24 12c3.059 0 5.842 1.154 7.961 3.039l5.657-5.657C34.046 6.053 29.268 4 24 4 16.318 4 9.656 8.337 6.306 14.691z"/>
+      <path fill="#FBBC05" d="M24 44c5.166 0 9.86-1.977 13.409-5.192l-6.19-5.238C29.211 35.091 26.715 36 24 36c-5.202 0-9.619-3.317-11.283-7.946l-6.522 5.025C9.505 39.556 16.227 44 24 44z"/>
+      <path fill="#EA4335" d="M43.611 20.083H42V20H24v8h11.303c-.792 2.237-2.231 4.166-4.087 5.571.001-.001.002-.001.003-.002l6.19 5.238C36.971 39.205 44 34 44 24c0-1.341-.138-2.65-.389-3.917z"/>
+    </svg>
+  );
 }
 
 export function AssetDetail({ assetId }: Props) {
@@ -60,6 +102,9 @@ export function AssetDetail({ assetId }: Props) {
   const fullTop1 = data.top_predictions[0];
   const plantaeScore = data.taxon_scores?.Plantae;
   const plantaeTier = plantaeColorClass(plantaeScore);
+  const attribution = data.plant_attribution;
+  const attributionRows = attribution?.rows ?? [];
+  const highlightIds = attribution?.highlight_detection_ids ?? [];
 
   return (
     <div className="text-[13px]">
@@ -69,12 +114,16 @@ export function AssetDetail({ assetId }: Props) {
           and are guaranteed to line up. The canvas lays out like an
           <img>: max-h 220px, max-w 100%, aspect ratio preserved. The
           text-center wrapper keeps it horizontally centered. A failed
-          fullsize load falls back to the preview size. */}
+          fullsize load falls back to the preview size.
+          highlightDetectionIds pushes the attribution-accepted boxes
+          onto the canvas — even low-YOLO-score boxes are drawn when
+          the whole-image plantae score confirms the bbox. */}
       <div className="text-center mb-2">
         <figure className="m-0 inline-block bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] max-w-full align-top">
           <BboxImage
             src={thumbUrl(data.asset_id, usePreview ? 'preview' : 'fullsize')}
             detections={data.detections}
+            highlightDetectionIds={highlightIds}
             fit="contain"
             maxHeight={220}
             ariaLabel={data.original_file_name}
@@ -158,19 +207,40 @@ export function AssetDetail({ assetId }: Props) {
         {fullTop1?.family && (
           <>
             <span className="rank-sep">›</span>
-            <span className="rank-family">{fullTop1.family}</span>
+            <a
+              href={googleSearchUrl(fullTop1.family, 'plant family')}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Search Google for family ${fullTop1.family}`}
+              className="rank-family hover:text-accent hover:underline"
+            >{fullTop1.family}</a>
           </>
         )}
         {fullTop1?.genus && (
           <>
             <span className="rank-sep">›</span>
-            <span className="rank-genus">{fullTop1.genus}</span>
+            <a
+              href={googleSearchUrl(fullTop1.genus, 'plant genus')}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Search Google for genus ${fullTop1.genus}`}
+              className="rank-genus hover:text-accent hover:underline"
+            >{fullTop1.genus}</a>
           </>
         )}
         {fullTop1?.species && (
           <>
             <span className="rank-sep">›</span>
-            <span className="rank-species">{fullTop1.species}</span>
+            <a
+              href={googleSearchUrl(
+                fullTop1.genus ? `${fullTop1.genus} ${fullTop1.species}` : fullTop1.species,
+                'plant'
+              )}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Search Google for ${fullTop1.species}`}
+              className="rank-species hover:text-accent hover:underline"
+            >{fullTop1.species}</a>
           </>
         )}
         {plantaeScore != null && (
@@ -180,16 +250,138 @@ export function AssetDetail({ assetId }: Props) {
         )}
       </nav>
 
+      {/* "Plants in this image" — the headline answer. Combines the
+          whole-image BioCLIP top-K with YOLO bbox-bioclip into a
+          single deduped species list. Rendered as the FIRST content
+          block under the image so the user gets the answer before
+          the full top-K and YOLO debug sections below. */}
+      <section className="border border-[#234] rounded-md bg-[#0e1410] p-3 my-3" aria-label="Plants in this image">
+        <div className="flex items-baseline justify-between mb-2">
+          <h5 className="m-0 text-[0.95rem] text-[#ad9]">Plants in this image</h5>
+          {/* Right-side meta: species count + (when non-default)
+              source. "whole image" is the default pathway and adds
+              noise, so we only print the source when something
+              different happened (yolo / mixed). */}
+          {attribution && attribution.source !== 'none' && (
+            <span className="text-[10px] text-fg-1 font-mono">
+              {attributionRows.length} species
+              {attribution.source !== 'whole_image' && (
+                <> · source: {attribution.source.replace('_', ' ')}</>
+              )}
+            </span>
+          )}
+        </div>
+        {attributionRows.length === 0 ? (
+          <p className="m-0 text-[12px] text-fg-1 italic">
+            No plants confidently attributed to this image.
+            {attribution?.plantae_score != null && (
+              <> Plantae kingdom score {(attribution.plantae_score * 100).toFixed(1)}%.</>
+            )}
+          </p>
+        ) : (
+          <ul className="m-0 p-0 list-none">
+            {attributionRows.map((r, i) => {
+              const badge = ATTRIBUTION_SOURCE_BADGE[r.source];
+              // A binomial species name already starts with its genus
+              // ("Helianthus annuus" → "Helianthus"). Detect this
+              // case-insensitively on the first word so we can avoid
+              // duplicating it in both the Google query and the
+              // sub-line pill.
+              const impliedGenus = !!(
+                r.genus && r.species &&
+                r.species.toLowerCase().split(/\s+/)[0] === r.genus.toLowerCase()
+              );
+              const showGenusPill = !!r.genus && !impliedGenus;
+              // Species search: prepend the genus only when the
+              // species doesn't already start with it. Without this
+              // guard, "Helianthus annuus" + genus "Helianthus"
+              // produces a "Helianthus Helianthus annuus" query,
+              // which Google can't find anything for. The "plant"
+              // hint keeps the search botanical for vague single-word
+              // species.
+              const speciesQuery = r.genus && !impliedGenus
+                ? `${r.genus} ${r.species}`
+                : r.species;
+              const speciesSearch = googleSearchUrl(speciesQuery, 'plant');
+              return (
+                <li
+                  key={`${r.species}-${i}`}
+                  className="flex items-baseline justify-between gap-2 py-1 border-t border-[#222] first:border-t-0 text-[13px]"
+                >
+                  <div className="flex-1 min-w-0">
+                    <span className="italic font-semibold">{r.species}</span>
+                    {r.common_name && (
+                      <span className="text-fg-1 text-[11px] ml-1.5">({r.common_name})</span>
+                    )}
+                    {/* Google search link for the species. The icon
+                        is the official multicolored G so users get
+                        the same visual cue as in other Google
+                        products. target=_blank + rel=noopener keeps
+                        the modal open. */}
+                    <a
+                      href={speciesSearch}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`Search Google for "${r.species}"`}
+                      aria-label={`Search Google for ${r.species}`}
+                      className="ml-1.5 inline-flex items-center align-baseline opacity-70 hover:opacity-100"
+                    >
+                      <GoogleIcon className="w-[12px] h-[12px]" />
+                    </a>
+                    <span className="block text-[11px] text-fg-1 truncate">
+                      {/* Skip the genus pill when the binomial already
+                          shows it — "Helianthus annuus" doesn't need
+                          "genus Helianthus" beneath it. */}
+                      {showGenusPill && (
+                        <a
+                          href={googleSearchUrl(r.genus as string, 'plant genus')}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={`Search Google for genus ${r.genus}`}
+                          className="hover:text-accent hover:underline"
+                        >genus {r.genus}</a>
+                      )}
+                      {showGenusPill && r.family && (
+                        <span className="mx-1">·</span>
+                      )}
+                      {r.family && (
+                        <a
+                          href={googleSearchUrl(r.family, 'plant family')}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          title={`Search Google for family ${r.family}`}
+                          className="hover:text-accent hover:underline"
+                        >family {r.family}</a>
+                      )}
+                      {!showGenusPill && !r.family && (r.kingdom ?? '')}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {/* Only render the chip for non-default sources
+                        (yolo crop, mixed). Whole-image rows show no
+                        chip — they're the default pathway. */}
+                    {badge && (
+                      <span
+                        className={`px-1.5 py-px rounded border text-[10px] font-mono ${badge.className}`}
+                        title={badge.title}
+                      >{badge.label}</span>
+                    )}
+                    <span className="text-[#ad9] font-mono tabular-nums text-[12px] min-w-[42px] text-right">
+                      {formatPct(r.score)}
+                    </span>
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+
       <LibraryNeighbors items={data.library_neighbors} />
 
-      <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">Top-{data.top_predictions.length} predictions</h5>
-      <div className="pt-0 pb-3 px-3">
-        <Predictions items={(data.top_predictions ?? []).slice(0, 5)} />
-      </div>
-
       {data.knn?.top_species ? (
-        <>
-          <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">KNN (re-classified)</h5>
+        <details className="my-3">
+          <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">KNN (re-classified)</summary>
           <div className="px-3 pb-3 border-t border-dashed border-[#333] mt-1">
             <div className="flex justify-between mb-1 text-[12px]">
               <span>
@@ -208,17 +400,33 @@ export function AssetDetail({ assetId }: Props) {
               </div>
             ))}
           </div>
-        </>
+        </details>
       ) : null}
       <button type="button" className="bg-[#234] text-fg border border-[#456] px-2.5 py-1 rounded text-[11px] cursor-pointer hover:bg-[#345] mt-1" onClick={handleReclassifyAll}>
         Re-run KNN
       </button>
 
-      {(data.detections ?? []).filter(d => d.score >= 0.10).length > 0 && (
-        <>
-          <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">YOLO detections (per-crop)</h5>
-          {data.detections
-            .filter(d => d.score >= 0.10)
+      {/* Debug panels — top-K BioCLIP and per-crop YOLO details. The
+          "Plants in this image" block above already answers the main
+          question; these are for users who want to see the raw
+          ranking under the hood. Collapsed by default so the modal
+          doesn't open with a wall of debug numbers. */}
+      <details className="my-3">
+        <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">
+          Top-{data.top_predictions.length} predictions (debug)
+        </summary>
+        <div className="pt-0 pb-3 px-3">
+          <Predictions items={(data.top_predictions ?? []).slice(0, 5)} />
+        </div>
+      </details>
+
+      {(data.detections ?? []).filter(d => d.score >= 0.20).length > 0 && (
+        <details className="my-3">
+          <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">
+            YOLO detections (debug, per-crop)
+          </summary>
+          {(data.detections ?? [])
+            .filter(d => d.score >= 0.20)
             .map((d, i) => (
               <div key={d.id}>
                 <DetectionBlock det={d} fullTop1={fullTop1} />
@@ -227,7 +435,7 @@ export function AssetDetail({ assetId }: Props) {
                 </button>
               </div>
             ))}
-        </>
+        </details>
       )}
     </div>
   );

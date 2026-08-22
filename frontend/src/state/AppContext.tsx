@@ -14,6 +14,7 @@ import {
   type Dispatch,
   type ReactNode,
 } from 'react';
+import type { SyncDefaults } from '../api/types';
 
 // ---- Types ---------------------------------------------------------------
 
@@ -42,6 +43,10 @@ export interface Filters {
   // 0 = no person, 1 = has person, undefined = any (and unscanned).
   // Drives /api/results?has_person= and the toolbar chip group.
   has_person?: 0 | 1 | undefined;
+  // Plantae-tier facet: independent of group_by, narrows both the
+  // filter cards and the photo grid to the same population so counts
+  // reconcile. undefined = all tiers.
+  plantae?: 'plant' | 'non_plant' | 'uncertain' | undefined;
 }
 
 export interface ModalState {
@@ -92,6 +97,13 @@ export interface AppState {
   // single active-bar. ClusterAlbumBar reads this so it doesn't
   // duplicate the cluster identity shown in that bar.
   filtersCollapsed: boolean;
+  // Sync-to-IMMICH defaults, persisted on the server (album_meta key
+  // "sync_defaults"). Loaded on Run-page mount; mutated by the
+  // ImmichSync component's "Save defaults" button. Per-action
+  // overrides (e.g. "this one time, tag only the with-people ones")
+  // live in ImmichSync's local state — they don't go through the
+  // reducer because they shouldn't survive a remount.
+  syncDefaults: SyncDefaults | null;
 }
 
 export type Action =
@@ -106,7 +118,8 @@ export type Action =
   | { type: 'JOB_PROGRESS'; added: number; total: number }
   | { type: 'JOB_DONE'; added: number; album_id: string | null; album_url: string | null; reused: boolean }
   | { type: 'JOB_ERROR'; errorMsg: string }
-  | { type: 'JOB_HIDE' };
+  | { type: 'JOB_HIDE' }
+  | { type: 'SET_SYNC_DEFAULTS'; defaults: SyncDefaults | null };
 
 // ---- Initial state -------------------------------------------------------
 
@@ -127,6 +140,7 @@ const INITIAL: AppState = {
   modal: { open: false, kind: null, assetId: null },
   job: defaultJob(),
   filtersCollapsed: false,
+  syncDefaults: null,
 };
 
 // ---- Reducer -------------------------------------------------------------
@@ -207,6 +221,8 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, job: { ...state.job, state: 'error', errorMsg: action.errorMsg } };
     case 'JOB_HIDE':
       return { ...state, job: defaultJob() };
+    case 'SET_SYNC_DEFAULTS':
+      return { ...state, syncDefaults: action.defaults };
     default:
       return state;
   }
@@ -242,4 +258,7 @@ export function useModal() {
 }
 export function useJob() {
   return useApp().state.job;
+}
+export function useSyncDefaults() {
+  return useApp().state.syncDefaults;
 }

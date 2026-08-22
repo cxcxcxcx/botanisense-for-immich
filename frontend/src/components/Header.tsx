@@ -1,7 +1,7 @@
 import { KnnPill } from './KnnPill';
 import { StatusPanel } from './StatusPanel';
-import { LegendBar } from './LegendBar';
 import { navigate, topLevel, type View } from '../hooks/useRoute';
+import { useApp } from '../state/AppContext';
 
 interface Props {
   view: View;
@@ -11,6 +11,21 @@ export function Header({ view }: Props) {
   // Both browse-list and browse-content share the "Browse" tab (we're
   // still browsing; the content view is just deeper into it).
   const active = topLevel(view);
+  // Clicking "Browse" while a filter is active should land on the
+  // photo grid (browse-content), not the empty filter-card list
+  // (browse-list). The list view collapses the cards behind an
+  // active-card summary when a filter is set, so without this jump
+  // the user gets a blank main area below the banner — see the
+  // `if (collapsed && activeCard && !showPersonChip) return null;`
+  // early-return in FilterCards. Deep-link navigation is still
+  // handled by the matching useEffect in App.tsx.
+  const { state } = useApp();
+  const hasActiveFilter =
+    state.filters.cluster_id != null ||
+    !!state.filters.species ||
+    !!state.filters.genus ||
+    !!state.filters.family;
+  const browseTarget: View = hasActiveFilter ? 'browse-content' : 'browse-list';
   return (
     <header className="sticky top-0 z-50 bg-bg flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
       <div className="inline-flex gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
@@ -18,7 +33,7 @@ export function Header({ view }: Props) {
           role="tab"
           aria-selected={active === 'browse-list'}
           className={`bg-transparent text-fg-0 border border-transparent rounded-md cursor-pointer py-[3px] px-3 text-[0.8rem] hover:text-fg hover:border-[#444] ${active === 'browse-list' ? 'bg-accent-dark text-white border-accent' : ''}`}
-          onClick={() => navigate('browse-list')}
+          onClick={() => navigate(browseTarget)}
         >
           Browse
         </button>
@@ -34,12 +49,13 @@ export function Header({ view }: Props) {
       <hgroup className="flex items-center gap-2 m-0">
         <h1 className="m-0 text-[1.1rem]">Immich × BioCLIP</h1>
       </hgroup>
-      {/* KNN pill + StatusPanel only on Run view; compact status in
-          browse view. LegendBar buttons (sync / backfill / purge)
-          only show on Run view. */}
+      {/* KNN pill + full StatusPanel on Run view; compact status on
+          Browse. The data-tools / sync-to-IMMICH sections moved out of
+          the sticky header and into the Run view's main column so the
+          header stays compact and the Run page has clear vertical
+          sections. */}
       {active === 'run' && <KnnPill />}
       {active === 'run' ? <StatusPanel /> : <StatusPanel compact />}
-      {active === 'run' && <LegendBar />}
     </header>
   );
 }

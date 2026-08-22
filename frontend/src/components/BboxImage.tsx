@@ -47,6 +47,15 @@ interface Props {
   // Fires if the image fails to decode (so callers can swap to a
   // fallback URL, e.g. fullsize → preview).
   onError?: () => void;
+  // When provided, the canvas draws ONLY the boxes whose `id` is in
+  // the set, regardless of score. This is the "plants in this image"
+  // signal: the asset-detail modal passes the detection IDs that
+  // storage.compute_plant_attribution accepted as justified, so
+  // plausibly-low-YOLO boxes are still drawn when the whole-image
+  // plantae score confirms the bbox. When omitted, the canvas falls
+  // back to the original `score >= 0.50` filter (used by grid cards
+  // that don't have an attribution summary).
+  highlightDetectionIds?: number[] | null;
 }
 
 // A <canvas> that draws BOTH the photo and its YOLO detection boxes.
@@ -64,6 +73,7 @@ export function BboxImage({
   className,
   ariaLabel,
   onError,
+  highlightDetectionIds,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -176,7 +186,14 @@ export function BboxImage({
       const mapX = (px: number) => offX + px * drawW;
       const mapY = (py: number) => offY + py * drawH;
 
-      const visible = (detections ?? []).filter(d => d.score >= 0.50);
+      const visible = (detections ?? []).filter(d => {
+        if (highlightDetectionIds && highlightDetectionIds.length > 0) {
+          return highlightDetectionIds.includes(d.id);
+        }
+        // Backwards-compat default: only draw high-confidence boxes
+        // when the caller hasn't supplied a curated highlight set.
+        return d.score >= 0.50;
+      });
       const stroke = 2 * s;
       const fontSize = 10 * s;
       const pad = 2 * s;
@@ -212,7 +229,7 @@ export function BboxImage({
     const ro = new ResizeObserver(draw);
     ro.observe(canvas);
     return () => ro.disconnect();
-  }, [natural, detections, fit]);
+  }, [natural, detections, fit, highlightDetectionIds]);
 
   const baseClass = fit === 'cover'
     ? 'block w-full h-full'

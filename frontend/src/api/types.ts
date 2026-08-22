@@ -22,6 +22,32 @@ export interface Detection {
   bbox_predictions?: Prediction[];
 }
 
+// "Plants in this image" attribution summary. One block per asset that
+// combines whole-image BioCLIP + YOLO bbox-bioclip into a single
+// deduped species list. Computed server-side by
+// storage.compute_plant_attribution and reused on the grid (whole-image
+// only) and the asset-detail modal (whole-image + YOLO fallback).
+export interface PlantAttributionRow {
+  species: string;
+  common_name: string | null;
+  score: number;
+  kingdom: string | null;
+  family: string | null;
+  genus: string | null;
+  source: 'whole_image' | 'yolo' | 'mixed';
+  // Set when source ∈ {yolo, mixed} — the detection row whose top-1
+  // crop produced this row. Drawn on the canvas as a highlighted box.
+  detection_id: number | null;
+  yolo_score: number | null;
+}
+
+export interface PlantAttribution {
+  source: 'whole_image' | 'yolo' | 'mixed' | 'none';
+  rows: PlantAttributionRow[];
+  highlight_detection_ids: number[];
+  plantae_score: number | null;
+}
+
 export interface NearDup {
   asset_id: string;
   original_file_name: string | null;
@@ -68,6 +94,12 @@ export interface ResultRow {
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
   detections: Detection[];
+  // "Plants in this image" summary — whole-image seed only for the
+  // grid (YOLO bbox-bioclip is too expensive to ship with every row).
+  // The asset-detail endpoint carries the full version with YOLO
+  // fallback. Add backwards-compat: cached rows pre-feature may
+  // expose this as undefined.
+  plant_attribution?: PlantAttribution;
   // Person-detection flag from the pipeline's "person" stage. See
   // AssetDetail.has_person for the three-state semantics.
   has_person?: boolean | null;
@@ -142,6 +174,9 @@ export interface AssetDetail {
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
   detections: Detection[];
+  // "Plants in this image" summary — full version with YOLO bbox
+  // fallback. Renders as the top block of the asset-detail modal.
+  plant_attribution: PlantAttribution;
   library_neighbors: LibraryNeighbor[];
   knn: KnnRow | null;
 }
@@ -223,6 +258,9 @@ export interface JobPreview {
   cluster_id?: number;
   kingdom?: string;
   min_score?: number;
+  // Membership filter echoed by the preview so the UI can render the
+  // count chip without re-deriving the value the server used.
+  people_filter?: 0 | 1 | null;
 }
 
 export interface JobStart {
@@ -233,6 +271,7 @@ export interface JobStart {
   cluster_id?: number;
   kingdom?: string;
   min_score?: number;
+  people_filter?: 0 | 1 | null;
 }
 
 export interface JobSnapshot {
@@ -290,6 +329,8 @@ export interface ResultsQuery {
   species?: string | undefined;
   genus?: string | undefined;
   family?: string | undefined;
+  has_person?: 0 | 1 | undefined;
+  plantae?: 'plant' | 'non_plant' | 'uncertain' | undefined;
   [k: string]: string | number | undefined;
 }
 
@@ -298,6 +339,48 @@ export interface RunParams {
   n_samples?: number | null;
   top_k?: number | null;
   batch_size?: number | null;
+}
+
+// Sync-to-IMMICH defaults — persisted on the server (album_meta
+// key="sync_defaults"). `people_filter` semantics: null = doesn't
+// matter, 0 = without people, 1 = with people. The same shape is
+// used by GET /api/settings/sync-defaults and PUT body.
+export interface SyncDefaultsSlot {
+  people_filter: 0 | 1 | null;
+  min_score?: number;
+}
+export interface SyncDefaultsClustersSlot {
+  people_filter: 0 | 1 | null;
+}
+export interface SyncDefaults {
+  plants: SyncDefaultsSlot;
+  fungi: SyncDefaultsSlot;
+  clusters: SyncDefaultsClustersSlot;
+  sync_all: SyncDefaultsClustersSlot;
+}
+export interface SyncDefaultsResponse {
+  defaults: SyncDefaults;
+  // True when the server seeded the row on first read (post-upgrade);
+  // lets the UI show a one-time "Defaults initialised from
+  // environment" hint instead of pretending the user set them.
+  seeded: boolean;
+}
+
+// Bulk-remove cluster album mappings. Mirrors POST
+// /api/album/cluster/remove. `cluster_ids=null` means "all
+// currently synced clusters" — the default Run-page action.
+export interface BulkClusterRemoveParams {
+  cluster_ids: number[] | null;
+  delete_in_immich: boolean;
+}
+export interface BulkClusterRemoveError {
+  cluster_id: number;
+  error: string;
+}
+export interface BulkClusterRemoveResponse {
+  removed: number;
+  remote_deleted: number;
+  errors: BulkClusterRemoveError[];
 }
 
 // SSE snapshot pushed by /api/events. One object per `data:` line,

@@ -10,6 +10,9 @@ import { useApp, DEFAULT_FILTERS, type Filters, type GroupBy, type SortMode } fr
 
 const PERSIST_KEYS = ['group_by', 'sort', 'q'] as const;
 
+const PLANTAE_VALUES = ['plant', 'non_plant', 'uncertain'] as const;
+type PlantaeValue = (typeof PLANTAE_VALUES)[number];
+
 function readPersisted(fallback: Filters): Filters {
   try {
     const saved = JSON.parse(localStorage.getItem('filters:persist') ?? '{}');
@@ -55,6 +58,11 @@ export function parseUrlFilters(search: string = window.location.search): Filter
   // as 0|1 (string is the URL transport); absent/unknown → undefined.
   const hp = sp.get('has_person');
   if (hp === '0' || hp === '1') f.has_person = hp === '1' ? 1 : 0;
+  // Plantae-tier facet: independent of group_by. Absent/invalid → undefined.
+  const pl = sp.get('plantae');
+  if (pl && (PLANTAE_VALUES as readonly string[]).includes(pl)) {
+    f.plantae = pl as PlantaeValue;
+  }
   return f;
 }
 
@@ -68,6 +76,7 @@ export function buildUrl(f: Filters): string {
   if (f.group_by === 'genus'   && f.genus)   sp.set('genus',   f.genus);
   if (f.group_by === 'family'  && f.family)  sp.set('family',  f.family);
   if (f.has_person != null) sp.set('has_person', String(f.has_person));
+  if (f.plantae) sp.set('plantae', f.plantae);
   if (f.page) sp.set('page', String(f.page));
   return `?${sp.toString()}`;
 }
@@ -75,10 +84,13 @@ export function buildUrl(f: Filters): string {
 /** Initial filters — read from URL first, fall back to localStorage, fall back to defaults. */
 export function initialFilters(): Filters {
   const fromUrl = parseUrlFilters();
-  // If URL had nothing useful, try localStorage.
+  // If URL had nothing useful, try localStorage. The "nothing useful"
+  // check must include EVERY top-level facet — including plantae — or
+  // a bare `?plantae=non_plant` URL would be silently discarded in
+  // favor of localStorage.
   if (fromUrl.group_by === 'cluster' && fromUrl.sort === 'rank' && !fromUrl.q && fromUrl.page === 0
       && fromUrl.cluster_id == null && !fromUrl.species && !fromUrl.genus && !fromUrl.family
-      && fromUrl.has_person == null) {
+      && fromUrl.has_person == null && fromUrl.plantae == null) {
     return readPersisted(DEFAULT_FILTERS);
   }
   return fromUrl;
@@ -102,6 +114,9 @@ export function useUrlFilters() {
     // has_person changes (including toggling off) re-paginate to 0 so
     // the user lands on page 1 of the new result set.
     if (Object.prototype.hasOwnProperty.call(patch, 'has_person')) {
+      next.page = 0;
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, 'plantae')) {
       next.page = 0;
     }
     writePersisted(next);

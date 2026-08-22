@@ -20,6 +20,18 @@ const SORTS: { value: CardSort; label: string; hint: string }[] = [
   { value: 'id',     label: 'id',     hint: 'internal cluster id order (cluster only)' },
 ];
 
+// Plantae-tier chips render here (and only here) because FilterCards
+// mounts on BOTH browse-list and browse-content (App.tsx), whereas
+// Toolbar only mounts on browse-list. Showing the chips on the grid
+// view lets the user filter plants/non-plants without first clicking
+// back to the card list.
+const PLANTAE_OPTS: Array<{ v: 'plant' | 'non_plant' | 'uncertain' | undefined; label: string; color: string; title: string }> = [
+  { v: undefined,  label: 'all',      color: 'transparent',  title: 'Show every photo (plants + uncertain + non-plants)' },
+  { v: 'plant',    label: 'plants',   color: '#1a3a1a',     title: 'Plantae ≥ 0.60' },
+  { v: 'uncertain', label: 'uncertain', color: '#3a3a1a',    title: 'Plantae 0.35–0.60' },
+  { v: 'non_plant', label: 'non-plants', color: '#3a1a1a',   title: 'Plantae < 0.35 (or unknown)' },
+];
+
 interface Card {
   key: string;
   label: string;
@@ -59,19 +71,26 @@ export function FilterCards() {
   useEffect(() => { setSortMode(readSort(filters.group_by)); }, [filters.group_by]);
   useEffect(() => { localStorage.setItem(SORT_KEY(filters.group_by), sortMode); }, [filters.group_by, sortMode]);
 
+  // Cluster list re-fetches whenever group_by flips to cluster OR the
+  // plantae tier changes. Both must be in the deps array.
   useEffect(() => {
     if (filters.group_by !== 'cluster') return;
     let cancelled = false;
-    getClusters().then(j => { if (!cancelled) setClusterData(j.clusters); }).catch(() => {});
+    getClusters(filters.plantae).then(j => { if (!cancelled) setClusterData(j.clusters); }).catch(() => {});
     return () => { cancelled = true; };
-  }, [filters.group_by]);
+  }, [filters.group_by, filters.plantae]);
 
+  // /api/results is fetched for the "all" tile total. We need it on
+  // BOTH the cluster view AND the taxonomy view (the previous behavior
+  // only fetched it for taxonomy, which made the cluster "all" tile
+  // sum local card counts and quietly disagree with the grid).
   useEffect(() => {
-    if (filters.group_by === 'cluster') return;
     let cancelled = false;
-    getResults({ page: 0, page_size: 1 }).then(r => { if (!cancelled) setResultsData(r); }).catch(() => {});
+    getResults({ page: 0, page_size: 1, plantae: filters.plantae })
+      .then(r => { if (!cancelled) setResultsData(r); })
+      .catch(() => {});
     return () => { cancelled = true; };
-  }, [filters.group_by]);
+  }, [filters.group_by, filters.plantae]);
 
   const allCards = useMemo<Card[]>(() => {
     if (filters.group_by === 'cluster') {
@@ -169,14 +188,21 @@ export function FilterCards() {
     setFilters({ [activeParamKey]: v, page: 0 } as Partial<typeof filters>);
   };
 
-  const total = allCards.reduce((a, b) => a + b.count, 0);
+  // The "all" tile total = the grid's pagination.total (raw file count
+  // for the active plantae tier). Sum of card counts is shown
+  // elsewhere as a sanity check (it should match). Fall back to the
+  // card sum while resultsData is loading so the tile doesn't flash 0.
+  // Same optional-chain trap as Grid.tsx — `?.pagination.total`
+    // short-circuits only `.pagination`, so a server response without
+    // a `pagination` field (e.g. the empty-filter sentinel) would
+    // throw when reading `.total`. Chain `?.` on every segment.
+    const totalAll = resultsData?.pagination?.total ?? allCards.reduce((a, b) => a + b.count, 0);
   const isLoading =
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
-  // Render the toolbar (sort + person chips) on BOTH browse-list and
-  // browse-content — users need to filter the photo grid by person
-  // from any cluster/taxon selection. Only render the cards grid on
+  // Render the toolbar (sort + plantae + person chips) on BOTH
+  // browse-list and browse-content. Only render the cards grid on
   // browse-list (where it makes sense). Hide entirely only when the
   // user explicitly collapsed an active card on browse-list.
   if (collapsed && activeCard && !showPersonChip) return null;
@@ -199,6 +225,35 @@ export function FilterCards() {
                 title={s.hint}
               >{s.label}</button>
               {i < SORTS.length - 1 && <span className="text-fg-3">/</span>}
+            </span>
+          ))}
+        </span>
+        {/* Plantae-tier chip — top-level facet that narrows both the
+            filter cards AND the photo grid. Lives in FilterCards
+            (not Toolbar) so it's visible on both views. The colored
+            squares match the LegendBar tiers. "all" clears the facet
+            (sets to undefined). Clicking any chip resets page to 0. */}
+        <span className="inline-flex items-center gap-1 ml-2" role="radiogroup" aria-label="Plantae tier filter">
+          <span className="text-fg-1 mr-[2px]">plants</span>
+          {PLANTAE_OPTS.map((opt, i, arr) => (
+            <span key={opt.label} className="inline-flex items-center gap-1">
+              <button
+                type="button"
+                role="radio"
+                aria-checked={filters.plantae === opt.v}
+                className={`inline-flex items-center gap-1 bg-transparent border-0 p-0 m-0 cursor-pointer text-[0.85rem] leading-[22px] ${
+                  filters.plantae === opt.v ? 'text-accent font-medium' : 'text-fg-0 hover:text-fg'
+                }`}
+                onClick={() => setFilters({ plantae: opt.v, page: 0 })}
+                title={opt.title}
+              >
+                <span
+                  className="inline-block w-2 h-2 rounded-sm"
+                  style={{ background: opt.color, border: opt.color === 'transparent' ? '1px solid #456' : undefined }}
+                />
+                {opt.label}
+              </button>
+              {i < arr.length - 1 && <span className="text-fg-3">/</span>}
             </span>
           ))}
         </span>
@@ -252,12 +307,12 @@ export function FilterCards() {
       </div>
 
       {/* Cards grid only on browse-list. On browse-content we already
-          rendered the toolbar above (sort + person chips); the cards
+          rendered the toolbar above (sort + chips); the cards
           themselves make no sense when looking at the photo grid. */}
       {!showPersonChip && (
       <div className="grid gap-2.5 py-1 grid-cols-[repeat(auto-fill,minmax(160px,1fr))]">
         <FilterAllCard
-          total={total}
+          total={totalAll}
           groupBy={filters.group_by}
           active={activeKey == null}
           onClick={goToAll}
@@ -312,7 +367,7 @@ function FilterAllCard({ total, groupBy, active, onClick }: AllCardProps) {
     <button
       type="button"
       className={`filter-card relative aspect-square bg-bg-2 rounded-lg overflow-hidden cursor-pointer p-0 text-inherit border transition-colors hover:border-accent hover:-translate-y-px ${
-        active ? 'border-accent shadow-[0_0_0_1px_#5cc078]' : 'border-line2'
+        active ? 'border-accent shadow-[0_0_0_1px#5cc078]' : 'border-line2'
       }`}
       onClick={onClick}
       title={`Show all ${total.toLocaleString()} assets (clear ${groupBy} filter)`}
@@ -332,7 +387,7 @@ function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
   const borderCls = pinned
     ? 'border-accent'
     : active
-      ? 'border-accent shadow-[0_0_0_1px_#5cc078]'
+      ? 'border-accent shadow-[0_0_0_1px#5cc078]'
       : 'border-line2 hover:border-accent';
   return (
     <button

@@ -1,66 +1,55 @@
-import { useEffect, useState } from 'react';
-import { getResults, reclassifyVisible } from '../api/endpoints';
-import type { ResultsResponse } from '../api/types';
+// Data tools shown on the Run view. These are the actions that DON'T
+// push to IMMICH (those live in <ImmichSync />): build the KNN index,
+// pull EXIF from Immich, purge assets that were removed from Immich,
+// reclassify the visible assets via KNN, and run a YOLO person scan.
+//
+// The previous version of this component also exposed the three
+// IMMICH-sync actions (Sync all clusters / Tag as Plants album /
+// Tag as Fungi album) and a Plantae confidence legend. Both moved:
+//   - the sync actions duplicate <ImmichSync /> and were removed
+//   - the Plantae legend is a Browse-view concern and would mislead
+//     users on the Run view, so it's gone
+//
+// Rendered as a section in the Run view's main column (not in the
+// sticky header) so it doesn't compete with the sync section for
+// visual space.
+
+import { useState } from 'react';
 import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
+import { reclassifyVisible } from '../api/endpoints';
 import { KnnBuildModal } from './KnnBuildModal';
 import { BackfillExifModal } from './BackfillExifModal';
 
 export function LegendBar() {
   const { dispatch } = useApp();
   const push = useToasts();
-  const [plantae, setPlantae] = useState<{ green: number; yellow: number }>({ green: 0.60, yellow: 0.35 });
   const [knnOpen, setKnnOpen] = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
 
-  useEffect(() => {
-    let cancelled = false;
-    getResults({ page: 0, page_size: 1 })
-      .then((r: ResultsResponse) => {
-        if (!cancelled) setPlantae({ green: r.plantae_green, yellow: r.plantae_yellow });
-      })
-      .catch(() => { /* keep defaults */ });
-    return () => { cancelled = true; };
-  }, []);
-
-  const handleSyncAll = () => dispatch({ type: 'OPEN_JOB', kind: 'sync-all', payload: {} });
-  const handlePlants  = () => dispatch({ type: 'OPEN_JOB', kind: 'plants', payload: {} });
-  const handleFungi   = () => dispatch({ type: 'OPEN_JOB', kind: 'fungi', payload: {} });
   const handlePurgeMissing = () => dispatch({ type: 'OPEN_JOB', kind: 'purge-missing', payload: {} });
   const handleDetectPeople = () => dispatch({ type: 'OPEN_JOB', kind: 'person-backfill', payload: {} });
 
   const handleReclassifyVisible = async () => {
     try {
-      const r = await reclassifyVisible();
+      await reclassifyVisible();
       push({ kind: 'info', message: 'KNN reclassify queued for visible assets' }, 2000);
-      console.debug('reclassify-visible queued', r);
     } catch (err) {
       push({ kind: 'error', message: err instanceof Error ? err.message : String(err) }, 4000);
     }
   };
 
-  // Shared button class — Pico's "secondary outline" button look,
-  // translated to Tailwind utility classes.
   const btnCls =
-    'px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.8rem] hover:bg-[#345] hover:border-accent disabled:opacity-50';
+    'px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.85rem] hover:bg-[#345] hover:border-accent disabled:opacity-50';
   const btnDanger = 'text-red-300 border-[#5a3030] hover:bg-[#5a3030] hover:text-white hover:border-red-300';
 
   return (
-    <nav className="flex flex-col gap-1 py-1 border-b border-line text-[0.85rem] w-full">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="inline-flex gap-1.5 items-center text-fg-1" title="Plantae confidence tiers">
-          Plantae <span className="w-2 h-2 rounded-sm" style={{ background: '#1a3a1a' }}></span>≥{plantae.green.toFixed(2)}{' '}
-          <span className="w-2 h-2 rounded-sm" style={{ background: '#3a3a1a' }}></span>≥{plantae.yellow.toFixed(2)}{' '}
-          <span className="w-2 h-2 rounded-sm" style={{ background: '#3a1a1a' }}></span>&lt;{plantae.yellow.toFixed(2)}
-        </span>
-      </div>
-      <div className="flex flex-wrap items-center gap-2">
-        <button className={btnCls} onClick={handleSyncAll}>⟳ Sync all clusters as albums</button>
-        <button className={btnCls} onClick={handlePlants}>Tag as Plants album</button>
-        <button className={btnCls} onClick={handleFungi}>Tag as Fungi album</button>
-        <button className={btnCls} onClick={handleReclassifyVisible}>Reclassify visible with KNN</button>
-      </div>
-      <div className="flex flex-wrap items-center gap-2 pt-1 mt-0.5 border-t border-dashed border-line2">
+    <section className="border border-line2 rounded-lg bg-bg-1 p-4 flex flex-col gap-3 w-full">
+      <header className="flex items-center justify-between gap-2">
+        <h3 className="m-0 text-base">Data tools</h3>
+        <small className="text-fg-2">local DB maintenance — doesn't touch Immich</small>
+      </header>
+      <div className="flex flex-wrap gap-2">
         <button
           className={btnCls}
           onClick={() => setKnnOpen(true)}
@@ -72,18 +61,23 @@ export function LegendBar() {
           title="Pull EXIF capture time + GPS from Immich for every asset that doesn't have it yet. ~30s for 17k assets."
         >🕒 Backfill EXIF</button>
         <button
-          className={`${btnCls} ${btnDanger}`}
-          onClick={handlePurgeMissing}
-          title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
-        >🗑 Purge assets deleted in Immich</button>
+          className={btnCls}
+          onClick={handleReclassifyVisible}
+          title="Queue KNN reclassification for every asset currently visible in the browse grid."
+        >Reclassify visible with KNN</button>
         <button
           className={btnCls}
           onClick={handleDetectPeople}
           title="Run YOLO over every asset where has_person is unknown. No BioCLIP — fast relative to a full pipeline run. ~70 min for ~19k photos."
-        >👤 Detect people in all photos</button>
+        >👤 Detect people</button>
+        <button
+          className={`${btnCls} ${btnDanger}`}
+          onClick={handlePurgeMissing}
+          title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
+        >🗑 Purge assets deleted in Immich</button>
       </div>
       <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
       <BackfillExifModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
-    </nav>
+    </section>
   );
 }

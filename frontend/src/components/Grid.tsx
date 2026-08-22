@@ -104,6 +104,10 @@ export function Grid() {
       // unchanged; backend treats 0/1 as exact-match on assets.has_person
       // and excludes unscanned (NULL) rows from both.
       has_person: filters.has_person,
+      // Plantae-tier facet — same idea, also top-level. Lets the user
+      // narrow the grid to plants / uncertain / non-plants without
+      // picking a cluster or taxon.
+      plantae: filters.plantae,
       sort: serverSort,
     })
       .then(r => { if (reqId === reqIdRef.current) { setData(r); setError(null); } })
@@ -112,7 +116,7 @@ export function Grid() {
   }, [
     filters.page, filters.page_size,
     filters.cluster_id, filters.species, filters.genus, filters.family,
-    filters.has_person,
+    filters.has_person, filters.plantae,
     filters.sort,
   ]);
 
@@ -130,7 +134,13 @@ export function Grid() {
       <Breadcrumb
         groupBy={filters.group_by}
         activeFilterLabel={activeFilterLabel}
-        total={data?.pagination.total ?? null}
+        // Optional-chain `?.` only short-circuits the IMMEDIATE property
+        // (`pagination`), not the chained `.total` after it. When the
+        // server returns the empty-filter sentinel `{error, results}`
+        // there is no `pagination` field, so the unsafe chain would
+        // throw "Cannot read properties of undefined (reading 'total')"
+        // and crash the whole grid. Use `?.` on every segment.
+        total={data?.pagination?.total ?? null}
         onBack={clearActiveFilter}
         sort={filters.sort}
         onSortChange={s => setFilters({ sort: s })}
@@ -143,7 +153,12 @@ export function Grid() {
         <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">No results in this view.</div>
       ) : (
         <>
-          <div className="grid grid-cols-2 gap-1.5 items-start">
+          {/* Responsive column count — packs more thumbnails on wider
+              screens where they stay readable (each card is aspect-4/5
+              with a compact meta footer). At 2xl (≥1536 px) each tile
+              is ~192 px wide, which still leaves room for the
+              predictions/species chips on the Card. */}
+          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 2xl:grid-cols-8 gap-1.5 items-start">
             {sortedRows.map(r => (
               <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
             ))}

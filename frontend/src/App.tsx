@@ -9,6 +9,8 @@ import { AssetDetail } from './components/AssetDetail';
 import { ParamsForm } from './components/ParamsForm';
 import { LogTail } from './components/LogTail';
 import { JobPanel } from './components/JobPanel';
+import { ImmichSync } from './components/ImmichSync';
+import { LegendBar } from './components/LegendBar';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -94,7 +96,14 @@ export function App() {
       <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-6' : ''}`}>
         {view === 'run' ? (
           <section className="flex flex-col gap-4">
+            {/* Run-page sections, top-to-bottom:
+                  1. Pipeline run — query / sample size / batch
+                  2. Sync to IMMICH — clusters / Plantae / Fungi / Remove
+                  3. Data tools — KNN build / EXIF backfill / purge / detect people
+                  4. Logs — pipeline + worker output */}
             <ParamsForm />
+            <ImmichSync />
+            <LegendBar />
             <LogTail active={true} />
           </section>
         ) : view === 'browse-content' ? (
