@@ -1,60 +1,120 @@
-- stratum: plantae_band_b_p0.20-0.30
-  asset_id: 2a436cec-dd35-43d5-ac78-a683cd192822
-  filename: IMG_2417.JPG
-  thumb_path: data/thumbs/2a436cec-dd35-43d5-ac78-a683cd192822.jpg
-  yolo_max: 0.7978
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: e04ce422-99ad-4a88-8eca-9e69e7f00a8f
+  filename: IMG_3520.JPG
+  thumb_path: data/thumbs/e04ce422-99ad-4a88-8eca-9e69e7f00a8f.jpg
+  yolo_max: 0.9621
   yolo_person: 1
-  model_p: 0.2104
+  model_p: 0.9519
   actual_person: 1
   use_case_relevant: 1
-  notes: "foreground_woman_lavender_field"
-  sublabel: "face"
-  i: 715
-- stratum: plantae_band_c_p0.30-0.40
-  asset_id: fcf952a3-9779-4cf6-8b78-70ce070923c2
-  filename: 20260322_120351.jpg
-  thumb_path: data/thumbs/fcf952a3-9779-4cf6-8b78-70ce070923c2.jpg
-  yolo_max: 0.8804
+  notes: kid_plant_focal
+  sublabel: foreground
+  i: 30
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 29fa1122-46b0-4526-bfc6-089b3efb5b39
+  filename: 2023-03-07 17.12.10.HEIC
+  thumb_path: data/thumbs/29fa1122-46b0-4526-bfc6-089b3efb5b39.jpg
+  yolo_max: 0.9617
   yolo_person: 1
-  model_p: 0.3846
+  model_p: 0.9954
   actual_person: 1
   use_case_relevant: 1
-  notes: "child_among_cherry_blossoms_face_visible"
-  sublabel: "background"
-  i: 716
-- stratum: plantae_band_c_p0.30-0.40
-  asset_id: 0bcc0123-8c53-4660-a74b-996b117e4f39
-  filename: 20240420_120654.jpg
-  thumb_path: data/thumbs/0bcc0123-8c53-4660-a74b-996b117e4f39.jpg
-  yolo_max: 0.5182
+  notes: back_walking_garden
+  sublabel: back_only
+  i: 31
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 6fe756a7-7325-408d-b906-35c45698e652
+  filename: _94A2584.JPG
+  thumb_path: data/thumbs/6fe756a7-7325-408d-b906-35c45698e652.jpg
+  yolo_max: 0.9568
   yolo_person: 1
-  model_p: 0.3044
+  model_p: 0.9825
   actual_person: 1
-  use_case_relevant: 0
-  notes: "tiny_background_pedestrians_garden"
-  sublabel: "tiny"
-  i: 717
-- stratum: plantae_band_c_p0.30-0.40
-  asset_id: 44a765a6-a694-447b-9022-d91c726f9514
-  filename: 2025-09-07 16.45.56.JPG
-  thumb_path: data/thumbs/44a765a6-a694-447b-9022-d91c726f9514.jpg
-  yolo_max: 0.8801
+  use_case_relevant: 1
+  notes: kid_plant_focal
+  sublabel: foreground
+  i: 32
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 18b57a7f-bb99-4c85-aae4-07853a3b35e4
+  filename: 2023-05-13 17.38.46.HEIC
+  thumb_path: data/thumbs/18b57a7f-bb99-4c85-aae4-07853a3b35e4.jpg
+  yolo_max: 0.9546
   yolo_person: 1
-  model_p: 0.3491
-  actual_person: 0
-  use_case_relevant: 0
-  notes: "screen_wedding_photos_on_monitor"
-  sublabel: null
-  i: 718
-- stratum: plantae_band_c_p0.30-0.40
-  asset_id: d47b4466-fb7d-46b6-aee2-1606b12615e4
-  filename: IMG_20191009_162712.jpg
-  thumb_path: data/thumbs/d47b4466-fb7d-46b6-aee2-1606b12615e4.jpg
-  yolo_max: 0.5697
-  yolo_person: 1
-  model_p: 0.3189
+  model_p: 0.9929
   actual_person: 1
-  use_case_relevant: 0
-  notes: "back_only_man_and_tiny_kid_in_garden"
-  sublabel: "back_only"
-  i: 719
+  use_case_relevant: 1
+  notes: back_walking_garden
+  sublabel: back_only
+  i: 33
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 10a57fd9-6609-42ba-b0a2-65024e7889c7
+  filename: 2022-09-11 11.01.54.jpg
+  thumb_path: data/thumbs/10a57fd9-6609-42ba-b0a2-65024e7889c7.jpg
+  yolo_max: 0.9519
+  yolo_person: 1
+  model_p: 0.9612
+  actual_person: 1
+  use_case_relevant: 1
+  notes: adult_focal_kid_background
+  sublabel: foreground
+  i: 34
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: b8233946-687a-42a2-abb3-467d2bf6d78b
+  filename: 2022-06-12 08.43.38.HEIC
+  thumb_path: data/thumbs/b8233946-687a-42a2-abb3-467d2bf6d78b.jpg
+  yolo_max: 0.956
+  yolo_person: 1
+  model_p: 0.9933
+  actual_person: 1
+  use_case_relevant: 1
+  notes: back_walking_garden
+  sublabel: back_only
+  i: 35
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 99465d7b-576d-4ffa-8519-d0d23e5933d6
+  filename: 2021-08-21 16.18.12.HEIC
+  thumb_path: data/thumbs/99465d7b-576d-4ffa-8519-d0d23e5933d6.jpg
+  yolo_max: 0.9562
+  yolo_person: 1
+  model_p: 0.9994
+  actual_person: 1
+  use_case_relevant: 1
+  notes: woman_smelling_flowers
+  sublabel: foreground
+  i: 36
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: bc4cf77a-0c4f-4929-8ce2-7bad5193edb0
+  filename: IMG_20190120_154355.jpg
+  thumb_path: data/thumbs/bc4cf77a-0c4f-4929-8ce2-7bad5193edb0.jpg
+  yolo_max: 0.9515
+  yolo_person: 1
+  model_p: 0.9826
+  actual_person: 1
+  use_case_relevant: 1
+  notes: back_walking_path
+  sublabel: back_only
+  i: 37
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 7be350f0-bcf6-4810-bf25-7a1aab780d6d
+  filename: IMG_20160902_192729.jpg
+  thumb_path: data/thumbs/7be350f0-bcf6-4810-bf25-7a1aab780d6d.jpg
+  yolo_max: 0.9506
+  yolo_person: 1
+  model_p: 0.996
+  actual_person: 1
+  use_case_relevant: 1
+  notes: portrait_woman_dress
+  sublabel: foreground
+  i: 38
+- stratum: 4_high_conf_hp1_untouched
+  asset_id: 96146bbd-7f76-424c-97d4-b12b86904ba4
+  filename: IMG_8231.JPG
+  thumb_path: data/thumbs/96146bbd-7f76-424c-97d4-b12b86904ba4.jpg
+  yolo_max: 0.9572
+  yolo_person: 1
+  model_p: 0.9846
+  actual_person: 1
+  use_case_relevant: 1
+  notes: portrait_woman_dress
+  sublabel: foreground
+  i: 39

@@ -143,9 +143,21 @@ def main():
         for i, r in enumerate(sampled):
             r["i"] = 700 + i  # offset from earlier batches (00..06 used 0..69)
 
+        # Snapshot existing batches before we touch anything — recovery
+        # net so a buggy carry-forward can't silently destroy old labels.
+        import shutil
+        import time as _time
+        old_batches = sorted(ROOT.glob("batch_*.yaml"))
+        if old_batches:
+            archive = ROOT.parent / f"label_sample_archive_{int(_time.time())}"
+            archive.mkdir(parents=True, exist_ok=False)
+            for ob in old_batches:
+                shutil.copy2(ob, archive / ob.name)
+            print(f"  archived {len(old_batches)} old batches → {archive}/", flush=True)
+
         # Write batches
         bs = args.batch_size
-        for old in ROOT.glob("batch_*.yaml"):
+        for old in old_batches:
             old.unlink()
         for i in range(0, len(sampled), bs):
             chunk = sampled[i:i+bs]

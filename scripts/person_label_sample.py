@@ -257,11 +257,22 @@ def main():
                 s["notes"] = None
                 s["sublabel"] = None
 
+        # Snapshot existing batches before we touch anything — recovery
+        # net so a buggy carry-forward can't silently destroy old labels.
+        import shutil
+        import time as _time
+        old_batches = sorted(out_dir.glob("batch_*.yaml"))
+        if old_batches:
+            archive = out_dir.parent / f"label_sample_archive_{int(_time.time())}"
+            archive.mkdir(parents=True, exist_ok=False)
+            for ob in old_batches:
+                shutil.copy2(ob, archive / ob.name)
+            print(f"  archived {len(old_batches)} old batches → {archive}/")
+
         # Split into batches
         n = len(sampled)
         bs = args.batch_size
         # Write batch_00.yaml, batch_01.yaml, ...
-        old_batches = sorted(out_dir.glob("batch_*.yaml"))
         for old in old_batches:
             old.unlink()
         for i in range(0, n, bs):

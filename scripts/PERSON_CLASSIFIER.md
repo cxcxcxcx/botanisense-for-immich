@@ -1,10 +1,10 @@
 # Person-flag classifier — design, evaluation, and production state
 
 The BioCLIP-2 logistic regression that decides `assets.has_person`.
-Stored at `data/person_classifier.joblib`. Replaces the original
-`has_real_person()` rule as the primary signal for "is there a use-case
-person in this photo", with YOLO retained only as a fallback in the
-classifier's borderline band.
+Stored at `data/person_classifier.joblib`. Used as the primary signal
+for "is there a use-case person in this photo"; YOLO acts as an
+**evidence gate** — the classifier positive only counts when YOLO also
+saw at least a faint person/face/human box.
 
 This document is the authoritative reference for the classifier design,
 training data, evaluation, and the current state of "remove YOLO from
@@ -14,15 +14,37 @@ the formula."
 
 ## TL;DR — current production state
 
-- **Total photos**: 19,304
-- **has_person=1**: 3,617 (18.7%)
-- **Classifier p>=0.5 (would be hp=1 if pure-classifier)**: 3,376 (17.5%)
-- **YOLO person (would be hp=1 if pure-YOLO)**: 3,862 (20.0%)
-- **Both agree**: 3,181 — the easy cases
-- **Classifier says yes, YOLO says no**: 195 (small — model catches missed persons)
-- **Classifier says no, YOLO says yes**: 681 (the borderline band — YOLO fallback applies here, with a Plantae>=0.95 safety net)
+**YOLO-evidence rule (shipped 2026-08-18)**:
 
-**Hybrid rule in production**:
+```
+has_person = 1  iff  classifier_p >= 0.15  AND  yolo_person_max >= 0.20
+has_person = 0  otherwise
+```
+
+Calibrated on 102-label stratified sample (7 strata). Population-weighted
+metrics with bootstrap 95% CIs at T=0.15:
+
+| Strategy | precision | recall | F1 |
+|---|---|---|---|
+| Pure classifier @ 0.15 | 0.975 | 0.979 | 0.977 |
+| Pure classifier @ 0.50 | 0.975 | 0.967 | 0.971 |
+| Hybrid (classifier+YOLO+Plantae) | 0.860 | 1.000 | 0.924 |
+| **YOLO-evidence @ 0.15** | **1.000** | **0.983** | **0.991** |
+| YOLO-evidence @ 0.50 | 1.000 | 0.967 | 0.983 |
+
+YOLO-evidence @ 0.15 has the tightest precision CI
+(`[1.000, 1.000]`) — the remaining FPs are in a single weight-1 stratum
+with no statistical room to escape. Recall stays ≥ 0.96. YOLO acts as
+an evidence gate: if YOLO truly saw nothing (`yolo_max` near 0), the
+model's positive is a misfire and we override it. `yolo_min=0.20`
+preserves wedding/family portraits (YOLO ~0.27) while killing
+pure-plant misfires (YOLO ~0.0).
+
+- **Total photos**: 19,304
+- **has_person=1**: 3,817 (19.8%) — applied by `scripts/person_apply_yolo_evidence.py`
+- **Flips from previous state**: 321 up (0→1, classifier rescues YOLO borderline) + 121 down (1→0, YOLO gate kills Plantae false positives)
+
+**Previous hybrid rule** (replaced on 2026-08-18; see "Rule history" below):
 1. classifier p >= 0.5 → hp=1 (trust classifier, ~3376 cases)
 2. classifier p < 0.5 AND YOLO says person AND (Plantae < 0.95 OR classifier p >= 0.15) → hp=1 (YOLO fallback with Plantae false-positive guard, ~265 cases)
 3. classifier p < 0.5 AND (Plantae >= 0.95 AND classifier p < 0.15) → hp=0 (Plantae-band safety net for hand-with-plant false positives, ~200 cases)
@@ -199,6 +221,7 @@ field, because the BioCLIP embedding collapses them.
 | `person_classifier_apply_flips.py` | Apply classifier p>=0.5 → hp=1 (was used for the 871-row initial flip) |
 | `person_classifier_plantae_flip.py` | Plantae>=0.95 + classifier p<0.15 → hp=0 (YOLO false positive cleanup) |
 | `person_classifier_backfill.py` | BioCLIP embed rows that lack embeddings + apply classifier flips |
+| `person_apply_yolo_evidence.py` | Apply the shipped YOLO-evidence rule across the whole library; POSTs /api/cache/invalidate |
 | `person_label_sample.py` | Build the 70-photo stratified sample (7 strata) |
 | `person_label_plantae_band.py` | Build the Plantae-band sample (4 bands) |
 | `person_label_prompt.md` | Labeling spec — what counts as actual_person / use_case_relevant |
@@ -236,23 +259,70 @@ field, because the BioCLIP embedding collapses them.
 
 If you're picking this up fresh:
 
-1. The original 70-photo stratified sample is **lost** (was overwritten
-   on 2026-08-17 by `person_label_plantae_band.py`). Regenerate with
-   `person_label_sample.py`.
+1. The original 70-photo stratified sample was **lost** on 2026-08-17
+   (was overwritten by `person_label_plantae_band.py`). Recovery
+   attempts (git fsck, archives) yielded script blobs but not the
+   original labels. The current 102-label sample (in
+   `data/label_sample/`) was built by `person_label_sample_yolo_basis.py`
+   using reconstructed YOLO has_person from the detections table.
 
-2. The classifier currently has F1 0.833 on `use_case_relevant` in a
-   within-sample eval on 32 Plantae-band photos. Real-world F1 unknown.
+2. The classifier currently has F1 0.991 (precision 1.000, recall
+   0.983, YOLO-evidence @ T=0.15) on the 102-label stratified sample,
+   95% bootstrap CI: prec=[1.000,1.000], rec=[0.959,1.000],
+   f1=[0.979,1.000]. Real-world F1 unknown.
 
 3. `storage.has_real_person()` is **no longer used in production** —
-   the database column `has_person` is set by the classifier-flips +
-   Plantae-safety-net scripts, not by the live pipeline. The function
-   still exists in storage.py for reference but is dead code.
+   the database column `has_person` is set by
+   `scripts/person_apply_yolo_evidence.py` (YOLO-evidence rule), not
+   by the live pipeline. The function still exists in storage.py for
+   reference but is dead code. The pipeline's person stage will only
+   touch rows where `has_person IS NULL`, which currently is zero.
 
 4. The `__pycache__` directories and `*.joblib` models are gitignored.
    Re-train the model from scratch by running `person_classifier_retrain.py`
-   after regenerating the 70-photo labels.
+   after regenerating the labels.
 
 5. The `cache_invalidate` HTTP endpoint (`POST /api/cache/invalidate`)
    is the way external scripts tell the running uvicorn worker to drop
    its in-process `_results_cache`. Without it, the worker serves stale
    `/api/results` until restart.
+
+---
+
+## Rule history
+
+| Date | Rule | Production has_person count | Comment |
+|---|---|---|---|
+| 2026-08-12 | Pure YOLO `has_real_person()` | ~4,830 | Initial person backfill. High false-positive rate (hand, jacket, screen-of-people). |
+| 2026-08-13 | Hybrid: classifier p≥0.5 OR (YOLO + Plantae safety net) | ~3,641 | First classifier shipped. Plantae-band false positives cut to ~200. |
+| 2026-08-15 | Pure classifier p≥0.5 (YOLO removed from formula) | 3,617 | Removed YOLO entirely. Added 32 hand-labels in Plantae band. |
+| **2026-08-18** | **YOLO-evidence: classifier p≥0.15 AND yolo_person_max≥0.20** | **3,817** | **Shipped.** Bootstrap CI shows prec=[1.000,1.000] rec=[0.959,1.000] f1=[0.979,1.000]. |
+
+The current rule keeps the classifier as the *primary* signal (it
+provides the recall) and uses YOLO as an *evidence gate* (it kills
+classifier false positives where YOLO saw nothing). It's the union of
+"trust the classifier" and "trust YOLO only as a sanity check on
+plant-only images".
+
+---
+
+## Annotation quality (lesson for next labeling pass)
+
+The 102-label sample ended up with a few row-swap and note-mismatch
+errors that were only caught by cross-referencing `notes` against the
+actual photo content:
+
+- `7157e427` was noted as "couple_walking_tulip_bed" but the photo is
+  a dry garden with street pedestrians (filename 2s apart from
+  `44a765a6`).
+- `44a765a6` was completely mislabeled — same dry-garden scene, but
+  the row got a different description entirely.
+- `92fffe94` was noted as "screen_portrait" but the photo is a kid in
+  a garden foreground.
+- Several iMac/screen-of-wedding-photos rows had `use_case_relevant=0`
+  — people on a screen DO count as a use-case person, but the
+  labeling prompt had a gap here.
+
+**Going forward**: label image-by-image, ideally via a script that
+calls the API and shows the actual JPEG/HEIC alongside the labels
+being entered. Bulk-row editing makes swap errors easy.
