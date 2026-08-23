@@ -719,6 +719,19 @@ def discover_plantae_assets(
             n_predict = 0
             n_thumb_dl = 0
             n_dedup = 0
+            # Bulk DB reads for this batch — replaces 3 per-asset
+            # SELECTs that previously dominated the search loop
+            # (~30s for 10k cached photos). One SELECT for the cache
+            # check, one for the existing asset rows (to know which
+            # need an upsert and which to refresh URLs on), one for
+            # the missing-captured_at check (drives the EXIF fetch).
+            batch_ids = [a.id for a in batch]
+            cached_ids = storage.bulk_taxon_scores_have_assets(
+                conn, asset_ids=batch_ids, rank="kingdom"
+            )
+            existing_assets = storage.bulk_asset_rows(
+                conn, asset_ids=batch_ids
+            )
             for asset in batch:
                 if asset.id in seen_ids:
                     n_dedup += 1
@@ -731,9 +744,7 @@ def discover_plantae_assets(
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
-                if storage.taxon_scores_have_asset(
-                    conn, asset_id=asset.id, rank="kingdom"
-                ):
+                if asset.id in cached_ids:
                     # Cache hit: kingdom score is already stored. Skip
                     # the GET /api/assets/{id} round-trip (the per-asset
                     # capture-time + GPS live in the local `assets`
@@ -741,12 +752,11 @@ def discover_plantae_assets(
                     # `assets` row when one of the URL/filename fields
                     # has actually changed.
                     n_cached += 1
-                    if not storage.asset_row_matches(
-                        conn,
-                        asset_id=asset.id,
-                        original_file_name=asset.original_file_name,
-                        original_url=original_url,
-                        thumbnail_url=thumbnail_url,
+                    existing = existing_assets.get(asset.id, {})
+                    if (
+                        existing.get("original_file_name") != asset.original_file_name
+                        or existing.get("original_url") != original_url
+                        or existing.get("thumbnail_url") != thumbnail_url
                     ):
                         # Refresh name/URLs only; keep existing
                         # captured_at / lat / lng.
@@ -757,10 +767,7 @@ def discover_plantae_assets(
                             original_url=original_url,
                             thumbnail_url=thumbnail_url,
                         )
-                    cached = storage.fetch_taxon_scores(
-                        conn, asset_ids=[asset.id], rank="kingdom"
-                    )
-                    d = cached.get(asset.id, {})
+                    d = existing
                     plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
                         "Plantae": float(d.get("Plantae") or 0.0),
                         "Fungi": float(d.get("Fungi") or 0.0),
@@ -770,9 +777,8 @@ def discover_plantae_assets(
                 # has the capture time + GPS (captured_at IS NOT NULL
                 # check gates against re-fetching photos we already
                 # know about from an earlier run).
-                if not storage.asset_has_captured_at(
-                    conn, asset_id=asset.id
-                ):
+                existing = existing_assets.get(asset.id, {})
+                if existing.get("captured_at") is None:
                     exif = ImmichClient.extract_exif(
                         client.get_asset_metadata(asset.id)
                     )

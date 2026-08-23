@@ -387,6 +387,51 @@ def asset_row_matches(
     return row is not None
 
 
+def bulk_asset_rows(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[str],
+) -> dict[str, dict]:
+    """Bulk: returns {asset_id: {original_file_name, original_url,
+    thumbnail_url, captured_at}} for the given asset_ids, in a single
+    SELECT. Replaces the per-asset `asset_row_matches` check which
+    was the second-largest cost in the search loop.
+    """
+    if not asset_ids:
+        return {}
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT asset_id, original_file_name, original_url, "
+        f"       thumbnail_url, captured_at "
+        f"  FROM assets WHERE asset_id IN ({placeholders})",
+        asset_ids,
+    ).fetchall()
+    return {
+        r["asset_id"]: dict(r)
+        for r in rows
+    }
+
+
+def bulk_assets_missing_captured_at(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[str],
+) -> set[str]:
+    """Returns the subset of `asset_ids` whose `assets.captured_at` is
+    NULL — i.e. the rows that need an EXIF fetch. Replaces the
+    per-asset `asset_has_captured_at` check.
+    """
+    if not asset_ids:
+        return set()
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT asset_id FROM assets "
+        f"WHERE captured_at IS NULL AND asset_id IN ({placeholders})",
+        asset_ids,
+    ).fetchall()
+    return {r["asset_id"] for r in rows}
+
+
 def asset_has_captured_at(
     conn: sqlite3.Connection,
     *,
@@ -2171,6 +2216,24 @@ def taxon_scores_have_asset(
         (asset_id, rank),
     ).fetchone()
     return row is not None
+
+
+def bulk_taxon_scores_have_assets(
+    conn: sqlite3.Connection, *, asset_ids: list[str], rank: str
+) -> set[str]:
+    """Returns the subset of `asset_ids` that have at least one row
+    in `taxon_scores` for `rank`. One SELECT for the whole batch —
+    replaces per-asset `taxon_scores_have_asset` which was the
+    dominant cost (~30 s for 10k cached photos)."""
+    if not asset_ids:
+        return set()
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT DISTINCT asset_id FROM taxon_scores "
+        f"WHERE rank=? AND asset_id IN ({placeholders})",
+        [rank, *asset_ids],
+    ).fetchall()
+    return {r["asset_id"] for r in rows}
 
 
 def fetch_taxon_scores(
