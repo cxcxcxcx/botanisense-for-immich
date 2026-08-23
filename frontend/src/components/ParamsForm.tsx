@@ -163,10 +163,8 @@ export function ParamsForm() {
         >
           {busy ? 'Running…' : 'Run pipeline'}
         </button>
-        <LiveRunStatus snapshot={snapshot} />
-        <small className="text-fg-1">
-          Uses server defaults unless you edit the params.
-        </small>
+        {/* Live status is in the StatusPanel below — no second
+            indicator here. */}
       </div>
 
       {paramsOpen && (
@@ -239,46 +237,4 @@ export function ParamsForm() {
       )}
     </form>
   );
-}
-
-
-function LiveRunStatus({ snapshot }: { snapshot: EventSnapshot | null }) {
-  // Tiny live indicator next to the Run button so the user sees
-  // immediately that the click registered and what the pipeline
-  // is doing. Subscribes to the same SSE stream as StatusPanel;
-  // lightweight — no polling.
-  const p = snapshot?.pipeline;
-  if (!p || p.status === 'idle') return null;
-  const label =
-    p.status === 'running' && p.stage
-      ? `stage: ${p.stage}`
-      : p.status === 'running'
-        ? 'running…'
-        : p.status === 'done'
-          ? `last run: ${p.current_run_id} · ${formatTotal(p)}`
-          : p.status === 'stopped'
-            ? 'stopped'
-            : `error: ${p.last_error ?? 'unknown'}`;
-  return (
-    <small
-      className={`text-[0.75rem] ${
-        p.status === 'error' ? 'text-red-400' : 'text-fg-1'
-      }`}
-      data-testid="live-run-status"
-    >
-      {label}
-    </small>
-  );
-}
-
-
-function formatTotal(p: { stage_times?: Record<string, number> }): string {
-  // The "last completed run" fallback synthesizes a stage_times entry
-  // called "total". Use it when present; otherwise format the sum of
-  // stage times as a best-effort fallback.
-  const t = p.stage_times?.['total'];
-  if (typeof t === 'number') return `${t.toFixed(0)}s`;
-  if (!p.stage_times) return '';
-  const sum = Object.values(p.stage_times).reduce((a, b) => a + b, 0);
-  return `${sum.toFixed(0)}s`;
 }
