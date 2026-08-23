@@ -21,6 +21,7 @@ import logging
 import os
 import threading
 import time
+import traceback
 import tracemalloc
 import uuid
 from collections import deque, OrderedDict
@@ -192,10 +193,16 @@ def _invalidate_results_cache(prefix: str = "all:") -> None:
             if k.startswith(prefix) or k == bare:
                 _results_cache.pop(k, None)
 
-# Only one pipeline run at a time across the whole process. Prevents
-# state corruption (the shared state dict would get clobbered) and
-# contention over the DB.
+# Pipeline runs execute in a child process so BioCLIP's ~5.5 GB resident
+# memory never lives in uvicorn. The child writes status to a JSON file
+# the parent polls for /api/status and /api/events; the parent keeps a
+# tiny registry of the active job (one at a time, enforced by this lock).
 _pipeline_lock = threading.Lock()
+# Active-job registry. Set when a child is forked; cleared when the
+# child exits or is reaped. Used by /api/status and /api/run/stop to
+# route to the right child.
+_pipeline_active_job: dict | None = None  # {"proc", "job_id", "status_path", "stop_event", "log_path"}
+_pipeline_jobs_lock = threading.Lock()
 
 
 def _get_classifier():
@@ -438,9 +445,12 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
 
 async def _start_run(query: str, n_samples: int, top_k: int,
                      batch_size: int) -> dict:
-    """Kick off a pipeline run in a worker thread. Returns the response
-    payload immediately if no run is currently in progress, otherwise
-    409 Conflict.
+    """Kick off a pipeline run in a child process. Returns immediately
+    (status 200 with the new run_id) once the child is forked; the
+    parent watches the child in a background asyncio task and reaps it
+    when it exits.
+
+    409 Conflict if a run is already in progress.
     """
     if not _pipeline_lock.acquire(blocking=False):
         raise HTTPException(
@@ -448,27 +458,237 @@ async def _start_run(query: str, n_samples: int, top_k: int,
             detail="pipeline is already running — see /api/status",
         )
     try:
-        # Status polling starts before the thread runs so the UI sees
-        # "running" the moment the request returns.
-        data = await asyncio.to_thread(
-            _run_and_store,
+        job_id = uuid.uuid4().hex[:8]
+        status_path = Path(DB_PATH).parent / f"pipeline-{job_id}.status.json"
+        log_path = Path(DB_PATH).parent / f"pipeline-{job_id}.log"
+
+        # Stop signal the parent sets when the user hits /api/run/stop.
+        # Shared with the child via multiprocessing.Value proxy; works
+        # across the process boundary (the threading.Event in pipeline.py
+        # is also checked, but it lives in this process only).
+        import multiprocessing as _mp
+        stop_event = _mp.Event()
+
+        # Spawn, not fork: the lazy-classifier fix means uvicorn has no
+        # BioCLIP in its address space, but spawn is defensive — even if
+        # a future eager import creeps in, a fresh interpreter starts
+        # clean. Fork + copy-on-write would silently inherit BioCLIP's
+        # 5 GB into the child.
+        proc = _mp.Process(
+            target=_pipeline_child_entry,
+            args=(query, n_samples, top_k, batch_size,
+                  str(status_path), str(log_path), stop_event),
+            daemon=True,
+            name=f"pipeline-{job_id}",
+        )
+        proc.start()
+
+        # Register so /api/status + /api/run/stop + the snapshot builder
+        # can find this run. Single-run invariant is enforced by
+        # _pipeline_lock above.
+        with _pipeline_jobs_lock:
+            global _pipeline_active_job
+            _pipeline_active_job = {
+                "proc": proc,
+                "job_id": job_id,
+                "status_path": status_path,
+                "log_path": log_path,
+                "stop_event": stop_event,
+                "started_at": time.time(),
+            }
+        _log.info("[pipeline] child started pid=%d job_id=%s", proc.pid, job_id)
+
+        # Fire-and-forget the reaper. We use a daemon Thread, not an
+        # asyncio task: the reaper's work is purely synchronous (wait
+        # for child, sync SQLite reads, drop caches) and shouldn't be
+        # tied to the request's event-loop lifetime — that's where the
+        # previous async-task version deadlocked.
+        import threading as _threading
+        reaper_thread = _threading.Thread(
+            target=_reap_pipeline_child,
+            args=(job_id, status_path, proc, stop_event),
+            daemon=True,
+            name=f"pipeline-reaper-{job_id}",
+        )
+        reaper_thread.start()
+
+        return {
+            "run_id": None,  # populated by the child; UI polls /api/status
+            "job_id": job_id,
+            "pid": proc.pid,
+            "status": "running",
+        }
+    except Exception:
+        # If we failed to start, release the lock so the next /api/run
+        # doesn't see "already running" forever.
+        _pipeline_lock.release()
+        raise
+
+
+def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
+                          batch_size: int, status_path: str,
+                          log_path: str, stop_event) -> None:
+    """Body of the child process. Mirrors the pipeline state to a JSON
+    file the parent polls, runs `run_pipeline` (which can hit ~5.85 GB
+    RSS at species-rank predict), and exits cleanly on completion or
+    error. The kernel reclaims all child pages when we return.
+
+    Imports BioCLIP / open_clip / torch here in the child only — the
+    parent (uvicorn) never sees them, so its RSS stays at ~640 MB.
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    try:
+        # Tell the pipeline module to mirror its state to status_path
+        # so the parent's /api/status and /api/events can render live
+        # progress without sharing memory.
+        import pipeline as _pipeline
+        _pipeline.set_status_file(Path(status_path))
+
+        # Same logging setup the in-process version had: file handler
+        # for the per-job log, plus stderr. The parent already attaches
+        # its own handler in attach_log_file() at startup, but that
+        # writes to a different file (pipeline.log) and we want this
+        # run to have its own log too.
+        log_path_p = Path(log_path)
+        # Plain FileHandler — we don't need utils.attach_log_file's
+        # path attach logic here because this child is single-purpose
+        # (one run, one log file, one exit).
+        handler = _logging.FileHandler(log_path_p, mode="w")
+        handler.setFormatter(_logging.Formatter("%(asctime)s %(message)s"))
+        log.addHandler(handler)
+        log.setLevel(_logging.INFO)
+
+        out = _pipeline.run_pipeline(
+            base_url=BASE_URL,
+            api_key=API_KEY,
             query=query,
             n_samples=n_samples,
             top_k=top_k,
+            db_path=DB_PATH,
+            classifier=None,
             batch_size=batch_size,
+            stop_event=stop_event,
         )
-        if not data:
-            # pipeline failed; state has the error.
-            state = get_state()
-            raise HTTPException(
-                status_code=500,
-                detail=f"pipeline failed: {state.get('last_error')}",
+        # Persist the result payload alongside the status so the parent
+        # can pick it up on reap and drop the in-process cache.
+        if out is not None:
+            result_path = Path(status_path).with_name(
+                Path(status_path).stem + ".result.json"
             )
-        with _results_lock:
-            _results_cache_put(str(data["run_id"]), data)
-        return data
+            result_path.write_text(json.dumps(
+                {"run_id": out.run_id, "n_new": out.n_new,
+                 "n_cached": out.n_cached, "n_requested": out.n_requested,
+                 "n_clusters": out.n_clusters, "query": out.query,
+                 "results_count": len(out.results)},
+                default=str,
+            ))
+        log.info("[pipeline] child finished cleanly")
+    except Exception as e:
+        log.exception("[pipeline] child crashed: %s", e)
+        # Make sure the status file reflects the error so the parent's
+        # snapshot builder shows it for a moment after we exit.
+        try:
+            import pipeline as _pipeline
+            _pipeline.error_state(f"{type(e).__name__}: {e}")
+        except Exception:
+            pass
     finally:
-        _pipeline_lock.release()
+        try:
+            handler.close()
+            log.removeHandler(handler)
+        except Exception:
+            pass
+
+
+def _reap_pipeline_child(job_id: str, status_path: Path,
+                               proc, stop_event) -> None:
+    """Background thread: wait for the child to exit, then drop caches
+    and clear the registry. Runs until the child terminates — one
+    thread per /api/run call. Synchronous (no asyncio) so the work
+    doesn't depend on the FastAPI event loop, which previously caused
+    uvicorn to hang after the response was sent.
+    """
+    import sys as _sys
+    def _trace(msg):
+        print(f"[reaper:{job_id}] {msg}", file=_sys.stderr, flush=True)
+    _trace(f"reaper thread starting, child pid={proc.pid}, alive={proc.is_alive()}")
+    try:
+        # Pure sync join — no event-loop interaction. proc.join()
+        # reaps zombies in addition to waiting, so a single call is
+        # enough.
+        proc.join()
+        _trace(f"child dead, exitcode={proc.exitcode}")
+
+        # Drop in-process caches. The pipeline result itself lives in
+        # the child's `out` object which is gone; rebuild a small
+        # payload from the result.json file the child wrote.
+        try:
+            result_path = status_path.with_name(
+                status_path.stem + ".result.json"
+            )
+            if result_path.exists():
+                result = json.loads(result_path.read_text())
+                run_id = result.get("run_id")
+                if run_id is not None:
+                    _trace(f"building results payload for run={run_id}")
+                    payload = _build_results_payload_for_run(run_id)
+                    if payload:
+                        # _results_cache_put acquires _results_lock
+                        # internally — don't wrap in another `with`
+                        # because _thread.lock is NOT reentrant and
+                        # would deadlock.
+                        _results_cache_put(str(run_id), payload)
+            _invalidate_clusters_cache()
+            with storage.connect(DB_PATH) as conn:
+                storage.invalidate_cluster_names(conn)
+        except Exception:
+            _trace(f"post-run cache invalidation failed:\n{traceback.format_exc()}")
+
+        _trace(f"child pid={proc.pid} reaped")
+    except Exception:
+        _trace(f"reaper crashed:\n{traceback.format_exc()}")
+    finally:
+        _trace("reaper finally: clearing registry + releasing lock")
+        with _pipeline_jobs_lock:
+            global _pipeline_active_job
+            _pipeline_active_job = None
+        try:
+            _pipeline_lock.release()
+            _trace("lock released")
+        except RuntimeError:
+            _trace("lock already released")
+
+
+def _build_results_payload_for_run(run_id: int) -> dict | None:
+    """Rebuild the per-run payload that _run_and_store used to return.
+    Used by the reaper after the child process has exited (and BioCLIP
+    has been unloaded with it). Mirrors the structure the React UI
+    expects for a `scope=run` request."""
+    with storage.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id, query, n_new, n_cached, n_requested, "
+            "       started_at, finished_at "
+            "  FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        # Lightweight payload — enough for the UI's first paint. Heavy
+        # detail (per-asset predictions, detections) comes from
+        # /api/asset/{id} on demand.
+        return {
+            "scope": "run",
+            "run_id": run_id,
+            "query": row["query"],
+            "n_new": row["n_new"],
+            "n_cached": row["n_cached"],
+            "n_requested": row["n_requested"],
+            "plantae_green": PLANTAE_GREEN,
+            "plantae_yellow": PLANTAE_YELLOW,
+            "started_at": row["started_at"],
+            "finished_at": row["finished_at"],
+        }
 
 
 @asynccontextmanager
@@ -652,7 +872,25 @@ async def status() -> dict:
 
     Kept for backwards-compat / scripts / debugging. The React UI now
     reads the same payload via /api/events (SSE) instead of polling
-    this endpoint."""
+    this endpoint.
+
+    When a child-process run is active, the parent's `pipeline.get_state()`
+    returns its own empty state (state lives in the child). We read the
+    child's status file instead — the child mirrors its state there on
+    every set_state / _stage_* call."""
+    with _pipeline_jobs_lock:
+        active = _pipeline_active_job
+    if active is not None:
+        sp = active["status_path"]
+        if sp.exists():
+            try:
+                snap = json.loads(sp.read_text())
+                # Stamp the job_id so the client can correlate with
+                # /api/run's response payload.
+                snap["job_id"] = active["job_id"]
+                return snap
+            except (json.JSONDecodeError, OSError):
+                pass  # fall through to local state
     return get_state()
 
 
@@ -707,9 +945,29 @@ def _snapshot_jobs(
 def _build_event_snapshot() -> dict:
     """Assemble the full event payload. Each source takes its own short
     lock; the worst-case time is bounded by the sum of the lock hold
-    times (microseconds). Safe to call from the SSE generator loop."""
+    times (microseconds). Safe to call from the SSE generator loop.
+
+    `pipeline` is sourced from the child-process status file when a
+    child run is active (see _pipeline_child_entry); otherwise it
+    falls back to the in-process `pipeline.get_state()` (the parent's
+    local copy — used for idle state)."""
+    with _pipeline_jobs_lock:
+        active = _pipeline_active_job
+    pipeline_state: dict
+    if active is not None:
+        sp = active["status_path"]
+        if sp.exists():
+            try:
+                pipeline_state = json.loads(sp.read_text())
+                pipeline_state["job_id"] = active["job_id"]
+            except (json.JSONDecodeError, OSError):
+                pipeline_state = get_state()
+        else:
+            pipeline_state = get_state()
+    else:
+        pipeline_state = get_state()
     return {
-        "pipeline": get_state(),
+        "pipeline": pipeline_state,
         "plants_jobs": _snapshot_jobs(_plants_jobs, _plants_jobs_lock),
         "cluster_album_jobs": _snapshot_jobs(
             _cluster_album_jobs, _cluster_album_jobs_lock
@@ -1409,16 +1667,30 @@ async def stop_run() -> dict:
         the stop flag was set
       - 200 with `{stopped: false, reason: "no run in progress"}` if
         nothing was running (no-op)
+
+    With the child-process refactor, the worker lives in a separate
+    process — its threading.Event is invisible from here. We set the
+    multiprocessing.Event shared with the child instead. The pipeline
+    module also sets the threading.Event on its own when it sees the
+    multiprocessing one set, so any in-process callers (tests) also
+    see the stop.
     """
-    # Defer import to avoid pinning the running pipeline module path
-    # into the route definition (it's also imported by the worker).
-    import pipeline as _pipeline
     import logging
     _log = logging.getLogger(__name__)
-    was_running = _pipeline.request_stop()
-    if was_running:
-        _log.info("stop requested by user; worker will unwind at next batch boundary")
-    return {"stopped": was_running}
+    with _pipeline_jobs_lock:
+        active = _pipeline_active_job
+    if active is None:
+        return {"stopped": False, "reason": "no run in progress"}
+    active["stop_event"].set()
+    # Also set the threading.Event in the parent so any in-process
+    # callers (rare; only tests really) observe the stop too.
+    import pipeline as _pipeline
+    _pipeline.request_stop()
+    _log.info(
+        "[pipeline] stop requested by user; child pid=%s will unwind at next batch boundary",
+        active["proc"].pid,
+    )
+    return {"stopped": True}
 
 
 class ReclassifyParams(BaseModel):

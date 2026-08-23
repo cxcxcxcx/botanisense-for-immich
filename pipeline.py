@@ -12,6 +12,7 @@ gallery in memory at once.
 from __future__ import annotations
 
 import gc
+import json
 import logging
 import os
 import sqlite3
@@ -195,10 +196,16 @@ def is_stopped() -> bool:
     return _stop_event.is_set()
 
 
-def check_stop() -> None:
+def check_stop(stop_event=None) -> None:
     """Same as is_stopped() but raises _PipelineStop so callers can
-    use try/except for control flow rather than checking on every line."""
-    if _stop_event.is_set():
+    use try/except for control flow rather than checking on every line.
+
+    `stop_event` is an optional multiprocessing.Event passed by the
+    parent when `run_pipeline` is running in a child process. We check
+    it in addition to the module-level `_stop_event` so the parent's
+    /api/run/stop can reach the worker across the process boundary
+    without sending signals."""
+    if (stop_event is not None and stop_event.is_set()) or _stop_event.is_set():
         raise _PipelineStop("user requested stop")
 
 # File log path — set by app.py on startup so the log lives next to the DB.
@@ -246,6 +253,7 @@ def reset_state() -> None:
                 "stage_t0": None,
             }
         )
+    _maybe_mirror_state()
 
 
 def _stage_begin(name: str) -> None:
@@ -255,6 +263,7 @@ def _stage_begin(name: str) -> None:
         # wall-clock seconds so the JS UI can subtract from Date.now()/1000
         # to project the running slice's elapsed time live.
         _state["stage_t0"] = time.time()
+    _maybe_mirror_state()
 
 
 def _stage_end(name: str) -> None:
@@ -269,6 +278,7 @@ def _stage_end(name: str) -> None:
                 _state["stage_times"] = times
             times[name] = times.get(name, 0.0) + elapsed
             _state["stage_t0"] = None
+    _maybe_mirror_state()
 
 
 def finish_state(*, run_id: int, n_new: int, n_cached: int,
@@ -287,6 +297,7 @@ def finish_state(*, run_id: int, n_new: int, n_cached: int,
                 "eta_seconds": 0.0,
             }
         )
+    _maybe_mirror_state()
 
 
 def error_state(message: str) -> None:
@@ -294,6 +305,7 @@ def error_state(message: str) -> None:
         _state.update(
             status="error", last_error=message, finished_at=time.time()
         )
+    _maybe_mirror_state()
 
 
 def stopped_state(message: str = "stopped by user") -> None:
@@ -308,12 +320,52 @@ def stopped_state(message: str = "stopped by user") -> None:
             finished_at=time.time(),
             eta_seconds=0.0,
         )
+    _maybe_mirror_state()
     _stop_event.clear()
 
 
 def set_state(**updates) -> None:
     with _state_lock:
         _state.update(updates)
+    _maybe_mirror_state()
+
+
+# When running in a child process (see _pipeline_child_entry in app.py),
+# the parent's `pipeline.get_state()` returns its own empty state because
+# `_state` is module-level per process. We mirror the child's state to
+# a JSON file on every set_state / _stage_* call so the parent's snapshot
+# builder can read it for /api/status and /api/events. Cheap (one fsync'd
+# write per state change, ~200 Hz max during a run) and survives the
+# child crashing — the file persists after exit so the parent can show
+# the final state for a moment before clearing it.
+_status_file_path: Path | None = None
+
+
+def set_status_file(path: Path | None) -> None:
+    """Tell the pipeline module where to mirror state. Pass None to
+    disable mirroring (the default, used when run_pipeline is in the
+    same process as the FastAPI worker). The child-process wrapper
+    _pipeline_child_entry calls this on entry."""
+    global _status_file_path
+    _status_file_path = path
+
+
+def _maybe_mirror_state() -> None:
+    if _status_file_path is None:
+        return
+    try:
+        with _state_lock:
+            snap = dict(_state)
+        # Atomic-ish: write to .tmp then rename. The parent reads on
+        # every SSE tick (~5 Hz) so it sees either the old or the new
+        # payload, never a half-written one.
+        tmp = _status_file_path.with_suffix(_status_file_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(snap, default=str))
+        tmp.replace(_status_file_path)
+    except Exception:
+        # Don't let a status-mirror error kill the pipeline. Worst case
+        # the parent sees stale state until the next successful write.
+        pass
 
 
 def get_state() -> dict:
@@ -557,6 +609,7 @@ def discover_plantae_assets(
     api_key: str,
     thumb_dir: Path,
     decision_batch_size: int = PLANT_BATCH_SIZE,
+    stop_event=None,
 ) -> list[ImmichAsset]:
     """Stream-search Immich and return assets up to the plant/fungi boundary.
 
@@ -617,7 +670,7 @@ def discover_plantae_assets(
         # User-visible stop check between Immich pages. Stopping here
         # means we've already committed the previous page's batch into
         # the DB so no work is lost.
-        check_stop()
+        check_stop(stop_event)
         n_batches = (len(items) + batch_size - 1) // batch_size
         _log.info(
             f"[search] page {page} from Immich: got {len(items)} photos to score "
@@ -631,7 +684,7 @@ def discover_plantae_assets(
             # Per-batch stop check. The previous batch already committed
             # all its DB writes (we commit after each batch's writes
             # above), so stopping here is safe.
-            check_stop()
+            check_stop(stop_event)
 
             # Gather cache hits and download preds in one pass.
             # plantae_by_path: {path: {"Plantae": p, "Fungi": f}} — max of
@@ -741,7 +794,10 @@ def discover_plantae_assets(
             # Run BioCLIP kingdom-rank on the misses. Persist each row.
             if to_predict_paths:
                 if clf is None:
-                    clf = classifier if classifier is not None else _resolve_classifier()
+                    # Lazy: only construct the model when we actually
+                    # have BioCLIP work to do. The caller passes None
+                    # so the singleton resolves on first use.
+                    clf = _resolve_classifier()
                 scores = _score_batch_for_kingdoms(clf, to_predict_paths)
                 for asset, p in zip(to_predict_assets, to_predict_paths):
                     kingdom_scores = scores.get(p, {})
@@ -965,6 +1021,7 @@ def run_pipeline(
     rank: str = "species",
     yolo_conf: float = 0.05,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    stop_event=None,
 ) -> RunResult:
     """Run a smart-search on Immich for `query`, embed + predict any assets
     not yet cached, recompute clusters, run YOLO-World on uncached images,
@@ -975,6 +1032,12 @@ def run_pipeline(
     Each cache check below is explicit: if a row exists for the (asset,
     rank) pair, we skip the work. Add new caches here so a freshly-cached
     asset still gets the new feature on the next run.
+
+    `stop_event` is an optional `multiprocessing.Event` set by the parent
+    process when running this in a child (see `_pipeline_child_entry` in
+    app.py). The threading-module `_stop_event` is always checked too,
+    so /api/run/stop works whether the worker is in-thread or
+    in-subprocess.
     """
     # Touch the lazy attributes — PEP 562 __getattr__ on this module loads
     # them on first access. Once loaded, they live in module globals and
@@ -1046,6 +1109,7 @@ def run_pipeline(
                 api_key=api_key,
                 thumb_dir=thumb_dir,
                 decision_batch_size=decision_batch_size,
+                stop_event=stop_event,
             )
             _stage_end("search")
 
@@ -1116,7 +1180,7 @@ def run_pipeline(
                     # Stop check at chunk boundary. Each chunk commits
                     # its embeddings + predictions before the next, so
                     # stopping here loses nothing.
-                    check_stop()
+                    check_stop(stop_event)
                     j = min(i + batch_size, len(needs_bioclip))
                     pil_images: list[Image.Image] = []
                     file_paths: list[str] = []
@@ -1325,7 +1389,7 @@ def run_pipeline(
 
             i = 0
             while i < len(kingdom_assets):
-                check_stop()
+                check_stop(stop_event)
                 j = min(i + batch_size, len(kingdom_assets))
                 pil_images: list[Image.Image] = []
                 file_paths: list[str] = []
@@ -1399,7 +1463,7 @@ def run_pipeline(
                 try:
                     i = 0
                     while i < len(needs_yolo):
-                        check_stop()
+                        check_stop(stop_event)
                         j = min(i + batch_size, len(needs_yolo))
                         todo: list[tuple[int, ImmichAsset, Path]] = []
                         for k in range(i, j):
@@ -1498,7 +1562,7 @@ def run_pipeline(
                 cursor_id: str | None = None
                 outer_page = 500
                 while True:
-                    check_stop()
+                    check_stop(stop_event)
                     todo = storage.get_assets_without_person_scan(
                         conn, limit=outer_page,
                         after_first_seen_at=cursor_ts,
@@ -1526,7 +1590,7 @@ def run_pipeline(
                     # we get the fresh 17-class init.
                     person_t0 = time.monotonic()
                     for i in range(0, len(todo_paths), batch_size):
-                        check_stop()
+                        check_stop(stop_event)
                         chunk = todo_paths[i : i + batch_size]
                         pil_images = [Image.open(p).convert("RGB") for _, p, _ in chunk]
                         detections = _yolo.detect(pil_images, conf=yolo_conf)
@@ -1657,7 +1721,7 @@ def run_pipeline(
             if all_bbox_targets:
                 i = 0
                 while i < len(all_bbox_targets):
-                    check_stop()
+                    check_stop(stop_event)
                     j = min(i + batch_size, len(all_bbox_targets))
                     chunk = all_bbox_targets[i:j]
 
