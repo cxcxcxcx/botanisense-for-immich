@@ -722,12 +722,16 @@ def discover_plantae_assets(
             # Bulk DB reads for this batch — replaces 3 per-asset
             # SELECTs that previously dominated the search loop
             # (~30s for 10k cached photos). One SELECT for the cache
-            # check, one for the existing asset rows (to know which
-            # need an upsert and which to refresh URLs on), one for
-            # the missing-captured_at check (drives the EXIF fetch).
+            # check, one for the cached kingdom SCORES (from
+            # taxon_scores — the assets table has no Plantae/Fungi
+            # columns), one for the existing assets rows, one for the
+            # missing-captured_at check (drives the EXIF fetch).
             batch_ids = [a.id for a in batch]
             cached_ids = storage.bulk_taxon_scores_have_assets(
                 conn, asset_ids=batch_ids, rank="kingdom"
+            )
+            cached_scores = storage.bulk_fetch_taxon_scores(
+                conn, asset_ids=list(cached_ids), rank="kingdom"
             )
             existing_assets = storage.bulk_asset_rows(
                 conn, asset_ids=batch_ids
@@ -752,11 +756,11 @@ def discover_plantae_assets(
                     # `assets` row when one of the URL/filename fields
                     # has actually changed.
                     n_cached += 1
-                    existing = existing_assets.get(asset.id, {})
+                    existing_asset = existing_assets.get(asset.id, {})
                     if (
-                        existing.get("original_file_name") != asset.original_file_name
-                        or existing.get("original_url") != original_url
-                        or existing.get("thumbnail_url") != thumbnail_url
+                        existing_asset.get("original_file_name") != asset.original_file_name
+                        or existing_asset.get("original_url") != original_url
+                        or existing_asset.get("thumbnail_url") != thumbnail_url
                     ):
                         # Refresh name/URLs only; keep existing
                         # captured_at / lat / lng.
@@ -767,7 +771,13 @@ def discover_plantae_assets(
                             original_url=original_url,
                             thumbnail_url=thumbnail_url,
                         )
-                    d = existing
+                    # IMPORTANT: cached_scores comes from taxon_scores,
+                    # not from the assets row. The assets table has no
+                    # Plantae/Fungi columns — fetching those from
+                    # existing_asset gave 0.0 for every asset, which
+                    # made the search boundary think nothing was a
+                    # plant. Don't reintroduce that bug.
+                    d = cached_scores.get(asset.id, {})
                     plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
                         "Plantae": float(d.get("Plantae") or 0.0),
                         "Fungi": float(d.get("Fungi") or 0.0),

@@ -2236,6 +2236,38 @@ def bulk_taxon_scores_have_assets(
     return {r["asset_id"] for r in rows}
 
 
+def bulk_fetch_taxon_scores(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[str],
+    rank: str,
+) -> dict[str, dict[str, float]]:
+    """Bulk: returns {asset_id: {taxon_name: score}} for all the
+    given asset_ids in a single SELECT. Replaces per-asset
+    `fetch_taxon_scores` calls. The earlier bulk version of the
+    pipeline search loop confused `bulk_asset_rows` (assets table)
+    with `fetch_taxon_scores` (taxon_scores table) — the assets
+    table has no Plantae/Fungi columns, so every cached asset was
+    scored as 0.0 and the search boundary logic stopped after the
+    first batch. This helper fixes that.
+    """
+    if not asset_ids:
+        return {}
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"""
+        SELECT asset_id, taxon_name, score
+          FROM taxon_scores
+         WHERE rank = ? AND asset_id IN ({placeholders})
+        """,
+        [rank, *asset_ids],
+    ).fetchall()
+    out: dict[str, dict[str, float]] = {}
+    for r in rows:
+        out.setdefault(r["asset_id"], {})[r["taxon_name"]] = float(r["score"])
+    return out
+
+
 def fetch_taxon_scores(
     conn: sqlite3.Connection,
     *,
