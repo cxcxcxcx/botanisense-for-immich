@@ -1162,19 +1162,35 @@ def run_pipeline(
             needs_yolo: list[tuple[ImmichAsset, Path | None]] = []
             ordered_ids: list[str] = []
 
+            # Bulk EXIF-skip check: same pattern as the search loop.
+            # One SELECT for all assets tells us which ones already
+            # have captured_at, so we can skip the per-asset
+            # get_asset_metadata HTTP call. Without this, a fully-
+            # cached run still makes n_samples GET requests to
+            # Immich — that's the multi-minute silence after
+            # "[search] reached target" that the user reported.
+            asset_ids = [a.id for a in assets]
+            missing_captured_at = storage.bulk_assets_missing_captured_at(
+                conn, asset_ids=asset_ids
+            )
+
             for asset in assets:
                 original_url = f"{base_url}/api/assets/{asset.id}/original"
                 thumbnail_url = (
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
-                # Pull EXIF in the same family as the chunk loop
-                # above — same cache, same parser. Existing rows keep
+                # Skip the EXIF fetch when the assets row already has
+                # captured_at — same logic as the search loop's
+                # asset_has_captured_at branch. Existing rows keep
                 # their previous EXIF via the ON CONFLICT clause in
                 # upsert_asset().
-                exif = ImmichClient.extract_exif(
-                    client.get_asset_metadata(asset.id)
-                )
+                if asset.id in missing_captured_at:
+                    exif = ImmichClient.extract_exif(
+                        client.get_asset_metadata(asset.id)
+                    )
+                else:
+                    exif = {"captured_at": None, "latitude": None, "longitude": None}
                 storage.upsert_asset(
                     conn,
                     asset_id=asset.id,
