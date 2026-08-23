@@ -256,17 +256,19 @@ timer." Once we measured uvicorn properly (`ps aux` shows VmRSS=636 MB
 because uvicorn never imports open_clip/bioclip.predict), the comparison
 flips:
 
-| Architecture                  | Uvicorn RSS during run | Uvicorn RSS after run | Logic to write     | Cost per run              |
-| ----------------------------- | ----------------------: | --------------------: | ------------------ | ------------------------- |
-| Same-process (today)          | 5.85 GB                 | 5.85 GB               | nothing            | 0                         |
-| Same-process + unload timer   | 5.85 GB                 | **1.27 GB**           | reaper + UI badge  | 0 + 14 s reload next call |
-| **Subprocess, exits on done** | **640 MB**              | **640 MB**            | **30 lines**       | 2-3 s spawn + 14 s load   |
-| Persistent worker (RPC)       | 640 MB                  | 640 MB                | large (RPC layer)  | 0 (worker stays warm)     |
+| Architecture                  | Uvicorn RSS during run | Uvicorn RSS after run | Logic to write     | Cost per run              | Status            |
+| ----------------------------- | ----------------------: | --------------------: | ------------------ | ------------------------- | ----------------- |
+| Same-process (pre-refactor)   | 5.85 GB                 | 5.85 GB               | nothing            | 0                         | replaced          |
+| Same-process + unload timer   | 5.85 GB                 | 1.27 GB               | reaper + UI badge  | 0 + 14 s reload next call | not implemented   |
+| **Subprocess, exits on done** | **222 MB**              | **222 MB**            | reaper thread      | 2-3 s spawn + 14 s load   | **shipped (b711040)** |
+| Persistent worker (RPC)       | 222 MB                  | 222 MB                | large (RPC layer)  | 0 (worker stays warm)     | not needed        |
 
 The 14 s model load is paid **once per child lifetime**, in both
 subprocess architectures. The 2-3 s spawn is the cold `import torch` cost.
 Both are amortized over a multi-minute BioCLIP run — irrelevant compared
-to the 5 GB we're keeping out of uvicorn.
+to the 5 GB we're keeping out of uvicorn. Live uvicorn sits at **222 MB**
+(the lazy-classifier fix already moved us off the 640 MB ceiling; the
+subprocess split removed the conditional 5.85 GB peak).
 
 We pick subprocess-per-run over persistent worker because:
 1. We have one BioCLIP consumer (`/api/run`). Persistent worker only
