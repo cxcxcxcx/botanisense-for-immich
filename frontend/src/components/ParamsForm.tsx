@@ -15,7 +15,7 @@
 // button, which was confusing (it did exactly what Run does when all
 // fields are blank). It's gone.
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { runPipeline } from '../api/endpoints';
 import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot } from '../api/types';
@@ -79,22 +79,34 @@ export function ParamsForm() {
   //      already true via `running`; we don't need to clear awaiting.
   const [awaiting, setAwaiting] = useState(false);
   const busy = running || awaiting;
+  // Synchronous "busy" guard — `awaiting` is React state and only
+  // applies to the next render. Between click and re-render the
+  // button is still enabled in the DOM, so a rapid second click
+  // (or pressing Enter inside an input field, which submits the
+  // form even when the submit button is disabled) would re-enter
+  // handleRun and fire /api/run twice. `busyRef` is a ref — set
+  // synchronously on click — so the second invocation early-returns
+  // before the second POST goes out.
+  const busyRef = useRef(false);
   const push = useToasts();
 
-  // Clear `awaiting` once the server reports a terminal pipeline state.
-  // We don't react to "idle" — that's also the initial state, and a
-  // momentary SSE reconnect could surface "idle" right before the run
-  // actually starts.
+  // Clear `awaiting` (and the ref) once the server reports a
+  // terminal pipeline state. We don't react to "idle" — that's also
+  // the initial state, and a momentary SSE reconnect could surface
+  // "idle" right before the run actually starts.
   useEffect(() => {
     if (!awaiting) return;
     const status = snapshot?.pipeline?.status;
     if (status === 'done' || status === 'error' || status === 'stopped') {
       setAwaiting(false);
+      busyRef.current = false;
     }
   }, [snapshot, awaiting]);
 
   const handleRun = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (busyRef.current) return;
+    busyRef.current = true;
     setAwaiting(true);
     try {
       const resp = await runPipeline({
@@ -113,6 +125,7 @@ export function ParamsForm() {
       // at which point the useEffect above clears awaiting.
     } catch (err) {
       setAwaiting(false);
+      busyRef.current = false;
       push(
         { kind: 'info', message: err instanceof Error ? err.message : String(err) },
         4000,
