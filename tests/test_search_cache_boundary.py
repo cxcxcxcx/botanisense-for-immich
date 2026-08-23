@@ -356,6 +356,216 @@ def test_storage_bulk_fetch_taxon_scores_matches_per_asset_path():
         assert bulk == per_asset, (bulk, per_asset)
 
 
+# ---- stitch-loop regression ----------------------------------------------
+#
+# The stitch loop runs after discover_plantae_assets and is responsible
+# for upserting the asset rows + deciding which need BioCLIP. On a
+# fully-cached run it was issuing N no-op INSERT ON CONFLICT DO UPDATE
+# statements — that's the 30 s silence between "[search] reached
+# target" and the "query=... n_new=..." line that the user reported.
+#
+# The fix: bulk-load existing rows up front, then skip the upsert
+# entirely when the row already matches (URLs match AND EXIF is set).
+# This test pins that — it seeds the DB with rows whose URLs match the
+# pipeline's deterministic template, then asserts that the stitch loop
+# issues zero upsert_asset / refresh_asset_urls / update_asset_exif
+# calls for those rows.
+
+# Mirrors the pipeline's URL templates exactly.
+THUMBNAIL_SIZE = "preview"  # default; pipeline.py also defaults to "preview"
+BASE_URL_FOR_TEST = "http://fake"
+
+
+def _seed_matching_urls(db_path: str, asset_ids: list[str],
+                         *, plantae: float = 0.95,
+                         fungi: float = 0.02) -> None:
+    """Seed assets with URLs that exactly match the pipeline's
+    deterministic template (so the stitch loop's urls_match check
+    passes), populated EXIF, and top_k species predictions.
+
+    Note on the filename: _FakeImmichClient returns assets with
+    `originalFileName=f"img_{i:06d}.jpg"`. We use the same format
+    here so the stitch loop's urls_match check is True and the skip
+    path triggers.
+    """
+    storage.init_db(db_path)
+    with storage.connect(db_path) as conn:
+        for aid in asset_ids:
+            original_url = f"{BASE_URL_FOR_TEST}/api/assets/{aid}/original"
+            thumbnail_url = (
+                f"{BASE_URL_FOR_TEST}/api/assets/{aid}/thumbnail"
+                f"?size={THUMBNAIL_SIZE}"
+            )
+            # The fake's filename format.
+            filename = f"img_{aid.split('-', 1)[1]}.jpg"
+            storage.upsert_asset(
+                conn, asset_id=aid,
+                original_file_name=filename,
+                original_url=original_url,
+                thumbnail_url=thumbnail_url,
+                captured_at="2025-01-01T00:00:00.000+00:00",
+                latitude=None,
+                longitude=None,
+            )
+            storage.upsert_taxon_scores(
+                conn,
+                asset_id=aid,
+                rank="kingdom",
+                scores={"Plantae": plantae, "Fungi": fungi},
+            )
+            for pos in range(3):
+                conn.execute(
+                    "INSERT OR REPLACE INTO predictions "
+                    "(asset_id, rank, position, species, common_name, "
+                    " score, kingdom, family, genus) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (aid, "species", pos, f"sp-{aid}-{pos}", "",
+                     0.95 - pos * 0.1, "Plantae", "Fam", "Gen"),
+                )
+        conn.commit()
+
+
+def test_stitch_loop_skips_no_op_updates_for_cached_assets():
+    """For a fully-cached run with matching URLs and populated EXIF,
+    the stitch loop must NOT issue upsert_asset / refresh_asset_urls /
+    update_asset_exif for those assets — every such call is wasted work
+    and was the source of the 30 s post-search silence.
+    """
+    n_samples = 200
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "state.db")
+        all_ids = [f"id-{i:06d}" for i in range(n_samples)]
+        _seed_matching_urls(db, all_ids)
+
+        client = _FakeImmichClient(BASE_URL_FOR_TEST, "fake",
+                                    total_assets=n_samples)
+        clf = _FakeClassifier()
+
+        # Wrap the three writes so we can count calls.
+        with mock.patch.object(storage, "upsert_asset") as m_upsert, \
+             mock.patch.object(storage, "refresh_asset_urls") as m_urls, \
+             mock.patch.object(storage, "update_asset_exif") as m_exif:
+            with _PatchedRun(client, clf):
+                out = pipeline.run_pipeline(
+                    base_url=BASE_URL_FOR_TEST,
+                    api_key="fake",
+                    query="q",
+                    n_samples=n_samples,
+                    top_k=3,
+                    db_path=db,
+                    batch_size=16,
+                )
+
+        # Every asset should be a cache hit (skip path).
+        assert out.n_cached == n_samples, (out.n_cached, out.n_new)
+        assert out.n_new == 0, out
+        # And zero writes issued by the stitch loop.
+        assert m_upsert.call_count == 0, m_upsert.call_count
+        assert m_urls.call_count == 0, m_urls.call_count
+        assert m_exif.call_count == 0, m_exif.call_count
+
+
+def test_stitch_loop_preserves_exif_when_urls_change():
+    """When Immich renames a file (URLs drift) but the row already has
+    EXIF, refresh_asset_urls must update only the URL/filename fields.
+    The old upsert_asset() codepath would have overwritten captured_at
+    with NULL because its SQL always writes the EXIF columns.
+    """
+    n_samples = 5
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "state.db")
+        all_ids = [f"id-{i:06d}" for i in range(n_samples)]
+        # Seed the FIRST id with a stale filename (URLs drift),
+        # the rest with the canonical filename.
+        storage.init_db(db)
+        with storage.connect(db) as conn:
+            for idx, aid in enumerate(all_ids):
+                # Match the fake's filename pattern; the only stale
+                # asset (idx==0) deliberately diverges so the
+                # refresh_asset_urls branch triggers once.
+                fname = (
+                    "STALE_NAME.jpg" if idx == 0
+                    else f"img_{aid.split('-', 1)[1]}.jpg"
+                )
+                storage.upsert_asset(
+                    conn, asset_id=aid,
+                    original_file_name=fname,
+                    original_url=f"{BASE_URL_FOR_TEST}/api/assets/{aid}/original",
+                    thumbnail_url=(
+                        f"{BASE_URL_FOR_TEST}/api/assets/{aid}/thumbnail"
+                        f"?size={THUMBNAIL_SIZE}"
+                    ),
+                    captured_at="2025-01-01T00:00:00.000+00:00",
+                )
+                storage.upsert_taxon_scores(
+                    conn, asset_id=aid, rank="kingdom",
+                    scores={"Plantae": 0.9, "Fungi": 0.02},
+                )
+                for pos in range(3):
+                    conn.execute(
+                        "INSERT OR REPLACE INTO predictions "
+                        "(asset_id, rank, position, species, common_name, "
+                        " score, kingdom, family, genus) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (aid, "species", pos, f"sp-{aid}-{pos}", "",
+                         0.95 - pos * 0.1, "Plantae", "Fam", "Gen"),
+                    )
+            conn.commit()
+
+        client = _FakeImmichClient(BASE_URL_FOR_TEST, "fake",
+                                    total_assets=n_samples)
+        clf = _FakeClassifier()
+
+        # `wraps=` delegates to the original function while still
+        # letting us count calls — without it, the search loop's
+        # refresh would never update the DB, and the stitch loop
+        # would also fire refresh_asset_urls for the same stale
+        # asset, giving us a misleading call count of 2.
+        with mock.patch.object(
+            storage, "refresh_asset_urls",
+            wraps=storage.refresh_asset_urls,
+        ) as m_urls, \
+        mock.patch.object(
+            storage, "upsert_asset", wraps=storage.upsert_asset,
+        ) as m_upsert, \
+        mock.patch.object(
+            storage, "update_asset_exif",
+            wraps=storage.update_asset_exif,
+        ) as m_exif:
+            with _PatchedRun(client, clf):
+                pipeline.run_pipeline(
+                    base_url=BASE_URL_FOR_TEST,
+                    api_key="fake",
+                    query="q",
+                    n_samples=n_samples,
+                    top_k=3,
+                    db_path=db,
+                    batch_size=16,
+                )
+
+        # Search loop refreshes the stale URL, then the stitch loop
+        # re-reads bulk_asset_rows and sees matching URLs and skips.
+        # Net result: 1 refresh, 0 upsert, 0 EXIF fetches.
+        assert m_urls.call_count == 1, m_urls.call_count
+        assert m_upsert.call_count == 0, m_upsert.call_count
+        assert m_exif.call_count == 0, m_exif.call_count
+
+        # captured_at must still be populated. The old upsert_asset
+        # codepath would have set it to NULL because its SQL writes
+        # the EXIF columns unconditionally.
+        with storage.connect(db) as conn:
+            row = conn.execute(
+                "SELECT captured_at, original_file_name "
+                "FROM assets WHERE asset_id = ?",
+                (all_ids[0],),
+            ).fetchone()
+        assert row["captured_at"] is not None, row["captured_at"]
+        expected_fname = f"img_{all_ids[0].split('-', 1)[1]}.jpg"
+        assert row["original_file_name"] == expected_fname, (
+            row["original_file_name"], expected_fname
+        )
+
+
 # Tiny test runner so failures actually propagate exit code. Without
 # this, exceptions in test functions just bubble up and Python exits
 # 0 — same as success.

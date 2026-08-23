@@ -432,6 +432,32 @@ def bulk_assets_missing_captured_at(
     return {r["asset_id"] for r in rows}
 
 
+def refresh_asset_urls(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: str,
+    original_file_name: str,
+    original_url: str,
+    thumbnail_url: str,
+) -> None:
+    """Update only the URL/filename fields of an existing asset row.
+    Leaves captured_at/latitude/longitude untouched. Used by the
+    pipeline when Immich reuses an asset id with a different name or
+    the base_url has changed since the first ingest. Contrast with
+    `upsert_asset`, which writes the EXIF columns and would clobber
+    them with NULL when called without EXIF kwargs."""
+    conn.execute(
+        """
+        UPDATE assets
+           SET original_file_name = ?,
+               original_url       = ?,
+               thumbnail_url      = ?
+         WHERE asset_id = ?
+        """,
+        (original_file_name, original_url, thumbnail_url, asset_id),
+    )
+
+
 def asset_has_captured_at(
     conn: sqlite3.Connection,
     *,
@@ -1403,6 +1429,31 @@ def fetch_predictions(
         (asset_id, rank),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def bulk_fetch_prediction_counts(
+    conn: sqlite3.Connection,
+    *,
+    asset_ids: list[str],
+    rank: str,
+) -> dict[str, int]:
+    """Returns {asset_id: count} for the given asset_ids at the given
+    rank. Used by the pipeline's stitch loop to decide which assets
+    still need a BioCLIP predict call, replacing an N+1 of
+    `fetch_predictions` + `len()`. Asset ids that don't appear in the
+    result set are simply absent — callers should treat absent as 0.
+    """
+    if not asset_ids:
+        return {}
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT asset_id, COUNT(*) AS n "
+        f"  FROM predictions "
+        f" WHERE rank = ? AND asset_id IN ({placeholders}) "
+        f" GROUP BY asset_id",
+        [rank] + asset_ids,
+    ).fetchall()
+    return {r["asset_id"]: r["n"] for r in rows}
 
 
 # ---------- detections ---------------------------------------------------

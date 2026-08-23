@@ -773,9 +773,12 @@ def discover_plantae_assets(
                         or existing_asset.get("original_url") != original_url
                         or existing_asset.get("thumbnail_url") != thumbnail_url
                     ):
-                        # Refresh name/URLs only; keep existing
-                        # captured_at / lat / lng.
-                        storage.upsert_asset(
+                        # Refresh name/URLs only — never overwrite
+                        # captured_at / lat / lng. The old code used
+                        # upsert_asset here, whose SQL always writes
+                        # the EXIF columns and so clobbered them with
+                        # NULL on every URL-drift run.
+                        storage.refresh_asset_urls(
                             conn,
                             asset_id=asset.id,
                             original_file_name=asset.original_file_name,
@@ -1177,17 +1180,29 @@ def run_pipeline(
             needs_yolo: list[tuple[ImmichAsset, Path | None]] = []
             ordered_ids: list[str] = []
 
-            # Bulk EXIF-skip check: same pattern as the search loop.
-            # One SELECT for all assets tells us which ones already
-            # have captured_at, so we can skip the per-asset
-            # get_asset_metadata HTTP call. Without this, a fully-
-            # cached run still makes n_samples GET requests to
-            # Immich — that's the multi-minute silence after
-            # "[search] reached target" that the user reported.
+            # Stitch loop — populate / refresh the `assets` rows and
+            # decide which assets still need a BioCLIP predict. Two
+            # bulk SELECTs up front (existing rows + missing EXIF + per-
+            # asset prediction count) replace the N+1 of the old
+            # per-asset loop. For the common cached case (URLs match
+            # AND captured_at is set AND predictions are complete) we
+            # do ZERO writes — that was the 30-second silence between
+            # "[search] reached target" and "query=... n_new=...".
             asset_ids = [a.id for a in assets]
+            existing_assets = storage.bulk_asset_rows(
+                conn, asset_ids=asset_ids
+            )
             missing_captured_at = storage.bulk_assets_missing_captured_at(
                 conn, asset_ids=asset_ids
             )
+            cached_pred_counts = storage.bulk_fetch_prediction_counts(
+                conn, asset_ids=asset_ids, rank=rank_name
+            )
+
+            n_stitched_skip = 0
+            n_stitched_urls_only = 0
+            n_stitched_exif_fetched = 0
+            n_stitched_full_upsert = 0
 
             for asset in assets:
                 original_url = f"{base_url}/api/assets/{asset.id}/original"
@@ -1195,35 +1210,71 @@ def run_pipeline(
                     f"{base_url}/api/assets/{asset.id}/thumbnail"
                     f"?size={THUMBNAIL_SIZE}"
                 )
-                # Skip the EXIF fetch when the assets row already has
-                # captured_at — same logic as the search loop's
-                # asset_has_captured_at branch. Existing rows keep
-                # their previous EXIF via the ON CONFLICT clause in
-                # upsert_asset().
-                if asset.id in missing_captured_at:
+                existing = existing_assets.get(asset.id, {})
+                urls_match = (
+                    existing.get("original_file_name") == asset.original_file_name
+                    and existing.get("original_url") == original_url
+                    and existing.get("thumbnail_url") == thumbnail_url
+                )
+                has_exif = asset.id not in missing_captured_at
+                if urls_match and has_exif:
+                    # Cache hit on every dimension — skip the upsert
+                    # entirely. This is the common case on a stable
+                    # Immich install: same URLs, EXIF already
+                    # captured, no-op in SQLite. Without this branch
+                    # we were issuing n_samples no-op UPDATEs per
+                    # run, ~30 s of silence on a 10k cached run.
+                    n_stitched_skip += 1
+                elif urls_match:
+                    # URLs are fine but the row is missing EXIF.
+                    # Fetch it once and write only the EXIF columns
+                    # — don't clobber the URLs that already match.
                     exif = ImmichClient.extract_exif(
                         client.get_asset_metadata(asset.id)
                     )
+                    n_stitched_exif_fetched += 1
+                    storage.update_asset_exif(
+                        conn,
+                        asset_id=asset.id,
+                        captured_at=exif["captured_at"],
+                        latitude=exif["latitude"],
+                        longitude=exif["longitude"],
+                    )
+                elif has_exif:
+                    # Row exists with EXIF but URLs have drifted
+                    # (Immich renamed the file, base_url changed,
+                    # etc). Refresh URLs only — never overwrite EXIF
+                    # with NULL.
+                    n_stitched_urls_only += 1
+                    storage.refresh_asset_urls(
+                        conn,
+                        asset_id=asset.id,
+                        original_file_name=asset.original_file_name,
+                        original_url=original_url,
+                        thumbnail_url=thumbnail_url,
+                    )
                 else:
-                    exif = {"captured_at": None, "latitude": None, "longitude": None}
-                storage.upsert_asset(
-                    conn,
-                    asset_id=asset.id,
-                    original_file_name=asset.original_file_name,
-                    original_url=original_url,
-                    thumbnail_url=thumbnail_url,
-                    captured_at=exif["captured_at"],
-                    latitude=exif["latitude"],
-                    longitude=exif["longitude"],
-                )
-
-                cached_preds = storage.fetch_predictions(
-                    conn, asset_id=asset.id, rank=rank_name
-                )
-                preds_ready = len(cached_preds) >= top_k
+                    # Either a brand-new asset or a row with no EXIF
+                    # AND drifted URLs. Fetch EXIF and do a full
+                    # upsert.
+                    exif = ImmichClient.extract_exif(
+                        client.get_asset_metadata(asset.id)
+                    )
+                    n_stitched_exif_fetched += 1
+                    storage.upsert_asset(
+                        conn,
+                        asset_id=asset.id,
+                        original_file_name=asset.original_file_name,
+                        original_url=original_url,
+                        thumbnail_url=thumbnail_url,
+                        captured_at=exif["captured_at"],
+                        latitude=exif["latitude"],
+                        longitude=exif["longitude"],
+                    )
+                    n_stitched_full_upsert += 1
 
                 ordered_ids.append(asset.id)
-                if not preds_ready:
+                if cached_pred_counts.get(asset.id, 0) < top_k:
                     # Defer download until the chunk loop reads it.
                     needs_bioclip.append((asset, None))
                     needs_yolo.append((asset, None))
@@ -1231,6 +1282,16 @@ def run_pipeline(
             n_new = len(needs_bioclip)
             n_cached = len(assets) - n_new
 
+            # One log line that explains the whole stitch. Counts
+            # that are 0 are still printed — the user wants to know
+            # the work actually happened (or didn't), and zero is a
+            # meaningful answer.
+            _log.info(
+                f"[stitch] {len(assets)} assets: "
+                f"skip={n_stitched_skip}  urls_only={n_stitched_urls_only} "
+                f"exif_fetched={n_stitched_exif_fetched} "
+                f"full_upsert={n_stitched_full_upsert}"
+            )
             _log.info(
                 f"query={query!r}  n_requested={n_samples}  "
                 f"n_new={n_new}  n_cached={n_cached}  "
