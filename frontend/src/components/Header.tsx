@@ -1,5 +1,4 @@
 import { KnnPill } from './KnnPill';
-import { StatusPanel } from './StatusPanel';
 import { navigate, topLevel, type View } from '../hooks/useRoute';
 import { useApp } from '../state/AppContext';
 
@@ -49,13 +48,12 @@ export function Header({ view }: Props) {
       <hgroup className="flex items-center gap-2 m-0">
         <h1 className="m-0 text-[1.1rem]">Immich × BioCLIP</h1>
       </hgroup>
-      {/* KNN pill + full StatusPanel on Run view; compact status on
-          Browse. The data-tools / sync-to-IMMICH sections moved out of
-          the sticky header and into the Run view's main column so the
-          header stays compact and the Run page has clear vertical
-          sections. */}
+      {/* KNN pill on Run view. The full StatusPanel lives in the Run
+          page's main column (one instance total), not the sticky header —
+          having it at the top meant two status bars on the Run page.
+          The Browse view doesn't get a status bar; if you want to see
+          run progress, switch to the Run tab. */}
       {active === 'run' && <KnnPill />}
-      {active === 'run' ? <StatusPanel /> : <StatusPanel compact />}
     </header>
   );
 }

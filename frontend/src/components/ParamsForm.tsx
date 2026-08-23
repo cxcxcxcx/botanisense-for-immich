@@ -15,7 +15,7 @@
 // button, which was confusing (it did exactly what Run does when all
 // fields are blank). It's gone.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { runPipeline } from '../api/endpoints';
 import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot } from '../api/types';
@@ -68,17 +68,34 @@ export function ParamsForm() {
   // actual run state, not just "click is being processed".
   const { data: snapshot } = useEventStream<EventSnapshot>('/api/events');
   const running = snapshot?.pipeline?.status === 'running';
-  // `submitting` is true only for the brief window between the click
-  // and the SSE event confirming `running`. Without this, an extra-fast
-  // network could flip the button back to "Run pipeline" before the
-  // server's first status file write reaches the SSE stream.
-  const [submitting, setSubmitting] = useState(false);
-  const busy = running || submitting;
+  // `awaiting` covers the window from click → SSE confirms a terminal
+  // state. It is NOT cleared when the POST returns, because there's a
+  // brief gap between /api/run returning and the server's first SSE
+  // push. Without this, the button would flicker back to "Run pipeline"
+  // before the user sees "Running…". Cleared in three places:
+  //   1. handleRun's catch block — POST failed, let the user retry.
+  //   2. The useEffect below — SSE reports done/error/stopped.
+  //   3. (Implicit) when the SSE's `running` flag flips on, `busy` is
+  //      already true via `running`; we don't need to clear awaiting.
+  const [awaiting, setAwaiting] = useState(false);
+  const busy = running || awaiting;
   const push = useToasts();
+
+  // Clear `awaiting` once the server reports a terminal pipeline state.
+  // We don't react to "idle" — that's also the initial state, and a
+  // momentary SSE reconnect could surface "idle" right before the run
+  // actually starts.
+  useEffect(() => {
+    if (!awaiting) return;
+    const status = snapshot?.pipeline?.status;
+    if (status === 'done' || status === 'error' || status === 'stopped') {
+      setAwaiting(false);
+    }
+  }, [snapshot, awaiting]);
 
   const handleRun = async (e: React.FormEvent) => {
     e.preventDefault();
-    setSubmitting(true);
+    setAwaiting(true);
     try {
       const resp = await runPipeline({
         query: query.trim() || null,
@@ -91,13 +108,15 @@ export function ParamsForm() {
         { kind: 'success', message: `Pipeline started (job ${jobId ?? '?'})` },
         2500,
       );
+      // Note: we deliberately don't `setAwaiting(false)` here. The SSE
+      // will tell us when the run actually finishes (done/error/stopped),
+      // at which point the useEffect above clears awaiting.
     } catch (err) {
+      setAwaiting(false);
       push(
         { kind: 'info', message: err instanceof Error ? err.message : String(err) },
         4000,
       );
-    } finally {
-      setSubmitting(false);
     }
   };
 
