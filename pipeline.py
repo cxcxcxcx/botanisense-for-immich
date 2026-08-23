@@ -271,6 +271,11 @@ def _stage_begin(name: str, *, chunk_total: int | None = None) -> None:
         _state["chunk_idx"] = 0
         _state["chunk_total"] = chunk_total if chunk_total is not None else 0
     _maybe_mirror_state()
+    # Visible pipeline log line so the run timeline reads top-to-bottom
+    # (search → species → cluster → kingdom → yolo → person → bbox-bioclip)
+    # even when a stage has no work to do. The caller still emits a
+    # detailed "starting N assets" line below when there IS work.
+    _log.info(f"[stage] {name}")
 
 
 def _stage_end(name: str) -> None:
@@ -305,6 +310,12 @@ def finish_state(*, run_id: int, n_new: int, n_cached: int,
             }
         )
     _maybe_mirror_state()
+    # Visible summary line so the log timeline ends with what the
+    # run actually accomplished, not just "done".
+    _log.info(
+        f"[run] done  run={run_id}  n_new={n_new}  n_cached={n_cached}  "
+        f"n_requested={n_requested}"
+    )
 
 
 def error_state(message: str) -> None:
@@ -1099,6 +1110,10 @@ def run_pipeline(
 
     reset_state()
     set_state(query=query, n_requested=n_samples)
+    _log.info(
+        f"[run] starting  query={query!r}  n_requested={n_samples}  "
+        f"rank={rank_name}  top_k={top_k}  batch_size={batch_size}"
+    )
     # Search's "chunk_total" is the photo target, not a batch count
     # — the search loop calls set_chunk_progress(len(accepted),
     # n_samples) per batch so the UI sees a steady advance instead
@@ -1227,10 +1242,13 @@ def run_pipeline(
             # slice. We mutate needs_bioclip/need_yolo in place as we go.
             species_total_chunks = (len(needs_bioclip) + batch_size - 1) // batch_size
 
+            # _stage_begin is OUTSIDE the needs_bioclip branch so the
+            # timeline always shows "[stage] species" even when cached.
+            _stage_begin("species", chunk_total=species_total_chunks)
+
             if needs_bioclip:
                 if clf is None:
                     clf = classifier if classifier is not None else _resolve_classifier()
-                _stage_begin("species", chunk_total=species_total_chunks)
                 species_t0 = time.monotonic()
                 _log.info(
                     f"[species] starting  {len(needs_bioclip)} assets, "
