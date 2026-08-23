@@ -5,8 +5,25 @@
 // Replaces the 5 separate polling loops (usePolling + 4 ad-hoc
 // setInterval sites). One connection per app; components read slices
 // of the same `data` via the hook.
+//
+// API base routing: when loaded from the Vite dev server (port 5173),
+// SSE streams would otherwise go through Vite's /api proxy, which
+// buffers chunked responses and backpressures uvicorn's generator.
+// Same fix as fetchJson: hit uvicorn directly on 8765 in dev. Prod
+// (uvicorn-served) keeps the relative URL.
 
 import { useEffect, useState } from 'react';
+
+const API_BASE: string =
+  (import.meta.env.VITE_API_BASE as string | undefined) ??
+  (typeof window !== 'undefined' && window.location?.port === '5173'
+    ? `${window.location.protocol}//${window.location.hostname}:8765`
+    : '');
+
+function resolveApiUrl(path: string): string {
+  if (!path.startsWith('/api')) return path;
+  return API_BASE + path;
+}
 
 export type EventStreamReadyState =
   | 'connecting'
@@ -18,10 +35,10 @@ export interface UseEventStreamResult<T> {
    *  (typically < 200ms after mount). */
   data: T | null;
   /** Set if a payload failed to JSON-parse or the stream errored. The
-   *  EventSource auto-reconnects; this is informational. */
+   * EventSource auto-reconnects; this is informational. */
   error: Error | null;
   /** Mirrors EventSource.readyState. `closed` is brief — the browser
-   *  reopens the connection within ~1s. */
+   * reopens the connection within ~1s. */
   readyState: EventStreamReadyState;
 }
 
@@ -31,7 +48,7 @@ const READY_STATE: Record<number, EventStreamReadyState> = {
   2: 'closed',
 };
 
-export function useEventStream<T>(url: string): UseEventStreamResult<T> {
+export function useEventStream<T>(path: string): UseEventStreamResult<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [readyState, setReadyState] = useState<EventStreamReadyState>(
@@ -46,7 +63,7 @@ export function useEventStream<T>(url: string): UseEventStreamResult<T> {
       setReadyState('closed');
       return;
     }
-    const es = new EventSource(url);
+    const es = new EventSource(resolveApiUrl(path));
 
     const onMessage = (ev: MessageEvent<string>) => {
       try {
@@ -75,7 +92,7 @@ export function useEventStream<T>(url: string): UseEventStreamResult<T> {
       es.close();
       setReadyState('closed');
     };
-  }, [url]);
+  }, [path]);
 
   return { data, error, readyState };
 }
