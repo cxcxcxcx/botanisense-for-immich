@@ -4,12 +4,21 @@
 // reveals the fields; the Run button always works and uses server
 // defaults for any field left blank.
 //
+// The Run button's visual state tracks the actual pipeline run via
+// the SSE stream — when /api/events reports status="running" the
+// button shows "Running…" and is disabled; when the run finishes
+// (status="done") it reverts to "Run pipeline". Tracking a local
+// `busy` boolean during the click was useless because /api/run
+// returns immediately (the child runs in the background).
+//
 // The previous version had a separate "Refresh (server defaults)"
 // button, which was confusing (it did exactly what Run does when all
 // fields are blank). It's gone.
 
 import { useState } from 'react';
 import { runPipeline } from '../api/endpoints';
+import { useEventStream } from '../hooks/useEventStream';
+import type { EventSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 
 interface FieldHelp {
@@ -54,25 +63,41 @@ export function ParamsForm() {
   const [n, setN] = useState('');
   const [topK, setTopK] = useState('');
   const [batch, setBatch] = useState('');
-  const [busy, setBusy] = useState(false);
   const [paramsOpen, setParamsOpen] = useState(false);
+  // Subscribe to the SSE pipeline status so the button reflects the
+  // actual run state, not just "click is being processed".
+  const { data: snapshot } = useEventStream<EventSnapshot>('/api/events');
+  const running = snapshot?.pipeline?.status === 'running';
+  // `submitting` is true only for the brief window between the click
+  // and the SSE event confirming `running`. Without this, an extra-fast
+  // network could flip the button back to "Run pipeline" before the
+  // server's first status file write reaches the SSE stream.
+  const [submitting, setSubmitting] = useState(false);
+  const busy = running || submitting;
   const push = useToasts();
 
   const handleRun = async (e: React.FormEvent) => {
     e.preventDefault();
-    setBusy(true);
+    setSubmitting(true);
     try {
-      await runPipeline({
+      const resp = await runPipeline({
         query: query.trim() || null,
         n_samples: n ? Number(n) : null,
         top_k: topK ? Number(topK) : null,
         batch_size: batch ? Number(batch) : null,
       });
-      push({ kind: 'success', message: 'Pipeline started' }, 2500);
+      const jobId = (resp as { job_id?: string })?.job_id;
+      push(
+        { kind: 'success', message: `Pipeline started (job ${jobId ?? '?'})` },
+        2500,
+      );
     } catch (err) {
-      push({ kind: 'info', message: err instanceof Error ? err.message : String(err) }, 4000);
+      push(
+        { kind: 'info', message: err instanceof Error ? err.message : String(err) },
+        4000,
+      );
     } finally {
-      setBusy(false);
+      setSubmitting(false);
     }
   };
 
@@ -95,7 +120,9 @@ export function ParamsForm() {
 
       {/* Single Run button — uses server defaults unless the user has
           unfolded the params and edited a field. Blank fields = server
-          default, so the collapsed state is fully functional. */}
+          default, so the collapsed state is fully functional. The
+          button's text/disabled state tracks the actual run via SSE so
+          the user gets immediate feedback that the click registered. */}
       <div className="flex items-center gap-3">
         <button
           type="submit"
@@ -104,6 +131,7 @@ export function ParamsForm() {
         >
           {busy ? 'Running…' : 'Run pipeline'}
         </button>
+        <LiveRunStatus snapshot={snapshot} />
         <small className="text-fg-1">
           Uses server defaults unless you edit the params.
         </small>
@@ -179,4 +207,46 @@ export function ParamsForm() {
       )}
     </form>
   );
+}
+
+
+function LiveRunStatus({ snapshot }: { snapshot: EventSnapshot | null }) {
+  // Tiny live indicator next to the Run button so the user sees
+  // immediately that the click registered and what the pipeline
+  // is doing. Subscribes to the same SSE stream as StatusPanel;
+  // lightweight — no polling.
+  const p = snapshot?.pipeline;
+  if (!p || p.status === 'idle') return null;
+  const label =
+    p.status === 'running' && p.stage
+      ? `stage: ${p.stage}`
+      : p.status === 'running'
+        ? 'running…'
+        : p.status === 'done'
+          ? `last run: ${p.current_run_id} · ${formatTotal(p)}`
+          : p.status === 'stopped'
+            ? 'stopped'
+            : `error: ${p.last_error ?? 'unknown'}`;
+  return (
+    <small
+      className={`text-[0.75rem] ${
+        p.status === 'error' ? 'text-red-400' : 'text-fg-1'
+      }`}
+      data-testid="live-run-status"
+    >
+      {label}
+    </small>
+  );
+}
+
+
+function formatTotal(p: { stage_times?: Record<string, number> }): string {
+  // The "last completed run" fallback synthesizes a stage_times entry
+  // called "total". Use it when present; otherwise format the sum of
+  // stage times as a best-effort fallback.
+  const t = p.stage_times?.['total'];
+  if (typeof t === 'number') return `${t.toFixed(0)}s`;
+  if (!p.stage_times) return '';
+  const sum = Object.values(p.stage_times).reduce((a, b) => a + b, 0);
+  return `${sum.toFixed(0)}s`;
 }
