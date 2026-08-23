@@ -229,6 +229,57 @@ def _get_active_job() -> dict | None:
         return active
 
 
+def _last_completed_run() -> dict | None:
+    """Return a snapshot of the most recent finished run, read from
+    SQLite. Used by /api/status and /api/events when there's no live
+    child — gives the UI a "last completed" view instead of an empty
+    idle state. Cheap (one indexed SELECT on the runs table)."""
+    from datetime import datetime
+    with storage.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT id, query, n_new, n_cached, n_requested, "
+            "       started_at, finished_at "
+            "  FROM runs "
+            " WHERE finished_at IS NOT NULL "
+            " ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        # Shape mirrors pipeline._state so the frontend doesn't need
+        # to special-case this. stage="" with status="done" is what
+        # finish_state writes after a successful run.
+        started = row["started_at"]
+        finished = row["finished_at"]
+        elapsed = 0.0
+        try:
+            if started and finished:
+                t0 = datetime.fromisoformat(started)
+                t1 = datetime.fromisoformat(finished)
+                elapsed = (t1 - t0).total_seconds()
+        except (ValueError, TypeError):
+            pass
+        return {
+            "status": "done",
+            "stage": "",
+            "chunk_idx": 0,
+            "chunk_total": 0,
+            "rate": 0.0,
+            "eta_seconds": 0.0,
+            "current_run_id": row["id"],
+            "query": row["query"],
+            "n_new": row["n_new"],
+            "n_cached": row["n_cached"],
+            "n_requested": row["n_requested"],
+            "started_at": started,
+            "finished_at": finished,
+            "last_error": None,
+            # Render the elapsed time as a single "stage_times" entry so
+            # the UI's stage-times bar shows total runtime.
+            "stage_times": {"total": elapsed},
+            "stage_t0": None,
+        }
+
+
 def _get_classifier():
     global _classifier
     if _classifier is None:
@@ -784,29 +835,28 @@ async def recompute_cluster_names() -> dict:
 
 @app.get("/api/status")
 async def status() -> dict:
-    """Live pipeline state. Poll this every 1s while a run is in
-    progress to drive the UI status panel. Safe to read when idle.
+    """Pipeline state for the UI status panel.
 
-    Kept for backwards-compat / scripts / debugging. The React UI now
-    reads the same payload via /api/events (SSE) instead of polling
-    this endpoint.
-
-    When a child-process run is active, the parent's `pipeline.get_state()`
-    returns its own empty state (state lives in the child). We read the
-    child's status file instead — the child mirrors its state there on
-    every set_state / _stage_* call."""
+    - During a run: child's live status file (mirrored per state change).
+    - After a run completes: last-completed-run summary from SQLite.
+      Without this fallback, /api/status returns the parent's empty
+      idle state once the child exits, and the UI keeps showing the
+      "Pipeline started" message with no final state.
+    - Never run yet: parent's empty idle state.
+    """
     active = _get_active_job()
     if active is not None:
         sp = active["status_path"]
         if sp.exists():
             try:
                 snap = json.loads(sp.read_text())
-                # Stamp the job_id so the client can correlate with
-                # /api/run's response payload.
                 snap["job_id"] = active["job_id"]
                 return snap
             except (json.JSONDecodeError, OSError):
-                pass  # fall through to local state
+                pass
+    last = await asyncio.to_thread(_last_completed_run)
+    if last is not None:
+        return last
     return get_state()
 
 
@@ -863,10 +913,11 @@ def _build_event_snapshot() -> dict:
     lock; the worst-case time is bounded by the sum of the lock hold
     times (microseconds). Safe to call from the SSE generator loop.
 
-    `pipeline` is sourced from the child-process status file when a
-    child run is active (see _pipeline_child_entry); otherwise it
-    falls back to the in-process `pipeline.get_state()` (the parent's
-    local copy — used for idle state)."""
+    `pipeline` is sourced from:
+    - The child-process status file when a run is active (live).
+    - The last completed run from the runs table after a run ends.
+    - The parent's empty idle state when no run has ever happened.
+    """
     active = _get_active_job()
     pipeline_state: dict
     if active is not None:
@@ -880,7 +931,12 @@ def _build_event_snapshot() -> dict:
         else:
             pipeline_state = get_state()
     else:
-        pipeline_state = get_state()
+        # No live child — show the last completed run, or the
+        # empty idle state if nothing has ever run. The UI needs
+        # this to show the user that the previous run finished
+        # and what it produced.
+        last = _last_completed_run()
+        pipeline_state = last if last is not None else get_state()
     return {
         "pipeline": pipeline_state,
         "plants_jobs": _snapshot_jobs(_plants_jobs, _plants_jobs_lock),
