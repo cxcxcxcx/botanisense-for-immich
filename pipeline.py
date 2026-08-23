@@ -914,7 +914,15 @@ def discover_plantae_assets(
                 _log.info(
                     f"[search] reached target of {n_samples}, stopping"
                 )
+                # Final progress update at 100% before returning.
+                set_chunk_progress(n_samples, n_samples)
                 return accepted[:n_samples]
+            # Live progress for the UI bar. Updates the SSE stream so
+            # StatusPanel advances per-batch even when each batch's
+            # commit takes tens of ms (10k photos / 16 per batch =
+            # 625 batches = several seconds of "silent" work
+            # otherwise).
+            set_chunk_progress(len(accepted), n_samples)
 
         page += 1
         if page > 50:  # safety net
@@ -1075,7 +1083,12 @@ def run_pipeline(
 
     reset_state()
     set_state(query=query, n_requested=n_samples)
-    _stage_begin("search")
+    # Search's "chunk_total" is the photo target, not a batch count
+    # — the search loop calls set_chunk_progress(len(accepted),
+    # n_samples) per batch so the UI sees a steady advance instead
+    # of "stage: search" with chunk_idx stuck at 0 for the 20+
+    # seconds the per-batch DB-write loop takes on a large run.
+    _stage_begin("search", chunk_total=n_samples)
 
     client = ImmichClient(base_url=base_url, api_key=api_key)
     try:
