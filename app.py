@@ -32,6 +32,7 @@ from pathlib import Path
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -654,6 +655,22 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Immich × BioCLIP", lifespan=lifespan)
+
+# CORS: the dev frontend is served by Vite on :5173 and calls /api/*
+# directly on uvicorn :8765 (bypassing Vite's proxy to avoid SSE
+# backpressure). Without this middleware the browser blocks those
+# cross-origin requests. Allow any origin — this is a local dev tool,
+# not a public service. Restrict before deploying anywhere.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    # SSE: the browser sends a preflight OPTIONS for EventSource.
+    # Returning the right Access-Control-Allow-Origin is enough; no
+    # special expose_headers needed.
+)
 
 
 @app.middleware("http")
