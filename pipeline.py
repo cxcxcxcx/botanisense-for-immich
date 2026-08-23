@@ -256,13 +256,20 @@ def reset_state() -> None:
     _maybe_mirror_state()
 
 
-def _stage_begin(name: str) -> None:
-    """Mark the start of `name` for the per-stage timing bar."""
+def _stage_begin(name: str, *, chunk_total: int | None = None) -> None:
+    """Mark the start of `name` for the per-stage timing bar.
+
+    `chunk_total` is the planned number of chunks for this stage; the
+    caller can update `chunk_idx` via set_state() as work progresses so
+    the UI progress bar advances in real time.
+    """
     with _state_lock:
         _state["stage"] = name
         # wall-clock seconds so the JS UI can subtract from Date.now()/1000
         # to project the running slice's elapsed time live.
         _state["stage_t0"] = time.time()
+        _state["chunk_idx"] = 0
+        _state["chunk_total"] = chunk_total if chunk_total is not None else 0
     _maybe_mirror_state()
 
 
@@ -327,6 +334,15 @@ def stopped_state(message: str = "stopped by user") -> None:
 def set_state(**updates) -> None:
     with _state_lock:
         _state.update(updates)
+    _maybe_mirror_state()
+
+
+def set_chunk_progress(idx: int, total: int) -> None:
+    """Update the in-stage chunk counter. Called per chunk from the
+    main loops so the UI progress bar advances."""
+    with _state_lock:
+        _state["chunk_idx"] = idx
+        _state["chunk_total"] = total
     _maybe_mirror_state()
 
 
@@ -1169,7 +1185,7 @@ def run_pipeline(
             if needs_bioclip:
                 if clf is None:
                     clf = classifier if classifier is not None else _resolve_classifier()
-                _stage_begin("species")
+                _stage_begin("species", chunk_total=species_total_chunks)
                 species_t0 = time.monotonic()
                 _log.info(
                     f"[species] starting  {len(needs_bioclip)} assets, "
@@ -1181,6 +1197,8 @@ def run_pipeline(
                     # its embeddings + predictions before the next, so
                     # stopping here loses nothing.
                     check_stop(stop_event)
+                    if species_total_chunks > 0:
+                        set_chunk_progress(i // batch_size + 1, species_total_chunks)
                     j = min(i + batch_size, len(needs_bioclip))
                     pil_images: list[Image.Image] = []
                     file_paths: list[str] = []
@@ -1375,7 +1393,7 @@ def run_pipeline(
             kingdom_total_chunks = (
                 (len(kingdom_assets) + batch_size - 1) // batch_size
             )
-            _stage_begin("kingdom")
+            _stage_begin("kingdom", chunk_total=kingdom_total_chunks)
             kingdom_t0 = time.monotonic()
             if kingdom_assets:
                 if clf is None:
@@ -1391,6 +1409,8 @@ def run_pipeline(
             while i < len(kingdom_assets):
                 check_stop(stop_event)
                 j = min(i + batch_size, len(kingdom_assets))
+                if kingdom_total_chunks > 0:
+                    set_chunk_progress(i // batch_size + 1, kingdom_total_chunks)
                 pil_images: list[Image.Image] = []
                 file_paths: list[str] = []
                 chunk_indices: list[int] = []
@@ -1453,7 +1473,7 @@ def run_pipeline(
             # off from here.
             yolo_total_chunks = (len(needs_yolo) + batch_size - 1) // batch_size
             yolo_t0 = time.monotonic()
-            _stage_begin("yolo")
+            _stage_begin("yolo", chunk_total=yolo_total_chunks)
             if needs_yolo:
                 _log.info(
                     f"[yolo] starting  {len(needs_yolo)} assets, "
@@ -1463,6 +1483,8 @@ def run_pipeline(
                 try:
                     i = 0
                     while i < len(needs_yolo):
+                        if yolo_total_chunks > 0:
+                            set_chunk_progress(i // batch_size + 1, yolo_total_chunks)
                         check_stop(stop_event)
                         j = min(i + batch_size, len(needs_yolo))
                         todo: list[tuple[int, ImmichAsset, Path]] = []
@@ -1706,7 +1728,7 @@ def run_pipeline(
                 (len(all_bbox_targets) + batch_size - 1) // batch_size
             )
             bbox_t0 = time.monotonic()
-            _stage_begin("bbox-bioclip")
+            _stage_begin("bbox-bioclip", chunk_total=bbox_total_chunks)
             if all_bbox_targets:
                 if clf is None:
                     clf = classifier if classifier is not None else _resolve_classifier()
@@ -1722,6 +1744,8 @@ def run_pipeline(
                 i = 0
                 while i < len(all_bbox_targets):
                     check_stop(stop_event)
+                    if bbox_total_chunks > 0:
+                        set_chunk_progress(i // batch_size + 1, bbox_total_chunks)
                     j = min(i + batch_size, len(all_bbox_targets))
                     chunk = all_bbox_targets[i:j]
 
