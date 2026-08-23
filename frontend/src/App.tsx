@@ -11,6 +11,7 @@ import { LogTail } from './components/LogTail';
 import { JobPanel } from './components/JobPanel';
 import { ImmichSync } from './components/ImmichSync';
 import { LegendBar } from './components/LegendBar';
+import { StatusPanel } from './components/StatusPanel';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -97,11 +98,12 @@ export function App() {
         {view === 'run' ? (
           <section className="flex flex-col gap-4">
             {/* Run-page sections, top-to-bottom:
-                  1. Pipeline run — query / sample size / batch
+                  1. Pipeline run — query / sample size / batch + live progress
                   2. Sync to IMMICH — clusters / Plantae / Fungi / Remove
                   3. Data tools — KNN build / EXIF backfill / purge / detect people
                   4. Logs — pipeline + worker output */}
             <ParamsForm />
+            <StatusPanel />
             <ImmichSync />
             <LegendBar />
             <LogTail active={true} />
