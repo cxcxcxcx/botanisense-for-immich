@@ -66,6 +66,15 @@
   .knn-pill-ready      { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-800; }
   .knn-pill-unavailable { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-red-900/40 text-red-300 border border-red-800; }
   .knn-pill-loading     { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-bg-1 text-fg-1 border border-line2; }
+
+  /* Pipeline status badge (StatusPanel). Distinct colors so the
+     running / done / stopped / error states are immediately visible
+     without depending on the (often-empty) stage label. */
+  .status-idle     { @apply px-2 py-0.5 rounded font-mono bg-bg-2 text-fg-1 border border-line2; }
+  .status-running  { @apply px-2 py-0.5 rounded font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-800; }
+  .status-done     { @apply px-2 py-0.5 rounded font-mono bg-sky-900/40 text-sky-300 border border-sky-800; }
+  .status-stopped  { @apply px-2 py-0.5 rounded font-mono bg-amber-900/40 text-amber-300 border border-amber-800; }
+  .status-error    { @apply px-2 py-0.5 rounded font-mono bg-red-900/40 text-red-300 border border-red-800; }
 }
 
 /* Tailwind utility escape hatches — for the handful of cases where a
