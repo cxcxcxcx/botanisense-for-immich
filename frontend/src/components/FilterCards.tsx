@@ -1,7 +1,7 @@
-// Filter cards — rich square tiles that replace the old text-only
-// "cluster pills". Each card carries a sample thumbnail (the asset with
-// the highest top-1 BioCLIP score in that group) with the label and
-// count overlaid at the bottom of the photo.
+// Filter cards — labeled chip groups that replace the old slash-list
+// rows. Each filter dimension is a labeled row of segmented chips.
+// The grid of cluster/taxon cards lives below the chip rows and only
+// renders on browse-list.
 
 import { useEffect, useMemo, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
@@ -27,9 +27,22 @@ const SORTS: { value: CardSort; label: string; hint: string }[] = [
 // back to the card list.
 const PLANTAE_OPTS: Array<{ v: 'plant' | 'non_plant' | 'uncertain' | undefined; label: string; color: string; title: string }> = [
   { v: undefined,  label: 'all',      color: 'transparent',  title: 'Show every photo (plants + uncertain + non-plants)' },
-  { v: 'plant',    label: 'plants',   color: '#1a3a1a',     title: 'Plantae ≥ 0.60' },
-  { v: 'uncertain', label: 'uncertain', color: '#3a3a1a',    title: 'Plantae 0.35–0.60' },
-  { v: 'non_plant', label: 'non-plants', color: '#3a1a1a',   title: 'Plantae < 0.35 (or unknown)' },
+  { v: 'plant',    label: 'plants',   color: '#5cc078',     title: 'Plantae ≥ 0.60' },
+  { v: 'uncertain', label: 'uncertain', color: '#e8c45c',    title: 'Plantae 0.35–0.60' },
+  { v: 'non_plant', label: 'non-plants', color: '#a35',       title: 'Plantae < 0.35 (or unknown)' },
+];
+
+const PERSON_OPTS: Array<{ v: 0 | 1 | undefined; label: string; title: string }> = [
+  { v: undefined, label: 'any', title: 'Show all photos (scanned + unscanned)' },
+  { v: 1,          label: 'has', title: 'Show only photos with a person detected' },
+  { v: 0,          label: 'no',  title: 'Show only photos scanned and confirmed without a person' },
+];
+
+const GROUP_BY_CHIPS: Array<{ v: GroupBy; label: string }> = [
+  { v: 'cluster', label: 'Cluster' },
+  { v: 'species', label: 'Species' },
+  { v: 'genus',   label: 'Genus' },
+  { v: 'family',  label: 'Family' },
 ];
 
 interface Card {
@@ -45,6 +58,13 @@ const SORT_KEY = (g: GroupBy) => `filtercards:sort:${g}`;
 function readSort(g: GroupBy): CardSort {
   const v = localStorage.getItem(SORT_KEY(g));
   return v === 'alpha' || v === 'id' || v === 'latest' ? v : 'size';
+}
+
+function tierDotClass(color: string): string {
+  if (color === '#5cc078') return 'tier-dot-green';
+  if (color === '#e8c45c') return 'tier-dot-yellow';
+  if (color === '#a35')    return 'tier-dot-red';
+  return 'border border-line2';
 }
 
 export function FilterCards() {
@@ -201,148 +221,205 @@ export function FilterCards() {
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
-  // Render the toolbar (sort + plantae + person chips) on BOTH
-  // browse-list and browse-content. Only render the cards grid on
-  // browse-list (where it makes sense). Hide entirely only when the
-  // user explicitly collapsed an active card on browse-list.
+  // Render the toolbar (chips + search) on BOTH browse-list and
+  // browse-content. Only render the cards grid on browse-list (where
+  // it makes sense). Hide entirely only when the user explicitly
+  // collapsed an active card on browse-list.
   if (collapsed && activeCard && !showPersonChip) return null;
 
   return (
-    <div className="pt-1">
-      <div className="flex flex-wrap items-center gap-2 py-1 pb-2 text-[0.8rem] text-fg-1">
-        <span className="inline-flex items-center gap-1" role="radiogroup" aria-label="Sort filter cards">
-          <span className="text-fg-1 mr-[2px]">sort</span>
-          {SORTS.map((s, i) => (
-            <span key={s.value} className="inline-flex items-center gap-1">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={sortMode === s.value}
-                className={`bg-transparent border-0 p-0 m-0 cursor-pointer text-[0.85rem] leading-[22px] ${
-                  sortMode === s.value ? 'text-accent font-medium' : 'text-fg-0 hover:text-fg'
-                }`}
-                onClick={() => setSortMode(s.value)}
-                title={s.hint}
-              >{s.label}</button>
-              {i < SORTS.length - 1 && <span className="text-fg-3">/</span>}
-            </span>
-          ))}
-        </span>
-        {/* Plantae-tier chip — top-level facet that narrows both the
-            filter cards AND the photo grid. Lives in FilterCards
-            (not Toolbar) so it's visible on both views. The colored
-            squares match the LegendBar tiers. "all" clears the facet
-            (sets to undefined). Clicking any chip resets page to 0. */}
-        <span className="inline-flex items-center gap-1 ml-2" role="radiogroup" aria-label="Plantae tier filter">
-          <span className="text-fg-1 mr-[2px]">plants</span>
-          {PLANTAE_OPTS.map((opt, i, arr) => (
-            <span key={opt.label} className="inline-flex items-center gap-1">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={filters.plantae === opt.v}
-                className={`inline-flex items-center gap-1 bg-transparent border-0 p-0 m-0 cursor-pointer text-[0.85rem] leading-[22px] ${
-                  filters.plantae === opt.v ? 'text-accent font-medium' : 'text-fg-0 hover:text-fg'
-                }`}
-                onClick={() => setFilters({ plantae: opt.v, page: 0 })}
-                title={opt.title}
-              >
-                <span
-                  className="inline-block w-2 h-2 rounded-sm"
-                  style={{ background: opt.color, border: opt.color === 'transparent' ? '1px solid #456' : undefined }}
-                />
-                {opt.label}
-              </button>
-              {i < arr.length - 1 && <span className="text-fg-3">/</span>}
-            </span>
-          ))}
-        </span>
-        {/* Person filter — top-level facet that only applies to the
-            photo grid (only shown when the user is on browse-content).
-            Three-state chip group: any / has person / no person. Backed
-            by /api/results?has_person= (server-side). Unscanned rows
-            (NULL) are excluded by both 0 and 1, so neither shows them
-            — that's the intentional "don't claim 'no person' until
-            we've actually checked" semantics. */}
-        {showPersonChip && (
-          <span className="inline-flex items-center gap-1 ml-2" role="radiogroup" aria-label="Person filter">
-            <span className="text-fg-1 mr-[2px]">person</span>
-            {([
-              { v: undefined, label: 'any' },
-              { v: 1 as const, label: 'has' },
-              { v: 0 as const, label: 'no' },
-            ]).map((opt, i, arr) => (
-              <span key={opt.label} className="inline-flex items-center gap-1">
-                <button
-                  type="button"
-                  role="radio"
-                  aria-checked={filters.has_person === opt.v}
-                  className={`bg-transparent border-0 p-0 m-0 cursor-pointer text-[0.85rem] leading-[22px] ${
-                    filters.has_person === opt.v ? 'text-accent font-medium' : 'text-fg-0 hover:text-fg'
-                  }`}
-                  onClick={() => setFilters({ has_person: opt.v, page: 0 })}
-                  title={
-                    opt.v === undefined
-                      ? 'Show all photos (scanned + unscanned)'
-                      : opt.v === 1
-                        ? 'Show only photos with a person detected'
-                        : 'Show only photos scanned and confirmed without a person'
-                  }
-                >{opt.label}</button>
-                {i < arr.length - 1 && <span className="text-fg-3">/</span>}
-              </span>
-            ))}
-          </span>
-        )}
-        <span className="ml-auto tabular-nums">{visibleCards.length} of {allCards.length} filters</span>
-        {activeCard && (
+    <div className="pt-1 flex flex-col gap-3">
+      {/* Active-filter pill — only when a cluster/taxon card is selected.
+          Surfaces the "you've narrowed to X" state at the top so the
+          user always has a one-click path back to All. */}
+      {activeCard && (
+        <div className="active-pill">
+          <span className="text-fg-1 uppercase tracking-wider text-[0.7rem]">Active</span>
+          <strong className="italic">{activeCard.label}</strong>
+          <span className="text-fg-1 tabular-nums">· {activeCard.count.toLocaleString()} assets</span>
           <button
             type="button"
-            className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.8rem] hover:bg-[#345] hover:border-accent"
-            onClick={toggleForceShow}
+            className="ml-auto chip"
+            onClick={clearFilter}
+            title="Clear active filter"
           >
-            collapse
+            clear
           </button>
-        )}
+        </div>
+      )}
+
+      {/* Group by — always visible. Switching here resets the active
+          taxonomy filter (the reducer handles this) and re-fetches the
+          card list. */}
+      <div className="filter-row">
+        <span className="filter-row-label">Group by</span>
+        <div className="filter-row-chips">
+          {GROUP_BY_CHIPS.map(g => (
+            <button
+              key={g.v}
+              type="button"
+              className={filters.group_by === g.v ? 'chip chip-active' : 'chip'}
+              onClick={() => setFilters({ group_by: g.v, page: 0 })}
+              title={`Bucket photos by ${g.label.toLowerCase()}`}
+            >{g.label}</button>
+          ))}
+        </div>
+      </div>
+
+      {/* Plantae tier — top-level facet that narrows both the filter
+          cards AND the photo grid. Color swatch dots match the
+          legend. "all" clears the facet (sets to undefined). */}
+      <div className="filter-row">
+        <span className="filter-row-label">Plants</span>
+        <div className="filter-row-chips">
+          {PLANTAE_OPTS.map(opt => (
+            <button
+              key={opt.label}
+              type="button"
+              className={filters.plantae === opt.v ? 'chip chip-active' : 'chip'}
+              onClick={() => setFilters({ plantae: opt.v, page: 0 })}
+              title={opt.title}
+            >
+              <span className={`tier-dot ${tierDotClass(opt.color)}`} aria-hidden="true" />
+              {opt.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Person — only on browse-content (the photo grid). See note at
+          the top of this component about why we hide it elsewhere. */}
+      {showPersonChip && (
+        <div className="filter-row">
+          <span className="filter-row-label">Person</span>
+          <div className="filter-row-chips">
+            {PERSON_OPTS.map(opt => (
+              <button
+                key={opt.label}
+                type="button"
+                className={filters.has_person === opt.v ? 'chip chip-active' : 'chip'}
+                onClick={() => setFilters({ has_person: opt.v, page: 0 })}
+                title={opt.title}
+              >{opt.label}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Sort + result count + collapse — last chip row. The count and
+          collapse button sit on the right via filter-row-tail. Sort
+          here only affects the order of the cards themselves (not the
+          photo grid sort — that lives in Grid.tsx's context bar). */}
+      <div className="filter-row">
+        <span className="filter-row-label">Sort cards</span>
+        <div className="filter-row-chips">
+          {SORTS.map(s => (
+            <button
+              key={s.value}
+              type="button"
+              className={sortMode === s.value ? 'chip chip-active' : 'chip'}
+              onClick={() => setSortMode(s.value)}
+              title={s.hint}
+            >{s.label}</button>
+          ))}
+        </div>
+        <div className="filter-row-tail">
+          <span className="tabular-nums text-fg-1 text-[0.8rem]">{visibleCards.length} of {allCards.length} cards</span>
+          {activeCard && (
+            <button
+              type="button"
+              className="chip"
+              onClick={toggleForceShow}
+              title={forceShow ? 'Hide filter cards on the grid view' : 'Show filter cards on the grid view'}
+            >{forceShow ? 'hide on grid' : 'show on grid'}</button>
+          )}
+        </div>
+      </div>
+
+      {/* Search — sub-filter that narrows the visible cards without
+          changing the active filter. Owns its own debounced local
+          state via useDebounce. */}
+      <div className="filter-row">
+        <span className="filter-row-label">Search</span>
+        <SearchInput
+          value={filters.q}
+          onChange={(v) => setFilters({ q: v, page: 0 })}
+        />
       </div>
 
       {/* Cards grid only on browse-list. On browse-content we already
-          rendered the toolbar above (sort + chips); the cards
-          themselves make no sense when looking at the photo grid. */}
+          rendered the chip rows above; the cards themselves make no
+          sense when looking at the photo grid. */}
       {!showPersonChip && (
-      <div className="grid gap-2.5 py-1 grid-cols-[repeat(auto-fill,minmax(160px,1fr))]">
-        <FilterAllCard
-          total={totalAll}
-          groupBy={filters.group_by}
-          active={activeKey == null}
-          onClick={goToAll}
-        />
-        {stickyActive && (
-          <FilterCardTile
-            card={stickyActive}
-            rank={filters.group_by}
-            active
-            pinned
-            onClick={() => { clearFilter(); navigate('browse-list'); }}
+        <div className="grid gap-2.5 py-1 grid-cols-[repeat(auto-fill,minmax(160px,1fr))]">
+          <FilterAllCard
+            total={totalAll}
+            groupBy={filters.group_by}
+            active={activeKey == null}
+            onClick={goToAll}
           />
-        )}
-        {isLoading && visibleCards.length === 0 && !stickyActive ? (
-          <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>Loading filters…</div>
-        ) : visibleCards.length === 0 && !stickyActive ? (
-          <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>No matches.</div>
-        ) : (
-          visibleCards.map(c => (
+          {stickyActive && (
             <FilterCardTile
-              key={c.key}
-              card={c}
+              card={stickyActive}
               rank={filters.group_by}
-              active={c.key === activeKey}
-              onClick={() => handleClick(c)}
+              active
+              pinned
+              onClick={() => { clearFilter(); navigate('browse-list'); }}
             />
-          ))
-        )}
-      </div>
+          )}
+          {isLoading && visibleCards.length === 0 && !stickyActive ? (
+            <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>Loading filters…</div>
+          ) : visibleCards.length === 0 && !stickyActive ? (
+            <div className="p-10 text-center text-fg-1 whitespace-pre-wrap" style={{ gridColumn: '1 / -1' }}>No matches.</div>
+          ) : (
+            visibleCards.map(c => (
+              <FilterCardTile
+                key={c.key}
+                card={c}
+                rank={filters.group_by}
+                active={c.key === activeKey}
+                onClick={() => handleClick(c)}
+              />
+            ))
+          )}
+        </div>
       )}
+    </div>
+  );
+}
+
+function SearchInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [local, setLocal] = useState(value);
+  // Mirror external value when it changes from elsewhere (e.g. URL
+  // navigation, back/forward).
+  useEffect(() => { setLocal(value); }, [value]);
+  const debounced = useDebounce(local, 200);
+  useEffect(() => {
+    if (debounced !== value) onChange(debounced);
+    // We intentionally exclude onChange from deps — it's stable from
+    // the parent's useUrlFilters callback. Re-running when it changes
+    // would cause a feedback loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debounced]);
+  return (
+    <div className="relative w-full sm:max-w-md">
+      <svg
+        className="absolute left-2.5 top-1/2 -translate-y-1/2 w-4 h-4 text-fg-2"
+        viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+        strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+      >
+        <circle cx="11" cy="11" r="7" />
+        <path d="m21 21-4.3-4.3" />
+      </svg>
+      <input
+        type="search"
+        className="search-input pl-8"
+        placeholder="filter cards by name…"
+        autoComplete="off"
+        value={local}
+        onChange={(e) => setLocal(e.target.value)}
+        title="Hide cards whose label doesn't match (sub-filter; doesn't change the active filter)"
+      />
     </div>
   );
 }
@@ -367,12 +444,12 @@ function FilterAllCard({ total, groupBy, active, onClick }: AllCardProps) {
     <button
       type="button"
       className={`filter-card relative aspect-square bg-bg-2 rounded-lg overflow-hidden cursor-pointer p-0 text-inherit border transition-colors hover:border-accent hover:-translate-y-px ${
-        active ? 'border-accent shadow-[0_0_0_1px#5cc078]' : 'border-line2'
+        active ? 'border-accent ring-1 ring-accent' : 'border-line2'
       }`}
       onClick={onClick}
       title={`Show all ${total.toLocaleString()} assets (clear ${groupBy} filter)`}
     >
-      <div className="absolute inset-0 bg-[#0a0a0a] flex items-center justify-center overflow-hidden" style={{ background: 'linear-gradient(135deg, #1a2a1a 0%, #142420 50%, #1a1a3a 100%)' }}>
+      <div className="absolute inset-0 flex items-center justify-center overflow-hidden" style={{ background: 'linear-gradient(135deg, #1a2a1a 0%, #142420 50%, #1a1a3a 100%)' }}>
         <span className={`text-5xl font-bold text-accent ${active ? 'opacity-100' : 'opacity-50'}`} style={{ textShadow: '0 0 12px rgba(92,192,120,0.4)' }}>∗</span>
       </div>
       <div className="absolute left-0 right-0 bottom-0 pt-[22px] pb-2 px-2 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-[3px] pointer-events-none text-left">
@@ -387,7 +464,7 @@ function FilterCardTile({ card, rank, active, pinned, onClick }: TileProps) {
   const borderCls = pinned
     ? 'border-accent'
     : active
-      ? 'border-accent shadow-[0_0_0_1px#5cc078]'
+      ? 'border-accent ring-1 ring-accent'
       : 'border-line2 hover:border-accent';
   return (
     <button

@@ -77,6 +77,60 @@
   .status-done     { @apply px-2 py-0.5 rounded font-mono bg-sky-900/40 text-sky-300 border border-sky-800; }
   .status-stopped  { @apply px-2 py-0.5 rounded font-mono bg-amber-900/40 text-amber-300 border border-amber-800; }
   .status-error    { @apply px-2 py-0.5 rounded font-mono bg-red-900/40 text-red-300 border border-red-800; }
+
+  /* Chip group — used by the filter bar (Toolbar + FilterCards) and
+     the header tab strip. Base + active variant; the inactive state
+     is just the base with hover utilities applied inline. Rounded-full
+     so chips read as a segmented control rather than a stack of
+     buttons. The .chip-active variant swaps to filled-accent so the
+     selection is obvious against the dark background — text colour
+     only would be invisible. */
+  .chip          { @apply inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-line2 bg-transparent text-fg-0 text-[0.85rem] leading-none cursor-pointer hover:text-fg hover:border-accent transition-colors; }
+  .chip-active   { @apply bg-accent border-accent text-bg font-medium hover:text-bg hover:border-accent; }
+
+  /* Filter row layout — one row per facet in the filter bar.
+     Stacks label above chip group on mobile, side-by-side on `sm:`.
+     The label is a small uppercase tracked-out caption so it reads
+     as a section header, not a form label. */
+  .filter-row        { @apply flex flex-col sm:flex-row sm:items-center gap-1.5 sm:gap-3; }
+  .filter-row-label  { @apply text-fg-1 text-[0.7rem] uppercase tracking-wider sm:w-20 sm:shrink-0; }
+  .filter-row-chips  { @apply flex flex-wrap items-center gap-1.5; }
+  .filter-row-tail   { @apply ml-auto flex items-center gap-3; }
+
+  /* Tier dot — small 4×4 rounded swatch that mirrors the Plantae tier
+     colours (green ≥0.60, yellow 0.35–0.60, red <0.35). Used both as
+     a chip-prefix (Plantae tier chip) and as a card-overlay
+     indicator. */
+  .tier-dot       { @apply inline-block w-2 h-2 rounded-sm shrink-0; }
+  .tier-dot-green  { @apply bg-[#5cc078]; }
+  .tier-dot-yellow { @apply bg-[#e8c45c]; }
+  .tier-dot-red    { @apply bg-[#a35]; }
+
+  /* Search input — sits inside FilterCards, full-width with a 🔍 prefix
+     icon rendered inline (no font icon). */
+  .search-input   { @apply w-full bg-bg-2 text-fg border border-line2 rounded-md px-2.5 py-2 text-[0.85rem] placeholder:text-fg-2 focus:outline-none focus:border-accent; }
+
+  /* Context bar — the cluster/taxon bar that sits between the filter
+     row and the photo grid. Holds the back link, current filter
+     label + count, and the sort dropdown. */
+  .context-bar    { @apply flex flex-wrap items-center gap-x-4 gap-y-2 p-3 rounded-lg border border-line2 bg-bg-1; }
+  .context-back   { @apply bg-transparent text-accent border-0 p-0 cursor-pointer text-[0.9rem] hover:underline; }
+
+  /* Styled native <select> for the sort dropdown. Matches the chip
+     aesthetic so the context bar reads as one component. */
+  .sort-select    { @apply bg-bg-2 text-fg border border-line2 rounded-md px-2 py-1 text-[0.85rem] cursor-pointer focus:outline-none focus:border-accent; }
+
+  /* Active-filter pill — appears at the top of the filter bar when a
+     cluster/taxon card is selected. Reads as "you've narrowed to X —
+     clear it here". */
+  .active-pill    { @apply flex items-center gap-2 px-3 py-1.5 rounded-md border border-accent/40 bg-accent/10 text-[0.85rem]; }
+
+  /* Brand mark + wordmark — header identity. The wordmark is two
+     lines (BotaniSense / for Immich) on mobile, collapses to one line
+     on `md:` and up via the inline modifier classes in Header.tsx. */
+  .brand-mark     { @apply w-7 h-7 shrink-0; }
+  .wordmark       { @apply text-fg font-semibold text-[1rem] leading-tight; }
+  .wordmark-sub   { @apply text-fg-1 text-[0.7rem] uppercase tracking-wider leading-tight; }
 }
 
 /* Tailwind utility escape hatches — for the handful of cases where a

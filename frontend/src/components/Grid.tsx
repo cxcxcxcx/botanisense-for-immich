@@ -8,16 +8,17 @@ import { Card } from './Card';
 import { Pagination } from './Pagination';
 
 // Photo-sort radio chips — live here (with the grid they sort) instead
-// of in the Toolbar (which sits on the cluster/taxon list view). Labels
-// use arrows so the direction is unambiguous; the matching `hint` is
-// rendered inline next to the active chip so users see what each sort
-// means without hovering for a tooltip.
-const SORT_OPTIONS: { value: SortMode; label: string; hint: string }[] = [
-  { value: 'rank',    label: 'default',    hint: 'order returned by the server (Immich rank)' },
-  { value: 'plantae', label: 'Plantae ↓',  hint: 'highest Plantae kingdom confidence first (green badge)' },
-  { value: 'score',   label: 'top-1 ↓',    hint: 'highest BioCLIP top-1 species score first (green chip)' },
-  { value: 'time',    label: 'newest ↓',   hint: 'newest EXIF capture time first (nulls last)' },
-  { value: 'added',   label: 'added ↓',    hint: 'newest first_seen_at first — most recently ingested into the DB (nulls last)' },
+// of in the Toolbar (which sits on the cluster/taxon list view).
+// Labels are written to be self-explanatory at a glance (no inline
+// tooltip / italic hint needed); a ⓘ button beside the chips opens a
+// modal with the full glossary for users who want the exact criteria
+// (see SortHelpButton below).
+const SORT_OPTIONS: { value: SortMode; label: string }[] = [
+  { value: 'rank',    label: 'Default order' },
+  { value: 'plantae', label: 'Plantae confidence ↓' },
+  { value: 'score',   label: 'ID confidence ↓' },
+  { value: 'time',    label: 'Capture date ↓' },
+  { value: 'added',   label: 'Date added ↓' },
 ];
 
 function sortRows(
@@ -131,7 +132,7 @@ export function Grid() {
 
   return (
     <div className="px-2 py-0">
-      <Breadcrumb
+      <ContextBar
         groupBy={filters.group_by}
         activeFilterLabel={activeFilterLabel}
         // Optional-chain `?.` only short-circuits the IMMEDIATE property
@@ -170,7 +171,13 @@ export function Grid() {
   );
 }
 
-interface BreadcrumbProps {
+// ContextBar — sits between the filter row and the photo grid.
+// Replaces the old slash-list breadcrumb. Layout: left side holds the
+// back link + current filter label + total count; right side holds the
+// sort <select> (styled to match the chip aesthetic) plus a <details>
+// disclosure with the full sort/filter glossary (replaces the old
+// modal-based help).
+interface ContextBarProps {
   groupBy: string;
   activeFilterLabel: string | null;
   total: number | null;
@@ -178,42 +185,102 @@ interface BreadcrumbProps {
   sort: SortMode;
   onSortChange: (s: SortMode) => void;
 }
-function Breadcrumb({ groupBy, activeFilterLabel, total, onBack, sort, onSortChange }: BreadcrumbProps) {
+function ContextBar({ groupBy, activeFilterLabel, total, onBack, sort, onSortChange }: ContextBarProps) {
   return (
-    <nav className="flex flex-wrap items-center gap-x-2 gap-y-1 py-1 pb-2.5 text-fg-0 text-[0.85rem]" aria-label="Photo grid context">
-      <button
-        type="button"
-        className="bg-transparent text-accent border-0 p-0 cursor-pointer hover:text-accent-hover hover:underline"
-        onClick={onBack}
-        title={`Clear ${groupBy} filter`}
-      >← back</button>
-      <span className="text-fg-3">·</span>
-      <span>
-        {activeFilterLabel
-          ? <><strong className="text-fg">{activeFilterLabel}</strong>{total != null && <> · <span className="tabular-nums">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>
-          : <>all photos{total != null && <> · <span className="tabular-nums">{total.toLocaleString()} asset{total === 1 ? '' : 's'}</span></>}</>}
-      </span>
-      <span className="text-fg-3">·</span>
-      <span className="inline-flex items-center gap-1">
-        <span className="text-fg-1">sort:</span>
-        {SORT_OPTIONS.map((s, i) => (
-          <span key={s.value} className="inline-flex items-center gap-1">
-            <button
-              type="button"
-              className={`bg-transparent border-0 p-0 cursor-pointer m-0 ${
-                sort === s.value ? 'text-[#5c93c0] font-medium' : 'text-fg-0 hover:text-fg'
-              }`}
-              onClick={() => onSortChange(s.value)}
-              title={s.hint}
-              aria-pressed={sort === s.value}
-            >{s.label}</button>
-            {i < SORT_OPTIONS.length - 1 && <span className="text-fg-3">/</span>}
-          </span>
-        ))}
-        <span className="text-fg-1 text-[0.75rem] italic ml-1">
-          {SORT_OPTIONS.find(o => o.value === sort)?.hint}
-        </span>
-      </span>
-    </nav>
+    <div className="px-2 pt-2">
+      <div className="context-bar">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          <button
+            type="button"
+            className="context-back"
+            onClick={onBack}
+            title={`Clear ${groupBy} filter`}
+          >← back</button>
+          <div className="flex flex-col min-w-0">
+            <strong className="truncate">
+              {activeFilterLabel ?? 'all photos'}
+            </strong>
+            {total != null && (
+              <span className="text-fg-1 text-[0.8rem] tabular-nums">
+                {total.toLocaleString()} asset{total === 1 ? '' : 's'}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-3 ml-auto">
+          <label className="flex items-center gap-2 text-[0.85rem]">
+            <span className="text-fg-1 uppercase tracking-wider text-[0.7rem]">Sort by</span>
+            <select
+              className="sort-select"
+              value={sort}
+              onChange={(e) => onSortChange(e.target.value as SortMode)}
+              aria-label="Sort photos"
+            >
+              {SORT_OPTIONS.map(o => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </label>
+          <details className="relative">
+            <summary
+              className="inline-flex items-center justify-center w-[18px] h-[18px] rounded-full border border-line2 bg-transparent text-fg-1 text-[11px] leading-none cursor-pointer hover:bg-bg-2 hover:border-accent hover:text-fg list-none"
+              title="What do the sort options and filters mean?"
+              aria-label="Show sort and filter help"
+            >ⓘ</summary>
+            <div className="absolute right-0 top-6 z-50 w-[min(420px,90vw)] p-4 rounded-lg border border-line2 bg-bg-1 shadow-lg text-[13px] leading-[1.45]">
+              <SortHelpBody />
+            </div>
+          </details>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Help body — same content the old SortHelpBody modal had. Lives
+// inside a <details> dropdown now (no modal needed). Plain <dl> for
+// readability; each item pairs the user-facing label with the exact
+// server-side criterion. Sections mirror the UI: sort options first,
+// then filter facets below.
+function SortHelpBody() {
+  return (
+    <div className="space-y-4">
+      <section>
+        <h4 className="m-0 mb-2 text-[#ad9] text-[0.95rem]">Sort criteria</h4>
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1.5 m-0">
+          <dt className="font-medium">Default order</dt>
+          <dd className="m-0 text-fg-1">Server's natural order — Immich rank, then cluster ID as tiebreak.</dd>
+          <dt className="font-medium">ID confidence ↓</dt>
+          <dd className="m-0 text-fg-1">Highest BioCLIP species identification confidence first (the green chip on each photo's top-1 prediction).</dd>
+          <dt className="font-medium">Plantae confidence ↓</dt>
+          <dd className="m-0 text-fg-1">Highest Plantae kingdom confidence first (the green badge).</dd>
+          <dt className="font-medium">Capture date ↓</dt>
+          <dd className="m-0 text-fg-1">Newest EXIF capture date first. Photos without a capture date sort last.</dd>
+          <dt className="font-medium">Date added ↓</dt>
+          <dd className="m-0 text-fg-1">Newest ingestion date first (when the asset was first indexed). Photos never ingested sort last.</dd>
+        </dl>
+      </section>
+
+      <section>
+        <h4 className="m-0 mb-2 text-[#ad9] text-[0.95rem]">Filters</h4>
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1.5 m-0">
+          <dt className="font-medium">Group by</dt>
+          <dd className="m-0 text-fg-1">Cluster / species / genus / family. Controls which list-view appears and which taxonomy chip is active.</dd>
+          <dt className="font-medium">Search</dt>
+          <dd className="m-0 text-fg-1">Narrows the cluster / taxonomy list by label substring. Doesn't affect the photo grid directly.</dd>
+          <dt className="font-medium">Plantae tier</dt>
+          <dd className="m-0 text-fg-1">
+            Narrows both the filter cards and the photo grid:
+            <span className="block">plants: Plantae ≥ 0.60</span>
+            <span className="block">uncertain: Plantae 0.35–0.60</span>
+            <span className="block">non-plants: Plantae &lt; 0.35</span>
+          </dd>
+          <dt className="font-medium">Person</dt>
+          <dd className="m-0 text-fg-1">
+            Narrows the photo grid by YOLO person detection. <em>any</em> includes unscanned; <em>has</em> / <em>no</em> exclude unscanned photos (we won't claim "no person" until we've actually looked).
+          </dd>
+        </dl>
+      </section>
+    </div>
   );
 }
