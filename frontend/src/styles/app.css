@@ -1,6 +1,8 @@
-/* Immich × BioCLIP — Tailwind 3 stylesheet.
-   Pico is gone (replaced by Tailwind utility classes). What lives
-   here now is only what utility classes can't easily express:
+/* BotaniSense for Immich — Tailwind 3 stylesheet.
+   The ML engine inside the app is BioCLIP-2 (not part of the
+   product name). Pico is gone — replaced by Tailwind utility classes.
+   What lives here now is only what utility classes can't easily
+   express:
      - @tailwind base reset (font, scrollbar, color-scheme)
      - @tailwind components (small reusable patterns like the plantae
        badge colors and KNN pill)

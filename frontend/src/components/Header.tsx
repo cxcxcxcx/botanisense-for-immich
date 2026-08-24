@@ -46,7 +46,7 @@ export function Header({ view }: Props) {
         </button>
       </div>
       <hgroup className="flex items-center gap-2 m-0">
-        <h1 className="m-0 text-[1.1rem]">Immich × BioCLIP</h1>
+        <h1 className="m-0 text-[1.1rem]">BotaniSense for Immich</h1>
       </hgroup>
       {/* KNN pill on Run view. The full StatusPanel lives in the Run
           page's main column (one instance total), not the sticky header —

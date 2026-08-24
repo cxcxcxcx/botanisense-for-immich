@@ -1,5 +1,14 @@
 # Development — how to run & refresh
 
+> **App name: BotaniSense for Immich.**
+> This repo's user-facing name is **BotaniSense for Immich** (see
+> `frontend/index.html` `<title>`, `Header.tsx`, `app.py` FastAPI title,
+> and `frontend/public/favicon.svg`). The ML engine inside the app is
+> **BioCLIP-2** — BioCLIP references in code, comments, and filenames
+> (`tol200m_bioclip2.faiss`, `bg-stage-bioclip`, etc.) describe the
+> model, not the app. Keep the two names distinct when reading or
+> editing this repo.
+
 This project runs as two servers during development. Knowing which one
 serves what is the difference between "my change showed up instantly"
 and "I've been staring at a stale bundle for an hour."

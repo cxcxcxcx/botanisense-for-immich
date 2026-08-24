@@ -1,4 +1,8 @@
-# Immich × BioCLIP — frontend
+# BotaniSense for Immich — frontend
+
+> App name: **BotaniSense for Immich**.
+> The ML engine inside it is BioCLIP-2 — don't confuse the two when
+> reading this README or `package.json` (name: `botanisense-for-immich-frontend`).
 
 React + Vite + TypeScript SPA. Talks to the FastAPI backend over JSON.
 
