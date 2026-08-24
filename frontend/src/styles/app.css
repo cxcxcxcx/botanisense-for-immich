@@ -233,6 +233,45 @@
   .modal-chip          { @apply px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition-all; }
   .modal-chip-active   { @apply bg-accent/15 border-accent/50 text-accent; }
   .modal-chip-inactive { @apply bg-bg-2 border-line text-fg-1 hover:border-[#3a3a3a]; }
+
+  /* Run page — outer container per the mock: max-w-3xl centered with
+     vertical stack of cards. */
+  .run-section         { @apply max-w-3xl mx-auto p-4 space-y-4 pb-12; }
+
+  /* Run-page card — bg-bg-1/50 + rounded-2xl + faint border per the
+     mock. `sm:p-5` pads a bit more on wider viewports. */
+  .run-card            { @apply bg-bg-1/50 border border-line2/80 rounded-2xl p-4 sm:p-5; }
+  .run-card-header     { @apply flex items-center justify-between mb-4; }
+  .run-card-title      { @apply font-semibold text-base flex items-center gap-2 m-0; }
+  .run-card-icon       { @apply w-4 h-4 text-accent shrink-0; }
+  .run-card-tag        { @apply text-[9px] text-fg-1 uppercase tracking-widest border border-line2 px-1.5 py-0.5 rounded; }
+  .run-card-edit-btn   { @apply text-[10px] text-fg-1 hover:text-fg transition-colors uppercase font-semibold tracking-wider bg-bg-2 px-2 py-1 rounded border border-line2; }
+
+  /* KNN warning alert — red-tinted card at the top of the Run page
+     when the KNN reference index is missing. */
+  .knn-alert           { @apply bg-red-500/10 border border-red-500/20 rounded-xl p-3 flex items-start gap-3; }
+  .knn-alert-icon      { @apply w-4 h-4 text-red-500 shrink-0 mt-0.5; }
+  .knn-alert-title     { @apply text-xs font-medium text-red-400 m-0; }
+  .knn-alert-body      { @apply text-[10px] text-red-500/70 mt-0.5 m-0; }
+
+  /* Run pipeline button — big emerald CTA per the mock. */
+  .run-pipeline-btn    { @apply w-full bg-accent hover:opacity-90 text-bg font-bold text-sm px-4 py-2.5 rounded-xl transition-all shadow-lg shadow-accent/10 flex items-center justify-center gap-2 disabled:opacity-50; }
+
+  /* Pipeline progress block — sits under the Run button. */
+  .run-progress        { @apply mt-4 space-y-2 bg-bg-2/50 p-3 rounded-lg border border-line2/50; }
+  .run-progress-meta   { @apply flex justify-between text-[10px] font-mono text-fg-1; }
+
+  /* Data tools buttons — 2-col grid per the mock, with icons. */
+  .data-tool-grid      { @apply grid grid-cols-1 sm:grid-cols-2 gap-2; }
+  .data-tool-btn       { @apply flex items-center gap-2 bg-bg-2 border border-line2/80 hover:bg-bg-1 text-xs px-3 py-2.5 rounded-xl transition-colors text-left; }
+  .data-tool-btn-danger { @apply bg-red-500/5 border border-red-500/20 hover:bg-red-500/10 text-red-400; }
+
+  /* Pipeline log terminal — dark monospace card with header strip and
+     scrollable body. */
+  .pipeline-log-card   { @apply bg-[#0c0c0e] border border-line2/80 rounded-2xl overflow-hidden font-mono text-[10px] leading-relaxed shadow-inner; }
+  .pipeline-log-header { @apply bg-bg-1/60 px-3 py-1.5 border-b border-line2/80 flex justify-between items-center; }
+  .pipeline-log-title  { @apply text-fg-1 font-sans font-semibold tracking-widest text-[9px]; }
+  .pipeline-log-body   { @apply p-3 h-40 overflow-y-auto text-fg-1 space-y-0.5; }
 }
 
 /* Tailwind utility escape hatches — for the handful of cases where a

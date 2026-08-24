@@ -46,22 +46,12 @@ export function LogTail({ active }: Props) {
   }, [lines]);
 
   return (
-    <section className="border border-line2 rounded-lg bg-bg-1 p-3">
-      <header className="flex items-center justify-between mb-2">
-        <h4 className="m-0 text-[12px] uppercase tracking-wide text-fg-1">
-          Pipeline log
-        </h4>
-        <small className="text-fg-1 font-mono text-[11px]">
-          {lines.length === 0 ? 'no lines yet' : `${lines.length} lines`}
-        </small>
-      </header>
-      <pre
-        ref={preRef}
-        data-testid="log-tail"
-        className="m-0 p-2 px-3 bg-[#0a0a0a] text-[#bcb] text-[11px]/[1.4] font-mono h-[30vh] min-h-[160px] overflow-auto whitespace-pre border border-[#2a2a2a] rounded"
-      >
-        {lines.length === 0 ? '(no log lines yet — run a pipeline to populate)' : lines.join('\n')}
-      </pre>
-    </section>
+    <pre
+      ref={preRef}
+      data-testid="log-tail"
+      className="m-0 p-2 px-3 bg-[#0c0c0e] text-[#bcb] text-[11px]/[1.4] font-mono overflow-auto whitespace-pre"
+    >
+      {lines.length === 0 ? '(no log lines yet — run a pipeline to populate)' : lines.join('\n')}
+    </pre>
   );
 }

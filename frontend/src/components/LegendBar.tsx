@@ -3,16 +3,10 @@
 // pull EXIF from Immich, purge assets that were removed from Immich,
 // reclassify the visible assets via KNN, and run a YOLO person scan.
 //
-// The previous version of this component also exposed the three
-// IMMICH-sync actions (Sync all clusters / Tag as Plants album /
-// Tag as Fungi album) and a Plantae confidence legend. Both moved:
-//   - the sync actions duplicate <ImmichSync /> and were removed
-//   - the Plantae legend is a Browse-view concern and would mislead
-//     users on the Run view, so it's gone
-//
-// Rendered as a section in the Run view's main column (not in the
-// sticky header) so it doesn't compete with the sync section for
-// visual space.
+// Styled per the mock's Run page: rounded-2xl outer card, header with
+// a Database icon + "Data tools" title + "Local DB" tag on the right,
+// and a 2-column grid of icon-prefixed action buttons below. The
+// destructive purge action uses the red-tinted button variant.
 
 import { useState } from 'react';
 import { useApp } from '../state/AppContext';
@@ -39,45 +33,124 @@ export function LegendBar() {
     }
   };
 
-  const btnCls =
-    'px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-[0.85rem] hover:bg-[#345] hover:border-accent disabled:opacity-50';
-  const btnDanger = 'text-red-300 border-[#5a3030] hover:bg-[#5a3030] hover:text-white hover:border-red-300';
-
   return (
-    <section className="border border-line2 rounded-lg bg-bg-1 p-4 flex flex-col gap-3 w-full">
-      <header className="flex items-center justify-between gap-2">
-        <h3 className="m-0 text-base">Data tools</h3>
-        <small className="text-fg-2">local DB maintenance — doesn't touch Immich</small>
+    <section className="run-card" aria-label="Data tools">
+      <header className="run-card-header">
+        <h3 className="run-card-title">
+          <DatabaseIcon />
+          Data tools
+        </h3>
+        <span className="run-card-tag">Local DB</span>
       </header>
-      <div className="flex flex-wrap gap-2">
+
+      <div className="data-tool-grid">
         <button
-          className={btnCls}
+          className="data-tool-btn"
           onClick={() => setKnnOpen(true)}
           title="Build the FAISS KNN index from TreeOfLife-200M parquet embeddings. Heavy: minutes-to-hours; logs stream into a tail viewer."
-        >🧠 Build KNN index</button>
+        >
+          <BrainIcon />
+          Build KNN index
+        </button>
         <button
-          className={btnCls}
+          className="data-tool-btn"
           onClick={() => setBackfillOpen(true)}
           title="Pull EXIF capture time + GPS from Immich for every asset that doesn't have it yet. ~30s for 17k assets."
-        >🕒 Backfill EXIF</button>
+        >
+          <ClockIcon />
+          Backfill EXIF
+        </button>
         <button
-          className={btnCls}
+          className="data-tool-btn"
           onClick={handleReclassifyVisible}
           title="Queue KNN reclassification for every asset currently visible in the browse grid."
-        >Reclassify visible with KNN</button>
+        >
+          <ActivityIcon />
+          Reclassify with KNN
+        </button>
         <button
-          className={btnCls}
+          className="data-tool-btn"
           onClick={handleDetectPeople}
           title="Run YOLO over every asset where has_person is unknown. No BioCLIP — fast relative to a full pipeline run. ~70 min for ~19k photos."
-        >👤 Detect people</button>
+        >
+          <UsersIcon />
+          Detect people
+        </button>
         <button
-          className={`${btnCls} ${btnDanger}`}
+          className="data-tool-btn data-tool-btn-danger sm:col-span-2"
           onClick={handlePurgeMissing}
           title="Scan Immich for assets missing from the server, then delete them from the local DB after confirmation."
-        >🗑 Purge assets deleted in Immich</button>
+        >
+          <TrashIcon />
+          Purge assets deleted in Immich
+        </button>
       </div>
+
       <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
       <BackfillExifModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
     </section>
+  );
+}
+
+// ---- icons (inline SVG; the codebase doesn't pull in lucide-react) ----
+
+function DatabaseIcon() {
+  return (
+    <svg className="run-card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <ellipse cx="12" cy="5" rx="9" ry="3" />
+      <path d="M3 5v14a9 3 0 0 0 18 0V5" />
+      <path d="M3 12a9 3 0 0 0 18 0" />
+    </svg>
+  );
+}
+
+function BrainIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-pink-400 shrink-0" aria-hidden="true">
+      <path d="M12 5a3 3 0 1 0-5.997.142 4 4 0 0 0-2.526 5.77 4 4 0 0 0 .556 6.588A4 4 0 0 0 12 18Z" />
+      <path d="M12 5a3 3 0 1 1 5.997.142 4 4 0 0 1 2.526 5.77 4 4 0 0 1-.556 6.588A4 4 0 0 1 12 18Z" />
+      <path d="M15 13a4.5 4.5 0 0 1-3-4 4.5 4.5 0 0 1-3 4" />
+      <path d="M17.6 9.8a3.5 3.5 0 0 0 0 4.4" />
+      <path d="M6.4 9.8a3.5 3.5 0 0 1 0 4.4" />
+    </svg>
+  );
+}
+
+function ClockIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-blue-400 shrink-0" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" />
+      <polyline points="12 6 12 12 16 14" />
+    </svg>
+  );
+}
+
+function ActivityIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-emerald-400 shrink-0" aria-hidden="true">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
+  );
+}
+
+function UsersIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="text-purple-400 shrink-0" aria-hidden="true">
+      <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+      <circle cx="9" cy="7" r="4" />
+      <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+      <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="shrink-0" aria-hidden="true">
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+      <line x1="10" y1="11" x2="10" y2="17" />
+      <line x1="14" y1="11" x2="14" y2="17" />
+    </svg>
   );
 }

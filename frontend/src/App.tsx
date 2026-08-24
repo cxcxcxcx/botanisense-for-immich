@@ -11,6 +11,7 @@ import { JobPanel } from './components/JobPanel';
 import { ImmichSync } from './components/ImmichSync';
 import { LegendBar } from './components/LegendBar';
 import { StatusPanel } from './components/StatusPanel';
+import { KnnAlert } from './components/KnnAlert';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -95,17 +96,37 @@ export function App() {
       <Header view={view} />
       <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-6' : ''}`}>
         {view === 'run' ? (
-          <section className="flex flex-col gap-4">
+          <section className="run-section">
             {/* Run-page sections, top-to-bottom:
-                  1. Pipeline run — query / sample size / batch + live progress
-                  2. Sync to IMMICH — clusters / Plantae / Fungi / Remove
-                  3. Data tools — KNN build / EXIF backfill / purge / detect people
-                  4. Logs — pipeline + worker output */}
-            <ParamsForm />
-            <StatusPanel />
+                  1. KNN warning — only when reference index is missing
+                  2. Pipeline run — params + Run button + live progress
+                  3. Sync to IMMICH — clusters / Plantae / Fungi / Remove
+                  4. Data tools — KNN build / EXIF backfill / purge / detect people
+                  5. Logs — pipeline + worker output */}
+            <KnnAlert />
+            <section className="run-card" aria-label="Pipeline">
+              <header className="run-card-header">
+                <h3 className="run-card-title">
+                  <PipelineIcon />
+                  Pipeline
+                </h3>
+              </header>
+              <ParamsForm />
+              <div className="mt-3">
+                <StatusPanel />
+              </div>
+            </section>
             <ImmichSync />
             <LegendBar />
-            <LogTail active={true} />
+            <section className="pipeline-log-card" aria-label="Pipeline log">
+              <header className="pipeline-log-header">
+                <span className="pipeline-log-title">PIPELINE LOG</span>
+                <span className="text-fg-2 font-sans text-[10px]">tail</span>
+              </header>
+              <div className="pipeline-log-body">
+                <LogTail active={true} />
+              </div>
+            </section>
           </section>
         ) : view === 'browse-content' ? (
           <>
@@ -125,5 +146,13 @@ export function App() {
       </Modal>
       <JobPanel />
     </>
+  );
+}
+
+function PipelineIcon() {
+  return (
+    <svg className="run-card-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="22 12 18 12 15 21 9 3 6 12 2 12" />
+    </svg>
   );
 }
