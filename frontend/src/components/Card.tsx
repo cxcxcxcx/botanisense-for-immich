@@ -19,15 +19,6 @@ export function Card({ row }: Props) {
   // is what gates visibility, not the confidence %.
   const tier = plantaeTier(plantaeScore);
   const hideOverlay = tier === 'red';
-  // Kingdom chips for green/yellow tiers only. Red tiers suppress the
-  // whole overlay per the user's "no need to show low conf plants"
-  // direction.
-  const kingdomChips = (hideOverlay || !row.taxon_scores)
-    ? []
-    : Object.entries(row.taxon_scores)
-        .filter(([k]) => k !== 'Plantae')
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 4);
 
   const handleOpen = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
@@ -60,11 +51,15 @@ export function Card({ row }: Props) {
           decoding="async"
           className="absolute inset-0 w-full h-full object-cover"
         />
-        {/* Bottom-of-photo overlay: tier swatch + species + confidence +
-            kingdom chips. Suppressed entirely for red-tier BioCLIP
-            results — those cards are intentionally low-info so the user
-            focuses on confident predictions. The gradient is kept so
-            the card still has a consistent baseline. */}
+        {/* Bottom-of-photo overlay: tier swatch + species + confidence.
+            Kingdom score chips (e.g. "Fungi 0%") were dropped — they're
+            noise at the card level since the Plantae tier swatch
+            already encodes kingdom confidence. Full kingdom breakdown
+            lives in the asset-detail modal for users who want it.
+            Suppressed entirely for red-tier BioCLIP results — those
+            cards are intentionally low-info so the user focuses on
+            confident predictions. The gradient is kept so the card
+            still has a consistent baseline. */}
         <div className="absolute left-0 right-0 bottom-0 px-2.5 pt-8 pb-3.5 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-1 pointer-events-none z-10">
           {!hideOverlay && fullTop1 && (
             <div className="flex justify-between items-baseline gap-2">
@@ -80,16 +75,6 @@ export function Card({ row }: Props) {
               <span className="font-mono font-semibold text-[12px]/[1] bg-accent-dark text-white py-0.5 px-1.5 rounded flex-shrink-0">
                 {formatPct(fullTop1.score)}
               </span>
-            </div>
-          )}
-          {kingdomChips.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {kingdomChips.map(([k, v]) => (
-                <span
-                  key={k}
-                  className="font-mono text-[10px] bg-white/10 text-fg-0 py-px px-1.5 rounded"
-                >{k} {(v * 100).toFixed(0)}%</span>
-              ))}
             </div>
           )}
         </div>
