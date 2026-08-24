@@ -13,7 +13,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
 import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
-import { useApp, useFilters, type GroupBy } from '../state/AppContext';
+import { useFilters, type GroupBy } from '../state/AppContext';
 import { useDebounce } from '../hooks/useDebounce';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { navigate, useRoute } from '../hooks/useRoute';
@@ -53,7 +53,6 @@ function readSort(g: GroupBy): CardSort {
 export function FilterCards() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
-  const { dispatch } = useApp();
   const debouncedQ = useDebounce(filters.q, 200);
   const view = useRoute();
 
@@ -62,8 +61,6 @@ export function FilterCards() {
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
   const [searchInput, setSearchInput] = useState(filters.q);
   const [filterModalOpen, setFilterModalOpen] = useState(false);
-  const [forceShow, setForceShow] = useState(false);
-  const COLLAPSE_KEY = (g: GroupBy) => `filtercards:collapsed:${g}`;
 
   useEffect(() => { setSortMode(readSort(filters.group_by)); }, [filters.group_by]);
   useEffect(() => { localStorage.setItem(SORT_KEY(filters.group_by), sortMode); }, [filters.group_by, sortMode]);
@@ -164,17 +161,6 @@ export function FilterCards() {
     return allCards.find(c => c.key === activeKey) ?? null;
   }, [activeKey, visibleCards, allCards]);
 
-  useEffect(() => { setForceShow(localStorage.getItem(COLLAPSE_KEY(filters.group_by)) === '1'); }, [filters.group_by]);
-  useEffect(() => { dispatch({ type: 'SET_FILTERS_COLLAPSED', collapsed: activeCard != null && !forceShow }); }, [activeCard, forceShow, dispatch]);
-
-  const toggleForceShow = () => {
-    const next = !forceShow;
-    setForceShow(next);
-    localStorage.setItem(COLLAPSE_KEY(filters.group_by), next ? '1' : '0');
-  };
-
-  const collapsed = activeCard != null && !forceShow;
-
   const activeParamKey: 'cluster_id' | 'species' | 'genus' | 'family' =
     filters.group_by === 'cluster' ? 'cluster_id'
     : filters.group_by === 'species' ? 'species'
@@ -206,9 +192,10 @@ export function FilterCards() {
 
   const filtersActive = filters.plantae != null || filters.has_person != null;
 
-  // On browse-content (photo grid) we only render the chrome —
-  // clusters don't make sense there. The sticky toolbar / quick bar
-  // / grid are Level-1 only.
+  // FilterCards is Level-1 only now (Toolbar mounts it on browse-list;
+  // Grid owns its own Filter button on browse-content). Kept the
+  // isPhotoView guard so this component is safe to mount on either
+  // view, even though current routing only mounts it on browse-list.
   const isPhotoView = view === 'browse-content';
 
   return (
@@ -272,21 +259,17 @@ export function FilterCards() {
                 ))}
               </div>
             </div>
-            {activeCard && (
-              <button
-                type="button"
-                onClick={toggleForceShow}
-                className="seg-chip seg-chip-inactive ml-auto"
-                title={forceShow ? 'Hide filter cards on the grid view' : 'Show filter cards on the grid view'}
-              >{forceShow ? 'hide on grid' : 'show on grid'}</button>
-            )}
           </div>
         </div>
       )}
 
-      {/* Cards grid only on browse-list. Hide entirely only when the
-          user explicitly collapsed an active card on browse-list. */}
-      {!isPhotoView && !collapsed && (
+      {/* Cards grid only on browse-list. Always renders on
+          browse-list — the prior `&& !collapsed` gate was hiding the
+          grid after navigating back from a cluster (race between
+          setFilters and navigate left `activeCard` set on first
+          paint). Now that FilterCards is Level-1 only, the cluster
+          grid should always be visible here. */}
+      {!isPhotoView && (
         <div className="p-3">
           <div className="count-line">
             <span>{visibleCards.length} of {allCards.length} cards</span>
@@ -323,12 +306,6 @@ export function FilterCards() {
         </div>
       )}
 
-      {/* Active-filter pill — only on browse-content when a card is
-          selected. Surfaces the "you've narrowed to X" state so the
-          user has a one-click path back to All without scrolling up
-          to the Level 1 toolbar. */}
-      {!isPhotoView && false /* keep prop consistent with the prior design — no active pill on browse-list */}
-
       <FilterModal open={filterModalOpen} onClose={() => setFilterModalOpen(false)} />
     </div>
   );
@@ -359,7 +336,7 @@ function ClusterCardTile({ card, active, pinned, onClick }: { card: Card; active
   return (
     <button
       type="button"
-      className={`cluster-card ${borderCls}`}
+      className={`cluster-card group ${borderCls}`}
       onClick={onClick}
       title={`${card.label} · ${card.count.toLocaleString()} asset${card.count === 1 ? '' : 's'}${pinned ? ' · click to clear' : ''}`}
     >

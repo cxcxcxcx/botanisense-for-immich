@@ -9,22 +9,17 @@ interface Props {
   onUpdated: (assetId: string) => void;
 }
 
-// Confidence pill tier — used to color the pill at the bottom-right of
-// each photo card. Mirrors the mock's two-tone scheme but adds an
-// explicit red tier for low-confidence BioCLIP results so the user can
-// spot them at a glance without expanding the card.
-function confidencePillClass(score: number | undefined): string {
-  if (score == null) return 'confidence-pill-yellow';
-  if (score >= 0.80) return 'confidence-pill-green';
-  if (score >= 0.35) return 'confidence-pill-yellow';
-  return 'confidence-pill-red';
-}
-
 export function Card({ row }: Props) {
   const { dispatch } = useApp();
 
   const fullTop1 = row.top_predictions[0];
-  const confidenceScore = fullTop1?.score;
+  const plantaeScore = row.taxon_scores?.Plantae;
+  // Per "no need to show low conf plants": red-tier BioCLIP results
+  // suppress the whole bottom overlay (species, tier swatch, conf
+  // pill) — the photo stands alone. Green/yellow tiers show the
+  // tier swatch + species name + confidence pill.
+  const tier = plantaeTier(plantaeScore);
+  const hideOverlay = tier === 'red';
 
   const handleOpen = (e: React.MouseEvent) => {
     const target = e.target as HTMLElement;
@@ -32,10 +27,6 @@ export function Card({ row }: Props) {
     dispatch({ type: 'OPEN_MODAL', assetId: row.asset_id });
   };
 
-  // Per the mock redesign: photo cards show ONLY the confidence pill
-  // — no species name, no tier swatch, no top badges. The species
-  // identity is implied by the active cluster/taxon filter; full
-  // kingdom + species detail lives in the asset-detail modal.
   return (
     <article
       id={`card-${row.asset_id}`}
@@ -49,28 +40,37 @@ export function Card({ row }: Props) {
         decoding="async"
         className="photo-card-image"
       />
-      {/* Bottom-right confidence pill. Color-coded by tier: emerald
-          for high (≥80%), amber for medium (35-80%), red for low
-          (<35% or null). The pill is the only overlay text on the
-          card — keeps the photo as the primary visual. */}
-      {confidenceScore != null && (
-        <div className="photo-card-overlay">
-          <span
-            className={`confidence-pill ${confidencePillClass(confidenceScore)}`}
-            title={
-              fullTop1
-                ? `${fullTop1.species} · ${formatPct(confidenceScore)}`
-                : `confidence ${formatPct(confidenceScore)}`
-            }
-          >
-            {formatPct(confidenceScore)}
-          </span>
-        </div>
-      )}
+      {/* Bottom overlay: tier swatch + species name (wraps to 2 lines
+          so long binomials aren't truncated) + confidence pill on
+          the right. Suppressed entirely for red-tier BioCLIP results
+          so low-confidence predictions don't crowd the grid. */}
+      <div className="photo-card-overlay">
+        {!hideOverlay && fullTop1 && (
+          <div className="flex items-end justify-between gap-2 w-full">
+            <span className="inline-flex items-start gap-1.5 min-w-0 flex-1">
+              <span
+                className={`tier-dot tier-dot-${tier} mt-1.5 shrink-0`}
+                aria-hidden="true"
+              />
+              <span
+                className="italic font-semibold text-[13px]/[1.2] drop-shadow break-words line-clamp-2"
+                title={fullTop1.species}
+              >
+                {fullTop1.species}
+              </span>
+            </span>
+            <span
+              className="font-mono font-semibold text-[12px]/[1] bg-accent-dark text-white py-0.5 px-1.5 rounded shrink-0 backdrop-blur-sm"
+              title={`${fullTop1.species} · ${formatPct(fullTop1.score)}`}
+            >
+              {formatPct(fullTop1.score)}
+            </span>
+          </div>
+        )}
+      </div>
       {/* Near-dup strip — kept from the prior design so the user can
           reach hidden burst-shot siblings from the grid. Renders
-          below the photo at the card's bottom edge; the photo area
-          stays square (the strip adds height below the 1:1 frame). */}
+          below the photo at the card's bottom edge. */}
       {row.near_dups && row.near_dups.length > 0 && (
         <div className="flex flex-wrap gap-1 p-1 bg-bg-1 border-t border-line2">
           {row.near_dups.slice(0, 6).map((sib) => (
@@ -100,11 +100,6 @@ export function Card({ row }: Props) {
           )}
         </div>
       )}
-      {/* suppress unused-var lint for plantaeTier (still imported by
-          other code paths and the lib module) — declared but not
-          referenced here because the mock dropped the per-card tier
-          swatch. */}
-      {void plantaeTier}
     </article>
   );
 }
