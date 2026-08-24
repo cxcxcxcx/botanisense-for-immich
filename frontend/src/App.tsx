@@ -3,7 +3,6 @@ import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
-import { FilterCards } from './components/FilterCards';
 import { Modal } from './components/Modal';
 import { AssetDetail } from './components/AssetDetail';
 import { ParamsForm } from './components/ParamsForm';
@@ -111,7 +110,6 @@ export function App() {
         ) : view === 'browse-content' ? (
           <>
             <ClusterAlbumBar />
-            <FilterCards />
             <Grid />
           </>
         ) : (

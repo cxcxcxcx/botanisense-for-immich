@@ -131,6 +131,108 @@
   .brand-mark     { @apply w-7 h-7 shrink-0; }
   .wordmark       { @apply text-fg font-semibold text-[1rem] leading-tight; }
   .wordmark-sub   { @apply text-fg-1 text-[0.7rem] uppercase tracking-wider leading-tight; }
+
+  /* Brand circle — wraps the fan-of-blades brand mark in the
+     emerald-cyan gradient ring from the mock. */
+  .brand-circle   { @apply p-1 bg-gradient-to-br from-emerald-400 to-cyan-500 rounded-lg shadow-sm; }
+
+  /* "FOR IMMICH" tag — small uppercase pill next to the wordmark. */
+  .brand-tag      { @apply text-[9px] font-bold text-fg-1 uppercase tracking-widest bg-bg-1 border border-line2 px-1 py-0.5 rounded ml-0.5; }
+
+  /* Tab button (icon + label) — used by the Browse/Run tab strip in
+     the header. Active = bg-bg-1 text-accent; inactive = text-fg-0. */
+  .tab-button          { @apply flex items-center gap-1.5 px-2.5 sm:px-3 py-1.5 rounded-md text-[0.8rem] sm:text-xs font-medium transition-all; }
+  .tab-button-active   { @apply bg-bg-1 text-accent shadow-sm; }
+  .tab-button-inactive { @apply bg-transparent text-fg-1 hover:text-fg; }
+
+  /* Sticky toolbar — sits at the top of the browse list. Two rows:
+     search + filter-trigger on row 1, quick-bar (group + sort) on
+     row 2. Sticky so it stays visible while the cluster grid scrolls. */
+  .sticky-toolbar   { @apply sticky top-0 z-10 bg-bg/95 backdrop-blur-md border-b border-line; }
+  .sticky-toolbar-pad { @apply p-3 pb-2 flex gap-2; }
+
+  /* Search pill — search input inside the sticky toolbar. Rounded-xl
+     per the mock. */
+  .search-pill      { @apply relative flex-1; }
+  .search-pill-input { @apply w-full bg-bg-1/50 border border-line2 rounded-xl py-2 pl-9 pr-4 text-sm focus:outline-none focus:border-accent/50 transition-colors placeholder:text-fg-2; }
+  .search-pill-icon  { @apply absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-fg-1; }
+
+  /* Filter trigger button — the w-10 h-10 icon button next to the
+     search pill. Shows a small emerald dot in the top-right corner
+     when any filter is active. */
+  .filter-trigger       { @apply relative flex items-center justify-center w-10 h-10 bg-bg-1/50 border border-line2 rounded-xl text-fg-1 hover:text-fg hover:bg-bg-2 transition-colors shrink-0; }
+  .filter-trigger-dot   { @apply absolute top-2.5 right-2.5 w-1.5 h-1.5 bg-accent rounded-full shadow-[0_0_4px_rgba(92,192,120,0.5)]; }
+
+  /* Quick bar — horizontal scroll row of segmented controls below
+     the search row. Contains Group + Sort segmented groups with a
+     vertical divider between them. */
+  .quick-bar        { @apply px-3 pb-3 flex items-center gap-4 overflow-x-auto whitespace-nowrap; }
+  .quick-bar-divider { @apply w-px h-4 bg-line shrink-0; }
+  .quick-bar-label  { @apply text-[10px] font-semibold text-fg-1 uppercase tracking-wider; }
+  .quick-bar-group  { @apply flex bg-bg-1/50 rounded-lg p-0.5 border border-line2; }
+
+  /* Segmented chip — used inside .quick-bar-group. Matches the mock's
+     compact segmented control: rounded-md, active = bg-bg-1 text-accent. */
+  .seg-chip          { @apply px-2.5 sm:px-3 py-1 rounded-md text-xs font-medium transition-colors; }
+  .seg-chip-active   { @apply bg-bg-1 text-accent; }
+  .seg-chip-inactive { @apply text-fg-1 hover:text-fg; }
+
+  /* Count line — sits between the quick bar and the cluster grid. */
+  .count-line        { @apply flex items-center justify-between mb-3 px-1 text-[10px] text-fg-1 uppercase tracking-widest font-semibold; }
+
+  /* Cluster grid — wraps the level-1 cards. */
+  .cluster-grid      { @apply grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-2 sm:gap-3; }
+
+  /* Cluster card — aspect-square, rounded-xl, image fills card with
+     gradient overlay. Bottom-left label + count. */
+  .cluster-card      { @apply relative aspect-square rounded-xl overflow-hidden cursor-pointer border border-line2 bg-bg-2 transition-colors hover:border-accent; }
+  .cluster-card-all  { @apply border-accent/30 bg-accent/10; }
+  .cluster-card-overlay { @apply absolute inset-0 bg-gradient-to-t from-bg/95 via-bg/40 to-transparent pointer-events-none; }
+  .cluster-card-label  { @apply font-medium text-sm leading-tight truncate; }
+  .cluster-card-name   { @apply text-fg italic; }
+  .cluster-card-name-all { @apply text-accent not-italic; }
+  .cluster-card-count  { @apply text-[10px] text-fg-1 mt-0.5; }
+
+  /* Back-bar — sticky top bar on Level 2 (photo grid). Back button
+     left, cluster/taxon name + count centered, sort dropdown right. */
+  .back-bar          { @apply sticky top-0 z-10 bg-bg/90 backdrop-blur-md border-b border-line px-2 py-2 flex items-center justify-between gap-2; }
+  .back-bar-back     { @apply flex items-center gap-1 px-2 py-1.5 rounded-lg text-fg-1 hover:bg-bg-1 hover:text-fg transition-colors; }
+  .back-bar-title    { @apply text-center flex-1 min-w-0; }
+  .back-bar-name     { @apply text-sm font-semibold italic text-fg truncate; }
+  .back-bar-count    { @apply text-[10px] text-fg-1; }
+
+  /* Photo card — aspect-square, rounded-lg (sm+), only a confidence
+     pill at the bottom-right corner. No species name, no tier
+     swatch, no top badges. */
+  .photo-card          { @apply relative aspect-square bg-bg-2 sm:rounded-lg overflow-hidden cursor-pointer; }
+  .photo-card-image    { @apply w-full h-full object-cover; }
+  .photo-card-overlay  { @apply absolute bottom-0 inset-x-0 p-2 bg-gradient-to-t from-black/90 to-transparent flex justify-end pointer-events-none; }
+  .confidence-pill       { @apply text-[10px] font-bold px-1.5 py-0.5 rounded backdrop-blur-sm tabular-nums; }
+  .confidence-pill-green  { @apply bg-accent/20 text-accent; }
+  .confidence-pill-yellow { @apply bg-[#e8c45c]/20 text-[#e8c45c]; }
+  .confidence-pill-red    { @apply bg-[#a35]/30 text-[#d97878]; }
+
+  /* Filter modal — bottom-sheet on mobile, centered card on sm+. */
+  .filter-modal-overlay { @apply fixed inset-0 z-50 flex items-end sm:items-center justify-center; }
+  .filter-modal-backdrop { @apply absolute inset-0 bg-black/60 backdrop-blur-sm; }
+  .filter-modal-card     { @apply relative w-full max-w-sm bg-bg-1 rounded-t-2xl sm:rounded-2xl shadow-2xl border border-line overflow-hidden; }
+  .filter-modal-header   { @apply p-4 border-b border-line flex justify-between items-center bg-bg-1/50; }
+  .filter-modal-title    { @apply font-semibold text-fg flex items-center gap-2; }
+  .filter-modal-close    { @apply p-1 rounded-lg text-fg-1 hover:text-fg hover:bg-bg-2 transition-colors; }
+  .filter-modal-body     { @apply p-5 space-y-6; }
+  .filter-modal-section  { @apply space-y-3; }
+  .filter-modal-section-label { @apply text-xs font-semibold text-fg-1 uppercase tracking-wider; }
+  .filter-modal-chips    { @apply flex flex-wrap gap-2; }
+  .filter-modal-footer   { @apply p-4 bg-bg-2/50 border-t border-line flex justify-end gap-3; }
+  .filter-modal-clear    { @apply px-4 py-2 text-xs font-medium text-fg-1 hover:text-fg transition-colors; }
+  .filter-modal-apply    { @apply px-4 py-2 bg-accent hover:opacity-90 text-bg text-xs font-bold rounded-lg transition-colors; }
+
+  /* Modal chip — used inside the filter modal. Inactive = bg-bg-2
+     border-line text-fg-1; active = bg-accent/15 border-accent/50
+     text-accent with a subtle glow. */
+  .modal-chip          { @apply px-3 py-1.5 rounded-lg text-xs font-medium border flex items-center gap-1.5 transition-all; }
+  .modal-chip-active   { @apply bg-accent/15 border-accent/50 text-accent; }
+  .modal-chip-inactive { @apply bg-bg-2 border-line text-fg-1 hover:border-[#3a3a3a]; }
 }
 
 /* Tailwind utility escape hatches — for the handful of cases where a
