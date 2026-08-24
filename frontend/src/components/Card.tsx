@@ -62,13 +62,22 @@ export function Card({ row }: Props) {
             still has a consistent baseline. */}
         <div className="absolute left-0 right-0 bottom-0 px-2.5 pt-8 pb-3.5 bg-gradient-to-b from-transparent to-black/85 text-fg flex flex-col gap-1 pointer-events-none z-10">
           {!hideOverlay && fullTop1 && (
-            <div className="flex justify-between items-baseline gap-2">
-              <span className="inline-flex items-center gap-1.5 min-w-0">
+            // Species name wraps up to 2 lines so long binomials
+            // (e.g. "Magnolia liliiflora", "Rosa canina subsp.
+            // lutetiana") aren't truncated with ellipsis. Confidence
+            // pill stays on the right of the FIRST line; if the name
+            // wraps, the second line is full-width. `title` exposes
+            // the full name on hover for anything longer than 2 lines.
+            <div className="flex justify-between items-start gap-2">
+              <span className="inline-flex items-start gap-1.5 min-w-0 flex-1">
                 <span
-                  className={`tier-dot tier-dot-${tier}`}
+                  className={`tier-dot tier-dot-${tier} mt-1.5`}
                   aria-hidden="true"
                 />
-                <span className="italic font-semibold text-[13px]/[1.2] drop-shadow overflow-hidden text-ellipsis whitespace-nowrap">
+                <span
+                  className="italic font-semibold text-[13px]/[1.2] drop-shadow break-words line-clamp-2"
+                  title={fullTop1.species}
+                >
                   {fullTop1.species}
                 </span>
               </span>
