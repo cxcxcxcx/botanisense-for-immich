@@ -1,14 +1,16 @@
 // FilterCards — Level 1 of the two-level browse layout.
-//   • sticky toolbar at the top: search pill + filter-trigger button
-//   • quick bar below: Group + Sort segmented controls (horizontal
-//     scroll on overflow)
+//   • sticky toolbar at the top: search pill only
+//   • quick bar below: Group segmented control + Sort menu
 //   • count line
 //   • cluster/taxon grid (square cards, rounded-xl per the mock)
 //
-// Plantae tier and Person filters moved into FilterModal.tsx —
-// triggered by the filter-trigger button. Plantae tier stays in scope
-// here so the cluster / taxonomy counts are filtered server-side
-// (they're a backend parameter on /api/results and /api/clusters).
+// Plantae tier + Person filters are NOT surfaced on Level 1 — the
+// Filter trigger button was removed because the chips + button
+// combination looked unused and the URL params alone provide enough
+// filtering for the cluster list. The same filters stay reachable
+// from Level 2 via Grid.tsx's back-bar (same FilterModal component).
+// Plantae tier stays in scope here so /api/clusters is server-side
+// filtered when the user arrives on Level 1 with plantae= in the URL.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
@@ -18,7 +20,6 @@ import { useDebounce } from '../hooks/useDebounce';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { navigate, useRoute } from '../hooks/useRoute';
 import { thumbUrl } from '../lib/thumb';
-import { FilterModal } from './FilterModal';
 
 export type CardSort = 'alpha' | 'size' | 'id' | 'latest';
 const SORTS: { value: CardSort; label: string }[] = [
@@ -59,7 +60,6 @@ export function FilterCards() {
   const [resultsData, setResultsData] = useState<ResultsResponse | null>(null);
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
   const [searchInput, setSearchInput] = useState(filters.q);
-  const [filterModalOpen, setFilterModalOpen] = useState(false);
 
   // Debounce the LOCAL input (not the URL-derived filters.q) so the
   // input stays responsive while typing. The previous version
@@ -204,8 +204,6 @@ export function FilterCards() {
     (filters.group_by === 'cluster' && !clusterData) ||
     (filters.group_by !== 'cluster' && !resultsData);
 
-  const filtersActive = filters.plantae != null || filters.has_person != null;
-
   // FilterCards is Level-1 only now (Toolbar mounts it on browse-list;
   // Grid owns its own Filter button on browse-content). Kept the
   // isPhotoView guard so this component is safe to mount on either
@@ -216,7 +214,12 @@ export function FilterCards() {
     <div className={isPhotoView ? '' : 'flex flex-col'}>
       {!isPhotoView && (
         <div className="sticky-toolbar">
-          {/* Row 1: search pill + filter trigger. */}
+          {/* Row 1: search pill only on Level 1.
+              The Filter trigger button was removed — the Plantae /
+              Person filters are still reachable from Level 2's
+              back-bar (Grid.tsx mounts the same FilterModal). The
+              URL params persist, so server-side counts and taxonomy
+              stays correctly filtered. */}
           <div className="sticky-toolbar-pad">
             <div className="search-pill">
               <SearchIcon />
@@ -230,16 +233,6 @@ export function FilterCards() {
                 title="Hide cards whose label doesn't match (sub-filter; doesn't change the active filter)"
               />
             </div>
-            <button
-              type="button"
-              onClick={() => setFilterModalOpen(true)}
-              className="filter-trigger"
-              title="Open filters"
-              aria-label="Open filters"
-            >
-              <FilterIcon />
-              {filtersActive && <span className="filter-trigger-dot" aria-hidden="true" />}
-            </button>
           </div>
 
           {/* Row 2: quick bar.
@@ -324,8 +317,6 @@ export function FilterCards() {
           </div>
         </div>
       )}
-
-      <FilterModal open={filterModalOpen} onClose={() => setFilterModalOpen(false)} />
     </div>
   );
 }
@@ -398,14 +389,6 @@ function SearchIcon() {
     <svg className="search-pill-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <circle cx="11" cy="11" r="7" />
       <path d="m21 21-4.3-4.3" />
-    </svg>
-  );
-}
-
-function FilterIcon() {
-  return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-      <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
     </svg>
   );
 }
