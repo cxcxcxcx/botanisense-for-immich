@@ -1,4 +1,3 @@
-import { KnnPill } from './KnnPill';
 import { navigate, topLevel, type View } from '../hooks/useRoute';
 import { useApp } from '../state/AppContext';
 
@@ -65,9 +64,9 @@ export function Header({ view }: Props) {
         </span>
       </a>
 
-      {/* Right-side group: tab strip + (Run view only) KnnPill.
-          `ml-auto` pushes the whole group to the right edge of the
-          header so the tabs sit flush right, not centered. */}
+      {/* Right-side group: tab strip only.
+          The KNN-unavailable indicator lives in the Run page (KnnAlert
+          banner at the top), not here — keeping the header simple. */}
       <div className="flex items-center gap-2 ml-auto">
         <div className="inline-flex gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
           <button
@@ -89,7 +88,6 @@ export function Header({ view }: Props) {
             <span className="hidden sm:inline">Run / Sync</span>
           </button>
         </div>
-        {active === 'run' && <KnnPill />}
       </div>
     </header>
   );
