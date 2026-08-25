@@ -289,7 +289,7 @@ export function FilterCards() {
           paint). Now that FilterCards is Level-1 only, the cluster
           grid should always be visible here. */}
       {!isPhotoView && (
-        <div className="p-3">
+        <div className="p-2 sm:p-3">
           <div className="count-line">
             <span>{visibleCards.length} of {allCards.length} cards</span>
           </div>

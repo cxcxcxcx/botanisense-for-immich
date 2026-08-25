@@ -16,7 +16,7 @@ export function Toolbar() {
   if (collapsed) return null;
 
   return (
-    <section className="flex flex-col gap-2 py-2 px-4 border-b border-line2">
+    <section className="flex flex-col gap-2 py-2 sm:px-4 border-b border-line2">
       <FilterCards />
     </section>
   );

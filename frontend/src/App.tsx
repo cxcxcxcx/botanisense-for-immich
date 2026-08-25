@@ -94,7 +94,7 @@ export function App() {
   return (
     <>
       <Header view={view} />
-      <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-6' : ''}`}>
+      <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-3 sm:px-6' : ''}`}>
         {view === 'run' ? (
           <section className="run-section">
             {/* Run-page sections, top-to-bottom:
