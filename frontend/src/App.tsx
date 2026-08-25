@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
@@ -21,6 +21,9 @@ export function App() {
   const modal = useModal();
   const filters = useFilters();
   const view = useRoute();
+  // Hoisted to the App so the "Edit params" toggle sits in the
+  // Pipeline card header (per the mock) instead of inside the form.
+  const [paramsOpen, setParamsOpen] = useState(false);
 
   // Whether the current URL filters narrow to a specific subset of
   // assets. This is the trigger for switching from the list view
@@ -110,8 +113,16 @@ export function App() {
                   <PipelineIcon />
                   Pipeline
                 </h3>
+                <button
+                  type="button"
+                  className="run-card-edit-btn"
+                  onClick={() => setParamsOpen(o => !o)}
+                  aria-expanded={paramsOpen}
+                >
+                  {paramsOpen ? 'Hide params' : 'Edit params'}
+                </button>
               </header>
-              <ParamsForm />
+              <ParamsForm paramsOpen={paramsOpen} />
               <div className="mt-3">
                 <StatusPanel />
               </div>

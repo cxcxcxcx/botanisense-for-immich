@@ -1,8 +1,13 @@
-// Run-page "Pipeline" section. The four pipeline params (query,
+// Run-page "Pipeline" form. The four pipeline params (query,
 // n_samples, top_k, batch_size) are collapsed by default — most users
 // just want "run with server defaults". Unfolding the disclosure
 // reveals the fields; the Run button always works and uses server
 // defaults for any field left blank.
+//
+// The disclosure state lives in the parent (App.tsx Run section) so
+// the toggle button can sit in the outer Pipeline card header —
+// matching the mock's card layout where the "Edit params" button is
+// in the header next to the title.
 //
 // The Run button's visual state tracks the actual pipeline run via
 // the SSE stream — when /api/events reports status="running" the
@@ -10,10 +15,6 @@
 // (status="done") it reverts to "Run pipeline". Tracking a local
 // `busy` boolean during the click was useless because /api/run
 // returns immediately (the child runs in the background).
-//
-// The previous version had a separate "Refresh (server defaults)"
-// button, which was confusing (it did exactly what Run does when all
-// fields are blank). It's gone.
 
 import { useEffect, useRef, useState } from 'react';
 import { runPipeline } from '../api/endpoints';
@@ -58,12 +59,18 @@ const FIELDS: Record<string, FieldHelp> = {
   },
 };
 
-export function ParamsForm() {
+interface Props {
+  /** When true, render the full set of param fields. When false, just
+   *  show the Run button (uses server defaults). The parent owns the
+   *  toggle so the toggle button can sit in the outer card header. */
+  paramsOpen: boolean;
+}
+
+export function ParamsForm({ paramsOpen }: Props) {
   const [query, setQuery] = useState('');
   const [n, setN] = useState('');
   const [topK, setTopK] = useState('');
   const [batch, setBatch] = useState('');
-  const [paramsOpen, setParamsOpen] = useState(false);
   // Subscribe to the SSE pipeline status so the button reflects the
   // actual run state, not just "click is being processed".
   const { data: snapshot } = useEventStream<EventSnapshot>('/api/events');
@@ -137,19 +144,7 @@ export function ParamsForm() {
     'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent';
 
   return (
-    <form onSubmit={handleRun} className="border border-line2 rounded-lg bg-bg-1 p-4 flex flex-col gap-3 w-full">
-      <header className="flex items-center justify-between gap-2">
-        <h3 className="m-0 text-base">Pipeline</h3>
-        <button
-          type="button"
-          className="text-fg-1 hover:text-fg text-sm"
-          onClick={() => setParamsOpen(o => !o)}
-          aria-expanded={paramsOpen}
-        >
-          {paramsOpen ? '▼ Hide params' : '▸ Edit params'}
-        </button>
-      </header>
-
+    <form onSubmit={handleRun} className="flex flex-col gap-3 w-full">
       {/* Single Run button — uses server defaults unless the user has
           unfolded the params and edited a field. Blank fields = server
           default, so the collapsed state is fully functional. The
@@ -159,12 +154,11 @@ export function ParamsForm() {
         <button
           type="submit"
           disabled={busy}
-          className="px-3 py-1.5 min-w-[100px] rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover disabled:opacity-50"
+          className="run-pipeline-btn"
         >
-          {busy ? 'Running…' : 'Run pipeline'}
+          <PlayIcon />
+          {busy ? 'Running…' : 'Run Pipeline'}
         </button>
-        {/* Live status is in the StatusPanel below — no second
-            indicator here. */}
       </div>
 
       {paramsOpen && (
@@ -236,5 +230,13 @@ export function ParamsForm() {
         </fieldset>
       )}
     </form>
+  );
+}
+
+function PlayIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <polygon points="6 4 20 12 6 20" />
+    </svg>
   );
 }

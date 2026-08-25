@@ -33,16 +33,20 @@ import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 import { Modal } from './Modal';
 
-// ---------- people-filter radio -------------------------------------------
+// ---------- people-filter chip group ---------------------------------------
+// Per the mock: each rule row has a 3-button segmented control
+// (Any / Without people / With people) that spans the full width of
+// the section. Replaces the older radio-button row which felt less
+// like an "options" picker and more like a form field.
 
 type PeopleFilter = 0 | 1 | null;
-const PEOPLE_LABELS: { value: PeopleFilter; label: string }[] = [
+const PEOPLE_OPTS: { value: PeopleFilter; label: string }[] = [
   { value: null, label: 'Any' },
-  { value: 0, label: 'Without people' },
-  { value: 1, label: 'With people' },
+  { value: 0,    label: 'Without people' },
+  { value: 1,    label: 'With people' },
 ];
 
-function PeopleFilterRadio({
+function PeopleFilterChips({
   value,
   onChange,
 }: {
@@ -50,20 +54,22 @@ function PeopleFilterRadio({
   onChange: (v: PeopleFilter) => void;
 }) {
   return (
-    <span className="inline-flex gap-3 text-[0.78rem]">
-      {PEOPLE_LABELS.map(opt => (
-        <label key={String(opt.value)} className="inline-flex items-center gap-1.5 cursor-pointer">
-          <input
-            type="radio"
-            name={`people-filter-${Math.random()}`}
-            checked={value === opt.value}
-            onChange={() => onChange(opt.value)}
-            className="accent-accent"
-          />
+    <div className="flex bg-bg-2 p-1 rounded-lg border border-line2/50" role="radiogroup" aria-label="People filter">
+      {PEOPLE_OPTS.map(opt => (
+        <button
+          key={String(opt.value)}
+          type="button"
+          role="radio"
+          aria-checked={value === opt.value}
+          onClick={() => onChange(opt.value)}
+          className={`flex-1 py-1.5 text-[10px] font-medium rounded-md transition-all ${
+            value === opt.value ? 'bg-bg-1 text-fg' : 'text-fg-1 hover:text-fg-0'
+          }`}
+        >
           {opt.label}
-        </label>
+        </button>
       ))}
-    </span>
+    </div>
   );
 }
 
@@ -589,7 +595,13 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
   );
 }
 
-// ---------- SlotRow: one row of the Defaults panel -----------------------
+// ---------- SlotRow: one rule in the Defaults panel ----------------------
+// Per the mock: each rule is laid out as two stacked rows.
+//   • Top row: rule label on the left, "score ≥" threshold on the right.
+//     Only the Plantae / Fungi rules have a score; clusters / sync-all
+//     just have the people filter.
+//   • Bottom row: full-width segmented chip group (Any / Without people
+//     / With people).
 
 function SlotRow({
   label, showScore, score, people, onScore, onPeople,
@@ -602,23 +614,25 @@ function SlotRow({
   onPeople: (v: PeopleFilter) => void;
 }) {
   return (
-    <div className="flex flex-wrap items-center gap-3 text-[0.8rem]">
-      <span className="text-fg-1 w-[140px] flex-shrink-0">{label}</span>
-      <PeopleFilterRadio value={people} onChange={onPeople} />
-      {showScore && score != null && onScore && (
-        <label className="inline-flex items-center gap-1.5">
-          <span className="text-fg-2">score ≥</span>
-          <input
-            type="number"
-            className="bg-bg-2 text-fg border border-line2 px-1.5 py-0.5 rounded w-[80px] text-[0.8rem] font-mono focus:outline-none focus:border-accent"
-            value={score}
-            min={0}
-            max={1}
-            step={0.05}
-            onChange={e => onScore(Number(e.target.value))}
-          />
-        </label>
-      )}
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-fg">{label}</span>
+        {showScore && score != null && onScore && (
+          <label className="inline-flex items-center gap-1.5">
+            <span className="text-[10px] text-fg-1">score ≥</span>
+            <input
+              type="number"
+              className="w-12 bg-bg-2 border border-line2 rounded text-center text-xs py-0.5 text-fg focus:outline-none focus:border-accent font-mono"
+              value={score}
+              min={0}
+              max={1}
+              step={0.05}
+              onChange={e => onScore(Number(e.target.value))}
+            />
+          </label>
+        )}
+      </div>
+      <PeopleFilterChips value={people} onChange={onPeople} />
     </div>
   );
 }
@@ -717,9 +731,9 @@ function ConfirmModal(props: {
                   ? 'Preview unavailable — see server response after click.'
                   : `Will tag ${previewCount.toLocaleString()} photo${previewCount === 1 ? '' : 's'}.`}
             </p>
-            <div className="flex flex-col gap-1.5 border border-[#222] rounded p-2">
+            <div className="flex flex-col gap-1.5">
               <span className="text-fg-2 text-[0.78rem]">Membership</span>
-              <PeopleFilterRadio value={overridePeople} onChange={setOverridePeople} />
+              <PeopleFilterChips value={overridePeople} onChange={setOverridePeople} />
             </div>
             {showScore && (
               <label className="inline-flex items-center gap-1.5">
