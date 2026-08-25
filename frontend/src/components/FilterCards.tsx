@@ -53,7 +53,6 @@ function readSort(g: GroupBy): CardSort {
 export function FilterCards() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
-  const debouncedQ = useDebounce(filters.q, 200);
   const view = useRoute();
 
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
@@ -62,17 +61,32 @@ export function FilterCards() {
   const [searchInput, setSearchInput] = useState(filters.q);
   const [filterModalOpen, setFilterModalOpen] = useState(false);
 
+  // Debounce the LOCAL input (not the URL-derived filters.q) so the
+  // input stays responsive while typing. The previous version
+  // debounced filters.q, which meant typing updated the local input
+  // but never pushed back to the URL — so the search filter looked
+  // stuck at whatever value the URL had when the page loaded.
+  const debouncedSearch = useDebounce(searchInput, 200);
+
   useEffect(() => { setSortMode(readSort(filters.group_by)); }, [filters.group_by]);
   useEffect(() => { localStorage.setItem(SORT_KEY(filters.group_by), sortMode); }, [filters.group_by, sortMode]);
-  useEffect(() => { setSearchInput(filters.q); }, [filters.q]);
 
-  // Push search into the URL once the user stops typing. Local state
-  // mirrors the input so typing is responsive; debouncing here avoids
-  // hammering the URL on every keystroke.
+  // Sync the local input when the URL changes externally (back/forward,
+  // a deep-link, or another component). Don't clobber a user keystroke
+  // mid-edit — only mirror when the URL value actually differs.
   useEffect(() => {
-    if (debouncedQ !== filters.q) setFilters({ q: debouncedQ, page: 0 });
+    setSearchInput(prev => (prev === filters.q ? prev : filters.q));
+  }, [filters.q]);
+
+  // Push the debounced search value into the URL. The guard ensures
+  // we don't loop with the sync effect above (if filters.q already
+  // matches the debounced value, this is a no-op).
+  useEffect(() => {
+    if (debouncedSearch !== filters.q) setFilters({ q: debouncedSearch, page: 0 });
+    // setFilters is stable from useUrlFilters; excluding it from deps
+    // avoids re-running on every parent re-render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [debouncedQ]);
+  }, [debouncedSearch]);
 
   // Cluster list re-fetches whenever group_by flips to cluster OR the
   // plantae tier changes. Both must be in the deps array.
