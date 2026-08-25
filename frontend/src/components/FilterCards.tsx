@@ -10,7 +10,7 @@
 // here so the cluster / taxonomy counts are filtered server-side
 // (they're a backend parameter on /api/results and /api/clusters).
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { getClusters, getResults } from '../api/endpoints';
 import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
 import { useFilters, type GroupBy } from '../state/AppContext';
@@ -242,11 +242,14 @@ export function FilterCards() {
             </button>
           </div>
 
-          {/* Row 2: quick bar (Group + Sort segmented). Horizontal
-              scroll on overflow for narrow viewports. */}
-          <div className="quick-bar hide-scrollbar">
-            <div className="flex items-center gap-2">
-              <span className="quick-bar-label">Group</span>
+          {/* Row 2: quick bar.
+                - Group chips: full segmented control on every viewport
+                  (no "Group" label — the chip text is self-explanatory;
+                  4 chips fit without scrolling on a 375 px screen).
+                - Sort: full segmented control on sm+, collapses to an
+                  icon button with a dropdown menu on narrow viewports
+                  so we don't overflow horizontally. */}
+            <div className="quick-bar">
               <div className="quick-bar-group">
                 {GROUP_BY_CHIPS.map(g => (
                   <button
@@ -258,11 +261,9 @@ export function FilterCards() {
                   >{g.label}</button>
                 ))}
               </div>
-            </div>
-            <span className="quick-bar-divider" aria-hidden="true" />
-            <div className="flex items-center gap-2">
-              <span className="quick-bar-label">Sort</span>
-              <div className="quick-bar-group">
+              <span className="quick-bar-divider" aria-hidden="true" />
+              {/* Sort: full segmented control on sm+ ... */}
+              <div className="hidden sm:flex quick-bar-group">
                 {SORTS.map(s => (
                   <button
                     key={s.value}
@@ -272,8 +273,12 @@ export function FilterCards() {
                   >{s.label}</button>
                 ))}
               </div>
+              {/* ... icon button + dropdown on narrow viewports */}
+              <SortMenu
+                value={sortMode}
+                onChange={setSortMode}
+              />
             </div>
-          </div>
         </div>
       )}
 
@@ -401,6 +406,77 @@ function FilterIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+    </svg>
+  );
+}
+
+// SortMenu — icon button + dropdown shown on narrow viewports. The
+// Sort segmented control renders on sm+ instead. Owns its own open
+// state and click-outside-to-close; the parent only passes the
+// current sort value + a setter.
+function SortMenu({ value, onChange }: { value: CardSort; onChange: (v: CardSort) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Click-outside closes the popover. Only attach the listener while
+  // open so we don't pay the document-level handler cost when the
+  // menu isn't visible.
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('click', handler);
+    return () => document.removeEventListener('click', handler);
+  }, [open]);
+
+  const activeLabel = SORTS.find(s => s.value === value)?.label ?? '';
+  return (
+    <div className="relative sm:hidden" ref={ref}>
+      <button
+        type="button"
+        className="sort-menu-trigger"
+        onClick={() => setOpen(o => !o)}
+        title="Sort options"
+        aria-haspopup="listbox"
+        aria-expanded={open}
+      >
+        <SortAscIcon />
+        <span className="hidden xs:inline">{activeLabel}</span>
+        <ChevronDownIcon />
+      </button>
+      {open && (
+        <div className="sort-menu-pop" role="listbox">
+          {SORTS.map(s => (
+            <button
+              key={s.value}
+              type="button"
+              role="option"
+              aria-selected={value === s.value}
+              className={value === s.value ? 'sort-menu-item sort-menu-item-active' : 'sort-menu-item'}
+              onClick={() => { onChange(s.value); setOpen(false); }}
+            >{s.label}</button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function SortAscIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M3 6h18" />
+      <path d="M7 12h10" />
+      <path d="M10 18h4" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="6 9 12 15 18 9" />
     </svg>
   );
 }

@@ -177,6 +177,14 @@
   .seg-chip-active   { @apply bg-bg-1 text-accent; }
   .seg-chip-inactive { @apply text-fg-1 hover:text-fg; }
 
+  /* SortMenu — icon button + dropdown that replaces the Sort segmented
+     control on narrow viewports. Hidden on sm+: where the segmented
+     chips take over. */
+  .sort-menu-trigger { @apply inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium text-fg-1 hover:text-fg bg-bg-1/50 border border-line2 sm:hidden; }
+  .sort-menu-pop     { @apply absolute top-full right-0 mt-1 z-20 bg-bg-1 border border-line2 rounded-lg shadow-lg py-1 min-w-[160px]; }
+  .sort-menu-item          { @apply block w-full text-left px-3 py-1.5 text-xs text-fg-0 hover:bg-bg-2; }
+  .sort-menu-item-active   { @apply text-accent font-medium bg-bg-1/40; }
+
   /* Count line — sits between the quick bar and the cluster grid. */
   .count-line        { @apply flex items-center justify-between mb-3 px-1 text-[10px] text-fg-1 uppercase tracking-widest font-semibold; }
 
