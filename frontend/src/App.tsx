@@ -11,7 +11,6 @@ import { JobPanel } from './components/JobPanel';
 import { ImmichSync } from './components/ImmichSync';
 import { LegendBar } from './components/LegendBar';
 import { StatusPanel } from './components/StatusPanel';
-import { KnnAlert } from './components/KnnAlert';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -101,12 +100,13 @@ export function App() {
         {view === 'run' ? (
           <section className="run-section">
             {/* Run-page sections, top-to-bottom:
-                  1. KNN warning — only when reference index is missing
-                  2. Pipeline run — params + Run button + live progress
-                  3. Sync to IMMICH — clusters / Plantae / Fungi / Remove
-                  4. Data tools — KNN build / EXIF backfill / purge / detect people
-                  5. Logs — pipeline + worker output */}
-            <KnnAlert />
+                  1. Pipeline run — params + Run button + live progress
+                     (KNN unavailable indicator is in the header pill —
+                     Header.tsx mounts it on the Run tab; we don't
+                     duplicate it here)
+                  2. Sync to IMMICH — clusters / Plantae / Fungi / Remove
+                  3. Data tools — KNN build / EXIF backfill / purge / detect people
+                  4. Logs — pipeline + worker output */}
             <section className="run-card" aria-label="Pipeline">
               <header className="run-card-header">
                 <h3 className="run-card-title">
