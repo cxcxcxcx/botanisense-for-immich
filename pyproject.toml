@@ -1,7 +1,10 @@
+# App product name is "BotaniSense for Immich"; the ML engine inside is
+# BioCLIP-2. The two names are distinct — see DEVELOPMENT.md for the
+# dual-naming convention.
 [project]
-name = "immich-bioclip"
+name = "botanisense-for-immich"
 version = "0.1.0"
-description = "Search Immich by text and run BioCLIP predictions on the results"
+description = "Browse an Immich library by plant species, with BioCLIP-2 zero-shot and optional KNN reclassification."
 requires-python = ">=3.10"
 dependencies = [
     "httpx>=0.27",
@@ -16,6 +19,9 @@ dependencies = [
     "faiss-cpu>=1.8",
     "duckdb>=1.0",
     "pyarrow>=25.0.0",
+    # tomllib is stdlib in 3.11+. The 3.10 fallback is gated by the
+    # python_version marker below — only installed when running 3.10.
+    "tomli>=2.0; python_version < '3.11'",
 ]
 
 [tool.uv]

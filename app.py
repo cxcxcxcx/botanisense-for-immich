@@ -1,4 +1,9 @@
-"""FastAPI web UI for the Immich × BioCLIP demo.
+"""FastAPI web UI for BotaniSense for Immich — an Immich companion that
+classifies plant photos via the BioCLIP-2 model and pushes the results
+back to Immich as albums. BioCLIP-2 (the underlying ML engine) and the
+app name "BotaniSense for Immich" are distinct: keep technical
+references to BioCLIP/-2 alone, this module/docstring deals with the
+user-facing product name.
 
 Routes (HTML):
   GET  /                          full page (Jinja-rendered base.html)
@@ -19,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 import threading
 import time
 import traceback
@@ -49,9 +55,56 @@ from pipeline import (
     run_pipeline,
 )
 
-load_dotenv()
+# tomllib is stdlib in 3.11+. On 3.10 we need the `tomli` backport
+# (declared in pyproject.toml with a python_version<"3.11" marker).
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        raise SystemExit(
+            "Python 3.10 requires the 'tomli' package for config.toml support.\n"
+            "Run `uv add tomli` and restart."
+        )
 
-BASE_URL = os.environ.get("IMMICH_BASE_URL", "http://192.168.84.113:2283")
+
+def _load_config() -> dict:
+    """Load user config from TOML.
+
+    Path precedence:
+      1. $BOTANISENSE_CONFIG env var (file must exist if set).
+      2. ./config.toml (optional; if absent, env vars work standalone).
+
+    Returns an empty dict when no config file exists. The constants
+    below use `cfg.get(...) or os.environ.get(...)` so env vars still
+    win for any value the user prefers to set in `.env`.
+    """
+    explicit = os.environ.get("BOTANISENSE_CONFIG")
+    if explicit:
+        if not Path(explicit).exists():
+            raise SystemExit(
+                f"BOTANISENSE_CONFIG={explicit!r} but that file does not exist."
+            )
+        path = explicit
+    else:
+        path = "config.toml"
+    if not Path(path).exists():
+        return {}
+    with Path(path).open("rb") as f:
+        return tomllib.load(f)
+
+
+load_dotenv()
+_cfg = _load_config()
+
+# Non-secret settings come from config.toml with env-var override. The
+# previously-hardcoded LAN defaults were a leak of the developer's home
+# network layout — see config.example.toml for the user-facing template.
+BASE_URL = (
+    _cfg.get("immich", {}).get("base_url")
+    or os.environ.get("IMMICH_BASE_URL", "")
+)
 API_KEY = os.environ.get("IMMICH_API_KEY", "")
 QUERY = os.environ.get("QUERY", "intentional plant photos")
 N_SAMPLES = int(os.environ.get("N_SAMPLES", "10000"))
@@ -94,18 +147,24 @@ RUN_ON_STARTUP = os.environ.get("RUN_ON_STARTUP", "0") == "1"
 
 _log = logging.getLogger("app")
 # KNN reclassification — separate from the zero-shot pipeline. Set
-# KNN_INVENTORY_DIR to the directory holding tol200m_bioclip2.faiss +
-# labels.parquet + INDEX_VERSION.txt. Leave it unset / pointing at a
-# non-existent dir to disable the KNN UI gracefully.
+# KNN_INVENTORY_DIR (in config.toml [knn] or env) to the directory
+# holding tol200m_bioclip2.faiss + labels.parquet + INDEX_VERSION.txt.
+# Leave it unset / pointing at a non-existent dir to disable the KNN UI
+# gracefully.
 KNN_INVENTORY_DIR = Path(
-    os.environ.get(
-        "KNN_INVENTORY_DIR", "/media/4T_Ext/bioclip_inventory/index"
-    )
+    _cfg.get("knn", {}).get("inventory_dir")
+    or os.environ.get("KNN_INVENTORY_DIR", "")
 )
 KNN_K = int(os.environ.get("KNN_K", "10"))
 
 if not API_KEY:
     raise SystemExit("IMMICH_API_KEY missing in .env / environment")
+
+if not BASE_URL:
+    raise SystemExit(
+        "IMMICH_BASE_URL missing — set it in config.toml [immich].base_url "
+        "or as an environment variable, then restart."
+    )
 
 # React SPA mount. After `npm run build` writes frontend/dist/, FastAPI
 # serves it at /. Dev mode uses Vite on :5173 with proxy → :8765.
@@ -138,6 +197,30 @@ _results_lock = threading.Lock()
 # pattern. Invalidated when a pipeline run completes.
 _clusters_cache: dict[tuple, dict] = {}
 _clusters_cache_lock = threading.Lock()
+
+
+# ---- /thumb pipeline ----------------------------------------------------
+# Two-layer cache that fixes the slow-grid paint:
+#
+# 1. ONE httpx.AsyncClient for the lifetime of the process. The previous
+#    code did `async with httpx.AsyncClient(...) as c: c.get(...)` for
+#    EVERY thumbnail request — no connection pooling, no HTTP keepalive,
+#    so a 60-card grid triggered 60 fresh TCP+TLS handshakes to Immich.
+#    Reusing one client lets httpx keep connections open between calls
+#    (max_keepalive_connections below) and bounds concurrency so a
+#    runaway grid can't exhaust Immich's worker pool.
+#
+# 2. Small in-memory LRU of thumbnail bytes keyed by (asset_id, size).
+#    Thumbnails are content-addressable — they only change when the
+#    underlying photo is replaced in Immich — so even a 500-entry cache
+#    (~15 MB for ~250px thumbs) absorbs a full 60-card grid hit on
+#    repeat visits. The Cache-Control header is still 24h so clients
+#    (and any reverse proxy) also cache downstream.
+_thumb_client: httpx.AsyncClient | None = None
+_thumb_client_lock = threading.Lock()  # guards lazy init / shutdown
+_THUMB_CACHE_MAX = 500
+_thumb_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
+_thumb_cache_lock = asyncio.Lock()  # all cache mutations
 
 
 def _results_cache_get(key: str) -> dict | None:
@@ -312,16 +395,28 @@ def _get_knn_index():
             import knn  # local module
             from knn import _load_index as _knn_load
             _knn_index, _knn_labels, _knn_meta = _knn_load(KNN_INVENTORY_DIR)
+            _log.info(
+                f"[knn.load] loaded {_knn_index.ntotal:,} vectors from {KNN_INVENTORY_DIR}"
+            )
     return _knn_index, _knn_labels, _knn_meta
 
 
 def _knn_status_dict() -> dict:
     """Compact status payload for /api/knn-status. Cheap when the index
     is already loaded (no FAISS work). When the index isn't built, we
-    still return a dict so the UI can render an informative empty state."""
+    still return a dict so the UI can render an informative empty state.
+
+    The `building` flag is True iff a /api/knn/build child process is
+    still running — the UI uses this to suppress the "reference index
+    missing" alert while a build is in progress (the JobPanel already
+    shows progress, and showing "missing" alongside an active build is
+    confusing — looks like the build did nothing)."""
     out: dict = {
         "inventory_dir": str(KNN_INVENTORY_DIR),
         "index_built": False,
+        "building": any(
+            j.get("status") == "running" for j in _knn_build_jobs.values()
+        ),
         "version": None,
         "n_rows": 0,
         "dim": 0,
@@ -645,6 +740,32 @@ def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # One shared httpx.AsyncClient for /thumb/* across the whole process
+    # — see _thumb_client docstring. Keeping keepalive_connections at 20
+    # matches Immich's per-IP limit on most installs; 50 max-connections
+    # lets a single grid request fan out without head-of-line blocking.
+    global _thumb_client
+    async with httpx.AsyncClient(
+        base_url=BASE_URL,
+        headers={"x-api-key": API_KEY, "Accept": "image/*"},
+        timeout=30.0,
+        limits=httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        ),
+    ) as client:
+        _thumb_client = client
+        await _lifespan_inner()
+        try:
+            yield
+        finally:
+            _thumb_client = None
+
+
+async def _lifespan_inner() -> None:
+    """Existing startup work (near-dup warm + optional auto-run),
+    pulled out so lifespan() stays focused on the shared HTTP client."""
     # NOTE: do NOT eagerly warm BioCLIP / YOLO here — browse-only mode
     # (~200 MB) is the default and we don't want to pay the ~3 GB cost
     # of model weights until the user actually hits POST /api/run.
@@ -702,19 +823,20 @@ async def lifespan(_app: FastAPI):
                 "startup auto-run failed: %s — %s",
                 e.status_code, e.detail,
             )
-    yield
 
 
-app = FastAPI(title="Immich × BioCLIP", lifespan=lifespan)
+app = FastAPI(title="BotaniSense for Immich", lifespan=lifespan)
 
 # CORS: the dev frontend is served by Vite on :5173 and calls /api/*
 # directly on uvicorn :8765 (bypassing Vite's proxy to avoid SSE
-# backpressure). Without this middleware the browser blocks those
-# cross-origin requests. Allow any origin — this is a local dev tool,
-# not a public service. Restrict before deploying anywhere.
+# backpressure). Origins come from config.toml [cors] (default empty =
+# same-origin only, which is correct for the bundled SPA on uvicorn).
+# Add `["http://localhost:5173"]` for the Vite dev server, or your
+# reverse-proxy origin when exposing the app publicly.
+_cors_origins = _cfg.get("cors", {}).get("origins", []) or []
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -858,6 +980,110 @@ async def status() -> dict:
     if last is not None:
         return last
     return get_state()
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    """Pre-flight check for the SPA HealthBanner.
+
+    Best-effort: every field returns ok=True/False plus context, never
+    raises. The UI decides what to surface (red for blockers, yellow
+    for warnings) and the user decides what to do — this endpoint
+    shouldn't refuse to respond just because, e.g., Immich is down.
+    """
+    # --- Immich reachability + API key ---
+    immich_ok = False
+    immich_version: str | None = None
+    immich_err: str | None = None
+    api_key_ok = False
+    api_key_scope = "none"
+    api_key_err: str | None = None
+    try:
+        # Cheap call: server info, no admin scope required.
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=4.0) as c:
+            r = await c.get("/api/server/ping", headers={"x-api-key": API_KEY})
+        if r.status_code == 200:
+            immich_ok = True
+            immich_version = r.json().get("version", None) if r.headers.get("content-type", "").startswith("application/json") else None
+        else:
+            immich_err = f"HTTP {r.status_code} from /api/server/ping"
+    except Exception as e:
+        immich_err = f"{type(e).__name__}: {e}"
+
+    # Distinct check for the API key's scope. /api/albums returns a
+    # paginated list and 401s without a valid key. We don't actually
+    # need the data, just the status.
+    try:
+        async with httpx.AsyncClient(base_url=BASE_URL, timeout=4.0) as c:
+            r = await c.get("/api/albums", headers={"x-api-key": API_KEY}, params={"take": 1})
+        if r.status_code == 200:
+            api_key_ok = True
+            api_key_scope = "ok"
+        elif r.status_code in (401, 403):
+            api_key_err = "invalid or revoked key"
+        else:
+            api_key_err = f"HTTP {r.status_code}"
+    except Exception as e:
+        api_key_err = f"{type(e).__name__}: {e}"
+
+    # --- KNN index ---
+    knn_path = str(KNN_INVENTORY_DIR) if KNN_INVENTORY_DIR else ""
+    knn_built = False
+    knn_version: str | None = None
+    if knn_path:
+        idx_version = Path(knn_path) / "INDEX_VERSION.txt"
+        faiss_file = Path(knn_path) / "tol200m_bioclip2.faiss"
+        knn_built = idx_version.exists() and faiss_file.exists()
+        if knn_built:
+            try:
+                knn_version = idx_version.read_text().strip()
+            except OSError:
+                knn_version = None
+
+    # --- BioCLIP-2 weights ---
+    # HuggingFace stores snapshots under
+    # ~/.cache/huggingface/models--imageomics--bioclip-2/snapshots/*/.
+    bioclip_weights = False
+    hf_cache = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
+    bioclip_dir = hf_cache / "models--imageomics--bioclip-2"
+    if bioclip_dir.exists():
+        for snap in bioclip_dir.glob("snapshots/*/"):
+            if any(snap.glob("*.safetensors")) or any(snap.glob("*.bin")):
+                bioclip_weights = True
+                break
+
+    # --- DB ---
+    db_ok = Path(DB_PATH).exists()
+    db_size = Path(DB_PATH).stat().st_size if db_ok else 0
+
+    return {
+        "immich": {"ok": immich_ok, "version": immich_version, "error": immich_err},
+        "api_key": {"ok": api_key_ok, "scope": api_key_scope, "error": api_key_err},
+        "knn": {
+            "built": knn_built,
+            "version": knn_version,
+            "path": knn_path,
+            "configured": bool(knn_path),
+        },
+        "bioclip": {
+            "weights_present": bioclip_weights,
+            "cache_path": str(bioclip_dir),
+        },
+        "db": {"ok": db_ok, "path": DB_PATH, "size_bytes": db_size},
+    }
+
+
+@app.get("/api/config")
+async def public_config() -> dict:
+    """Non-secret runtime config surfaced to the SPA.
+
+    Used by AssetDetail to render the "Open in Immich" button — we
+    assume the Immich web UI is on the same host as the API (default
+    deployment). If a user runs the SPA against an Immich instance
+    proxied at a different URL, this endpoint can be expanded to
+    accept an `IMMICH_PUBLIC_URL` override.
+    """
+    return {"immich_public_url": BASE_URL}
 
 
 @app.get("/api/logs")
@@ -1688,6 +1914,13 @@ class KnnBuildArgs(BaseModel):
     index_dir: str | None = None        # default: KNN_INVENTORY_DIR
     kingdoms: str | None = None        # comma-separated, e.g. "Plantae,Fungi"
     index_type: str | None = None      # "ivf" (default) or "flat"
+    ivf_nlist: int | None = None       # override IVF cluster count (default: sqrt(train_size))
+    ivf_train_size: int | None = None  # #vectors held in RAM for k-means training (default: 200K, lower=less RAM)
+    # If True, load existing index at index_dir (if any) and continue
+    # adding instead of training from scratch. Used for multi-pass
+    # builds that exceed RLIMIT_DATA — split 130M into 3 sequential
+    # ~45M-row passes, the 2nd/3rd with resume=True.
+    resume: bool = False
 
 # In-memory job registry. Jobs are short-lived (~minutes-to-hours);
 # the log file outlives the process so users can grep later.
@@ -1698,62 +1931,66 @@ _knn_build_jobs: dict[str, dict] = {}
 _knn_build_jobs_lock = threading.Lock()
 
 
-def _knn_build_worker(job_id: str, args: KnnBuildArgs) -> None:
-    """Body of the build thread. Imports knn.build_faiss_index, sets up
-    a file log handler so each chunk progress line lands in the per-job
-    log file, and tears down cleanly on success/error."""
-    import logging
-    import knn  # local module
+# Soft memory cap on the KNN build child process. We tried a hard
+# RLIMIT_DATA cap at 12 GB but it tripped false positives — DuckDB
+# mmap's every parquet shard (~100 MB × 666 = 66 GB of virtual
+# address space), so the kernel's `mmap: VmData exceed data ulimit`
+# check fired before physical RAM filled up. cgroup v2 memory.max
+# would be the right tool here, but it's not writable to non-root
+# users on this box.
+#
+# Approach: set a "soft warning" cap based on RSS in the watcher
+# thread (NOT a kernel rlimit). If the build process's RSS exceeds
+# this value the parent SIGKILLs it. The OS OOM killer is the
+# backstop. Sized to leave headroom on a 29 GB host for the rest
+# of the system: ~29 total − ~6 baseline (immich_ml, postgresql,
+# memray) − 0.5 uvicorn = ~22 GB safe for the build. The build's
+# actual steady-state RSS at 130M rows is ~2 GB (in-RAM IVFPQ +
+# DuckDB + Python), so 22 GB gives us 10x headroom — the only way
+# it would hit the cap is a leak we haven't found yet, in which
+# case SIGKILL surfaces as a clean error instead of crashing uvicorn.
+_KNN_BUILD_MEM_LIMIT_BYTES = 10 * 1024**3  # parent SIGKILLs build if RSS > 10 GB
 
-    job = _knn_build_jobs[job_id]
-    log_path = Path(job["log_path"])
-    log_path.parent.mkdir(parents=True, exist_ok=True)
 
-    knn_logger = logging.getLogger("knn")
-    handler = logging.FileHandler(log_path, mode="w")
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    knn_logger.addHandler(handler)
-    knn_logger.setLevel(logging.INFO)
-    # Make sure the kNN package's _log also reaches our handler.
-    # (knn._log = logging.getLogger(__name__))
+def _tail_error_from_log(log_path: str) -> str | None:
+    """Pull the most recent `[knn.build] error: ...` line from the log
+    file. Worker writes this on caught exceptions; it's the cleanest
+    single-line summary for the UI."""
     try:
-        index_dir = Path(args.index_dir or KNN_INVENTORY_DIR)
-        index_dir.mkdir(parents=True, exist_ok=True)
-        kingdoms = (
-            [k.strip() for k in args.kingdoms.split(",") if k.strip()]
-            if args.kingdoms else None
-        )
-        knn.build_faiss_index(
-            parquet_glob=args.parquet_glob,
-            index_path=index_dir / "tol200m_bioclip2.faiss",
-            labels_path=index_dir / "labels.parquet",
-            kingdoms=kingdoms,
-            version_tag=args.tag,
-            index_type=args.index_type or "ivf",
-        )
-        # Clear the cached in-process index so the next /api/knn-status
-        # picks up the freshly-built one.
-        global _knn_index, _knn_labels, _knn_meta
-        with _lock:
-            _knn_index = None
-            _knn_labels = None
-            _knn_meta = None
-        job["status"] = "done"
-    except Exception as e:
-        knn_logger.exception("[knn.build] failed")
-        job["status"] = "error"
-        job["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        knn_logger.removeHandler(handler)
-        handler.close()
-        job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        with open(log_path) as f:
+            lines = f.readlines()
+    except (FileNotFoundError, OSError):
+        return None
+    for line in reversed(lines[-50:]):
+        line = line.strip()
+        if line.startswith("[knn.build] error:"):
+            return line.split("[knn.build] error:", 1)[1].strip()
+    return None
 
 
 @app.post("/api/knn/build")
 async def start_knn_build(args: KnnBuildArgs) -> dict:
-    """Spawn a build thread, return its job_id. The UI polls
+    """Spawn a build child process, return its job_id. The UI polls
     /api/knn/build/job/{job_id} for status and /api/knn/build/logs for
     the live log tail."""
+    # Pre-flight: create the index dir NOW so a permission / mount /
+    # typo error surfaces here as a clean 422 instead of an opaque
+    # FileNotFoundError traceback in the child (which would also flood
+    # the log file with stack traces). The child re-runs mkdir with
+    # exist_ok=True; this is the canary.
+    target_dir = Path(args.index_dir or KNN_INVENTORY_DIR)
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError) as e:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Cannot create index directory {target_dir}: "
+                f"{type(e).__name__}: {e}. "
+                f"Pick a path the server process can write to "
+                f"(e.g. data/knn-index next to the SQLite DB)."
+            ),
+        )
     job_id = uuid.uuid4().hex[:8]
     log_path = Path(DB_PATH).parent / f"knn-build-{job_id}.log"
     _knn_build_jobs[job_id] = {
@@ -1765,8 +2002,142 @@ async def start_knn_build(args: KnnBuildArgs) -> dict:
         "args": args.model_dump(),
         "error": None,
     }
-    threading.Thread(target=_knn_build_worker, args=(job_id, args), daemon=True).start()
+    # CRITICAL: spawn the build in a real subprocess with RLIMIT_DATA
+    # applied BEFORE Python starts in the child (via preexec_fn).
+    # `multiprocessing.Process` with fork context was failing to actually
+    # fork on this setup — observed behavior was the build running
+    # inside the uvicorn worker, with rlimit silently not applied. That
+    # would OOM-kill the entire web server on a runaway build.
+    #
+    # subprocess.Popen with preexec_fn is the canonical Linux pattern:
+    # the OS calls our preexec_fn in the freshly-forked child before
+    # exec, so resource.setrlimit() runs while we're still single-
+    # threaded and pid-stable. The kernel then enforces the cap on
+    # every subsequent mmap/malloc in this process tree.
+    import resource, subprocess
+    def _set_rlimit():
+        if _KNN_BUILD_MEM_LIMIT_BYTES is not None:
+            resource.setrlimit(
+                resource.RLIMIT_DATA,
+                (_KNN_BUILD_MEM_LIMIT_BYTES, _KNN_BUILD_MEM_LIMIT_BYTES),
+            )
+    # Use `python -m knn` rather than importing the module — same as
+    # the CLI entry path that has been smoke-tested many times. Avoids
+    # the import-after-fork gotchas that multiprocessing.Process hit.
+    cmd = [
+        "./.venv/bin/python", "-u", "-m", "knn",
+        "--parquet-glob", args.parquet_glob,
+        "--index-dir", str(Path(args.index_dir or KNN_INVENTORY_DIR)),
+        "--tag", args.tag,
+    ]
+    if args.kingdoms:
+        cmd += ["--kingdoms", args.kingdoms]
+    if args.index_type:
+        cmd += ["--index-type", args.index_type]
+    if args.ivf_nlist is not None:
+        cmd += ["--ivf-nlist", str(args.ivf_nlist)]
+    if args.ivf_train_size is not None:
+        cmd += ["--ivf-train-size", str(args.ivf_train_size)]
+    if args.resume:
+        cmd += ["--resume"]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=open(log_path, "w"),
+        stderr=subprocess.STDOUT,
+        preexec_fn=_set_rlimit,
+        start_new_session=True,  # child becomes process group leader
+    )
+    _knn_build_jobs[job_id]["proc"] = proc
+    # Watch in a daemon thread (don't block the request). The thread
+    # exits when the child exits; it doesn't keep uvicorn alive.
+    threading.Thread(
+        target=_watch_subprocess_build, args=(job_id, proc), daemon=True
+    ).start()
     return {"job_id": job_id}
+
+
+def _watch_subprocess_build(job_id: str, proc: subprocess.Popen) -> None:
+    """Daemon thread that waits for the KNN build subprocess to exit and
+    updates the job dict based on the exit code. Mirrors the
+    multiprocessing watcher but for subprocess.Popen — exitcode semantics
+    match: 0 = success, -9 = SIGKILL (parent's RSS cap exceeded),
+    other = error.
+
+    Also polls the child's RSS every 5s and SIGKILLs it if it crosses
+    the parent's soft cap (22 GB default). This is the backstop in
+    place of RLIMIT_DATA — we couldn't use a kernel rlimit because
+    DuckDB's mmap'd parquet files exceeded RLIMIT_DATA well before
+    physical RAM did, and cgroup v2 isn't writable by non-root users.
+    """
+    import os as _os
+    import time as _time
+    # Poll the child for two things: (1) did it exit on its own, (2)
+    # is its RSS over the soft cap. `proc.poll()` returns None while
+    # the child is alive. We sleep 5s between polls so a runaway
+    # build gets ~5s of grace after the first overshoot — enough for
+    # a chunk boundary, not enough to take down uvicorn.
+    last_kill_at = 0.0
+    while proc.poll() is None:
+        _time.sleep(5.0)
+        try:
+            with open(f"/proc/{proc.pid}/status") as _f:
+                _status = _f.read()
+        except (FileNotFoundError, ProcessLookupError):
+            break
+        _rss_kb = 0
+        for _line in _status.splitlines():
+            if _line.startswith("VmRSS:"):
+                _rss_kb = int(_line.split()[1])
+                break
+        _rss_mb = _rss_kb / 1024
+        if (
+            _KNN_BUILD_MEM_LIMIT_BYTES is not None
+            and _rss_kb > _KNN_BUILD_MEM_LIMIT_BYTES / 1024
+        ):
+            # Throttle: don't kill more than once per 30s so a stuck
+            # proc gets one chance to release memory before we
+            # escalate to SIGKILL.
+            if _time.time() - last_kill_at > 30:
+                last_kill_at = _time.time()
+                _log.warning(
+                    f"[knn.build] job {job_id} RSS={_rss_mb:.0f} MB > "
+                    f"soft cap {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB; "
+                    f"sending SIGKILL"
+                )
+                try:
+                    _os.kill(proc.pid, 9)
+                except ProcessLookupError:
+                    pass
+    proc.wait()
+    job = _knn_build_jobs.get(job_id)
+    if job is None:
+        return
+    job["finished_at"] = datetime.now(timezone.utc).isoformat()
+    if proc.returncode == 0:
+        job["status"] = "done"
+        job["error"] = None
+    elif proc.returncode == -9 or proc.returncode == 137:
+        # SIGKILL — the parent killed us because RSS exceeded the
+        # soft cap. Surface a clear message instead of an empty log.
+        job["status"] = "error"
+        msg = (
+            f"KNN build worker exceeded its {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB "
+            f"RSS soft cap and was killed. Try a smaller "
+            f"ivf_train_size (e.g. 100000) or split into multiple "
+            f"passes with --resume."
+        )
+        job["error"] = f"MemoryError: {msg}"
+        try:
+            with open(job["log_path"], "a") as f:
+                f.write(f"\n[knn.build] KILLED by OS (exitcode {proc.returncode} / SIGKILL).\n")
+                f.write(f"[knn.build] Likely cause: {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB RLIMIT_DATA exceeded.\n")
+                f.write(f"[knn.build] Hint: re-run with ivf_train_size <= 100000.\n")
+        except Exception:
+            pass
+    else:
+        job["status"] = "error"
+        err = _tail_error_from_log(job["log_path"])
+        job["error"] = err or f"KNN build worker exited with code {proc.returncode}"
 
 
 @app.get("/api/knn/build/job/{job_id}")
@@ -1954,9 +2325,9 @@ def _cluster_album_worker(
                 cluster_name = row["name"]
 
         album_title = (
-            f"Cluster {cluster_id} ({cluster_name})"
+            f"Cluster {cluster_id} ({cluster_name}) #BotaniSense"
             if cluster_name
-            else f"Cluster {cluster_id} (BioCLIP)"
+            else f"Cluster {cluster_id} (BioCLIP) #BotaniSense"
         )
 
         with _cluster_album_jobs_lock:
@@ -2163,13 +2534,24 @@ def _cluster_album_sync_all_worker(
     A cluster that becomes empty after the filter is SKIPPED (not
     synced as an empty album) so the Run page "Sync clusters (all)"
     button doesn't produce phantom albums for filtered-out clusters.
+
+    "Junk drawer" clusters — those with no species-rank taxon_scores,
+    i.e. HDBSCAN's cluster-of-last-resort that captured scattered
+    kingdom-only points — are filtered out before the totals are
+    computed. Without this filter a single cluster with 50%+ of all
+    photos would dominate the sync and produce one giant album of
+    unlabeled photos, exactly what `n_assets_total=19784 / n_clusters=1`
+    was showing before this change. Skipped clusters count toward
+    neither the denominator nor `clusters_done`.
     """
     import time as _time
     chunk_size = 1000
     try:
         # 1. Snapshot every cluster upfront so we know total work and
         # can show a deterministic progress bar. Filtering out clusters
-        # with zero assets here (shouldn't happen, but defensive).
+        # with zero assets (shouldn't happen, but defensive) and clusters
+        # without species-rank predictions (junk-drawer clusters that
+        # would otherwise dominate the sync — see docstring above).
         with storage.connect(DB_PATH) as conn:
             cluster_rows = conn.execute(
                 "SELECT cluster_id, COUNT(*) AS n FROM assets "
@@ -2180,7 +2562,11 @@ def _cluster_album_sync_all_worker(
                 (int(r["cluster_id"]), int(r["n"]))
                 for r in cluster_rows
                 if r["n"] > 0
+                and storage.cluster_has_species_predictions(
+                    conn, int(r["cluster_id"])
+                )
             ]
+            skipped = len(cluster_rows) - len(clusters)
             # Pre-fetch cluster names (used for album titles).
             name_rows = conn.execute(
                 "SELECT cluster_id, name FROM cluster_names"
@@ -2190,10 +2576,17 @@ def _cluster_album_sync_all_worker(
         n_assets_total = sum(n for _, n in clusters)
         with _cluster_album_jobs_lock:
             _cluster_album_jobs[job_id]["n_clusters"] = len(clusters)
+            _cluster_album_jobs[job_id]["n_clusters_skipped"] = skipped
             _cluster_album_jobs[job_id]["n_assets_total"] = n_assets_total
             _cluster_album_jobs[job_id]["clusters_done"] = 0
             _cluster_album_jobs[job_id]["photos_added"] = 0
             _cluster_album_jobs[job_id]["people_filter"] = people_filter
+        if skipped:
+            _log.info(
+                f"[cluster-sync-all] skipping {skipped} junk-drawer "
+                f"cluster(s) with no species-rank scores; "
+                f"{len(clusters)} cluster(s) will be synced"
+            )
 
         client = _immich_client()
         try:
@@ -2202,9 +2595,9 @@ def _cluster_album_sync_all_worker(
             for idx, (cluster_id, n_assets) in enumerate(clusters):
                 cluster_name = names.get(cluster_id)
                 album_title = (
-                    f"Cluster {cluster_id} ({cluster_name})"
+                    f"Cluster {cluster_id} ({cluster_name}) #BotaniSense"
                     if cluster_name
-                    else f"Cluster {cluster_id} (BioCLIP)"
+                    else f"Cluster {cluster_id} (BioCLIP) #BotaniSense"
                 )
 
                 # Per-cluster album: same reuse-or-create logic as the
@@ -2321,7 +2714,9 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
     """
     with storage.connect(DB_PATH) as conn:
         # Quick cluster-count preview so the UI can show "Sync N
-        # clusters (M total photos)?" in its confirm panel.
+        # clusters (M total photos)?" in its confirm panel. Junk-drawer
+        # clusters (no species-rank scores) are filtered out so the
+        # preview matches what the worker will actually do.
         rows = conn.execute(
             "SELECT cluster_id, COUNT(*) AS n FROM assets "
             "WHERE cluster_id IS NOT NULL GROUP BY cluster_id"
@@ -2330,6 +2725,9 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
             (int(r["cluster_id"]), int(r["n"]))
             for r in rows
             if r["n"] > 0
+            and storage.cluster_has_species_predictions(
+                conn, int(r["cluster_id"])
+            )
         ]
         n_assets_total = sum(n for _, n in clusters)
 
@@ -2373,12 +2771,13 @@ async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
 
 
 @app.delete("/api/album/cluster/{cluster_id}")
-async def delete_cluster_album(
-    cluster_id: int, delete_in_immich: bool = False
-) -> dict:
-    """Drop the cluster→album mapping. If `delete_in_immich=true`, also
-    DELETE the album in Immich (idempotent: 404 is treated as already-
-    gone). Returns `{deleted: true, remote_deleted: bool}`."""
+async def delete_cluster_album(cluster_id: int) -> dict:
+    """Drop the cluster→album mapping AND DELETE the album in Immich
+    (idempotent: 404 is treated as already-gone). The user-facing
+    'cluster sync' feature is marked beta, and the policy is "never
+    leave orphans": when you untrack a cluster album locally, the
+    matching Immich album goes with it. Returns `{deleted, remote_deleted}`.
+    """
     with storage.connect(DB_PATH) as conn:
         saved = storage.get_cluster_album(conn, cluster_id)
         if saved is None:
@@ -2386,19 +2785,18 @@ async def delete_cluster_album(
         storage.delete_cluster_album(conn, cluster_id)
 
     remote_deleted = False
-    if delete_in_immich:
-        client = _immich_client()
+    client = _immich_client()
+    try:
         try:
-            try:
-                client.delete_album(album_id=saved["album_id"])
-                remote_deleted = True
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 404:
-                    remote_deleted = False  # already gone; idempotent
-                else:
-                    raise
-        finally:
-            client.close()
+            client.delete_album(album_id=saved["album_id"])
+            remote_deleted = True
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                remote_deleted = False  # already gone; idempotent
+            else:
+                raise
+    finally:
+        client.close()
 
     return {"deleted": True, "remote_deleted": remote_deleted}
 
@@ -2410,23 +2808,27 @@ class ClusterAlbumsRemoveParams(BaseModel):
     validates each id against the existing cluster_albums rows so a
     typo'd id is silently ignored rather than producing a confusing
     error.
+
+    Note: Immich albums are ALWAYS deleted alongside the local
+    mapping (the `delete_in_immich` toggle was removed when the
+    cluster-sync feature went beta — policy is "never leave orphans").
     """
     cluster_ids: list[int] | None = None
-    delete_in_immich: bool = False
 
 
 @app.post("/api/album/cluster/remove")
 async def bulk_remove_cluster_albums(
     params: ClusterAlbumsRemoveParams,
 ) -> dict:
-    """Bulk-remove cluster→album mappings. One round-trip replaces N
-    DELETE /api/album/cluster/{id} calls for the Sync-to-IMMICH
-    "Remove synced clusters" button.
+    """Bulk-remove cluster→album mappings AND DELETE the matching
+    Immich albums. One round-trip replaces N DELETE
+    /api/album/cluster/{id} calls for the Sync-to-IMMICH "Remove
+    synced clusters" button.
 
     Behaviour:
       - `cluster_ids=None` → every currently synced cluster
-      - `delete_in_immich=True` → also DELETE the album in Immich
-        (404 is treated as already-gone, same as the single DELETE)
+      - Every mapping's matching Immich album is DELETEd (404 is
+        idempotent)
       - Per-cluster errors are collected in `errors` so one failure
         (e.g. transient network) doesn't abort the whole bulk
 
@@ -2448,7 +2850,7 @@ async def bulk_remove_cluster_albums(
 
     # Single ImmichClient lifecycle for the whole batch — opening /
     # closing per cluster would burn ~30ms × N on the LAN.
-    client = _immich_client() if params.delete_in_immich else None
+    client = _immich_client()
     try:
         for cluster_id in target_ids:
             try:
@@ -2461,16 +2863,15 @@ async def bulk_remove_cluster_albums(
                         continue
                     storage.delete_cluster_album(conn, cluster_id)
                 removed += 1
-                if client is not None:
-                    try:
-                        client.delete_album(album_id=saved["album_id"])
+                try:
+                    client.delete_album(album_id=saved["album_id"])
+                    remote_deleted += 1
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        # already gone in Immich — local row was
+                        # the source of truth; count it as success
                         remote_deleted += 1
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code == 404:
-                            # already gone in Immich — local row was
-                            # the source of truth; count it as success
-                            remote_deleted += 1
-                        else:
+                    else:
                             errors.append({
                                 "cluster_id": cluster_id,
                                 "error": (
@@ -3061,11 +3462,44 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
     if size not in _ALLOWED_SIZES:
         size = "preview"
 
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        r = await c.get(
-            f"{BASE_URL}/api/assets/{asset_id}/thumbnail",
+    key = (asset_id, size)
+    # Cache HIT — bypass the network entirely. Lock is held only long
+    # enough to read+move; the bytes are returned without acquiring
+    # anything.
+    async with _thumb_cache_lock:
+        hit = _thumb_cache.get(key)
+        if hit is not None:
+            _thumb_cache.move_to_end(key)
+            body, media_type = hit
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "public, max-age=86400, immutable",
+                    "Content-Length": str(len(body)),
+                    "X-Thumb-Cache": "HIT",
+                },
+            )
+
+    # Cache MISS — fetch from Immich through the shared client (kept
+    # alive for the lifetime of the process via lifespan). We release
+    # the cache lock during the network round-trip so concurrent misses
+    # for DIFFERENT asset_ids can fan out in parallel; only the
+    # final put+evict re-acquires the lock.
+    client = _thumb_client
+    if client is None:
+        # Lifespan didn't run (e.g. ASGI server misconfigured) — fall
+        # back to a one-shot client so the endpoint still works, just
+        # without connection reuse.
+        async with httpx.AsyncClient(timeout=30.0) as fallback:
+            r = await fallback.get(
+                f"/api/assets/{asset_id}/thumbnail",
+                params={"size": size},
+            )
+    else:
+        r = await client.get(
+            f"/api/assets/{asset_id}/thumbnail",
             params={"size": size},
-            headers={"x-api-key": API_KEY},
         )
     if r.status_code != 200:
         # HTTPException uses `detail`, not `text`. Preserve the upstream
@@ -3074,14 +3508,24 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
             status_code=r.status_code,
             detail=f"immich thumbnail {asset_id}/{size}: {r.text[:200]}",
         )
-    # Long-lived cache: thumbnails are content-addressable by asset_id and
-    # don't change unless the underlying photo is replaced in Immich.
+    body = r.content
+    media_type = r.headers.get("content-type", "image/jpeg")
+    # Server-side LRU (process-local, ~15 MB at the 500-entry cap). The
+    # Cache-Control header below is for downstream caches and the
+    # browser — they all benefit from the same content-addressable
+    # invariant: a thumbnail for asset_id=X never changes unless the
+    # underlying photo is replaced in Immich.
+    async with _thumb_cache_lock:
+        _thumb_cache[key] = (body, media_type)
+        while len(_thumb_cache) > _THUMB_CACHE_MAX:
+            _thumb_cache.popitem(last=False)
     return Response(
-        content=r.content,
-        media_type=r.headers.get("content-type", "image/jpeg"),
+        content=body,
+        media_type=media_type,
         headers={
             "Cache-Control": "public, max-age=86400, immutable",
-            "Content-Length": str(len(r.content)),
+            "Content-Length": str(len(body)),
+            "X-Thumb-Cache": "MISS",
         },
     )
 

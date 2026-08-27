@@ -20,8 +20,9 @@ and "I've been staring at a stale bundle for an hour."
 | **8765** | uvicorn (FastAPI) | `app.py` API + `/thumb/*` + the built SPA from `frontend/dist/` | `uvicorn app:app ...` |
 | **5173** | Vite dev server | `frontend/src/` source (HMR), proxies `/api` and `/thumb` → 8765 | `npm run dev` in `frontend/` |
 
-Both bind `0.0.0.0`, so on your phone use
-`http://192.168.84.113:5173` (dev) or `http://192.168.84.113:8765` (built).
+Both bind `0.0.0.0`, so on your phone use `http://<your-lan-ip>:5173` (dev)
+or `http://<your-lan-ip>:8765` (built). The exact IP depends on your
+host's network interface — `ip route get 1` or `ifconfig` will tell you.
 
 The running uvicorn is launched as:
 ```

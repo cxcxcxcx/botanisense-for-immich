@@ -1,0 +1,50 @@
+name: Bug report
+description: Report something that's broken or behaving unexpectedly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: A clear description of the bug.
+      placeholder: |
+        I clicked X, expected Z, got Y.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps to reproduce.
+      placeholder: |
+        1. Run `uvicorn app:app` with config X
+        2. Open Y
+        3. See Z
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: false
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Versions, OS, Immich version, library size.
+      placeholder: |
+        - BotaniSense commit: (git rev-parse HEAD)
+        - Immich version: (e.g. v1.132.0)
+        - OS: (e.g. Linux 6.x)
+        - Library size: (e.g. 17 000 photos)
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Pipeline log / server log / browser console output.
+      render: shell
+    validations:
+      required: false

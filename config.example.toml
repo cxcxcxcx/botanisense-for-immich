@@ -1,0 +1,38 @@
+# BotaniSense for Immich — user config.
+#
+# Copy this file to `config.toml` (which is gitignored) and edit the
+# values to match your setup.
+#
+# Path precedence:
+#
+#   1. $BOTANISENSE_CONFIG env var (full path; file must exist)
+#   2. ./config.toml  (working directory; optional)
+#
+# When a key is not set in this file, the app falls back to the matching
+# environment variable (e.g. `IMMICH_BASE_URL`). When neither is set, the
+# app refuses to start for required keys and uses an empty/disabling
+# value for optional ones. See README.md for the full list of env vars.
+
+[immich]
+# Required. No default — the app refuses to start without it.
+base_url = "http://192.168.1.10:2283"
+
+# `api_key` is intentionally NOT in this file. Read IMMICH_API_KEY from
+# your shell environment (e.g. via .env with python-dotenv, a systemd
+# EnvironmentFile=, or docker-compose secrets). Keeping secrets out of
+# a tracked-file format is intentional.
+
+[knn]
+# Optional. Directory containing tol200m_bioclip2.faiss + labels.parquet
+# + INDEX_VERSION.txt. Leave empty to disable the KNN reclassification
+# feature entirely.
+inventory_dir = ""
+
+[cors]
+# Optional. Origins allowed to call /api/*. Default = same-origin only
+# (the bundled SPA on uvicorn). Set this when serving the SPA from a
+# different origin (e.g. behind a reverse proxy or a different host).
+#
+# Example for Vite dev:
+#   origins = ["http://localhost:5173"]
+origins = []
