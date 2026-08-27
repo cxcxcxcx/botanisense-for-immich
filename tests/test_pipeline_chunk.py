@@ -65,6 +65,19 @@ class _FakeImmichClient:
         im.save(buf, format="PNG")
         return buf.getvalue()
 
+    # Pipeline calls ImmichClient.extract_exif(client.get_asset_metadata(id))
+    # — return None so the fixture yields {"captured_at": None, ...} and
+    # the test stays focused on the prediction-write path, not EXIF.
+    def get_asset_metadata(self, asset_id: str) -> dict | None:
+        return None
+
+    # Mirror of the real static method on ImmichClient (which the test
+    # monkey-patches out). Tests don't care about EXIF, just that the
+    # call returns a dict with the expected keys.
+    @staticmethod
+    def extract_exif(asset_payload: dict | None) -> dict:
+        return {"captured_at": None, "latitude": None, "longitude": None}
+
     def close(self):
         pass
 
