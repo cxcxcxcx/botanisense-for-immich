@@ -218,6 +218,24 @@
   .photo-card          { @apply relative aspect-square bg-bg-2 sm:rounded-lg overflow-hidden cursor-pointer; }
   .photo-card-image    { @apply w-full h-full object-cover; }
   .photo-card-overlay  { @apply absolute bottom-0 inset-x-0 p-2 bg-gradient-to-t from-black/90 to-transparent flex justify-end pointer-events-none; }
+
+  /* Skeleton placeholder for lazy-loaded <img> content. The Card and
+     FilterCardOverlay render a div.shimmer under the real image until
+     onLoad fires; the actual image fades in on top via opacity
+     transition. Same animation works at any size — it's a
+     background-gradient sweep, not a layout-dependent shape. */
+  @keyframes shimmer {
+    0%   { background-position: -400px 0; }
+    100% { background-position: 400px 0; }
+  }
+  .shimmer {
+    background: linear-gradient(90deg,
+      rgba(255,255,255,0.04) 0%,
+      rgba(255,255,255,0.10) 50%,
+      rgba(255,255,255,0.04) 100%);
+    background-size: 800px 100%;
+    animation: shimmer 1.4s infinite linear;
+  }
   .confidence-pill       { @apply text-[10px] font-bold px-1.5 py-0.5 rounded backdrop-blur-sm tabular-nums; }
   .confidence-pill-green  { @apply bg-accent/20 text-accent; }
   .confidence-pill-yellow { @apply bg-[#e8c45c]/20 text-[#e8c45c]; }

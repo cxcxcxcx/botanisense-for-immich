@@ -379,19 +379,24 @@ function ClusterCardTile({ card, active, pinned, onClick }: { card: Card; active
 
 function ClusterCardOverlay({ card }: { card: Card }) {
   const [imgError, setImgError] = useState(false);
+  const [imgLoaded, setImgLoaded] = useState(false);
   const showImg = card.sampleAssetId && !imgError;
   const fallbackChar = card.label.replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
   return (
     <>
       <div className="absolute inset-0 flex items-center justify-center overflow-hidden">
+        {showImg && !imgLoaded && (
+          <div className="absolute inset-0 shimmer" aria-hidden="true" />
+        )}
         {showImg ? (
           <img
             src={thumbUrl(card.sampleAssetId as string)}
             alt={card.label}
             loading="lazy"
             decoding="async"
-            className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+            onLoad={() => setImgLoaded(true)}
             onError={() => setImgError(true)}
+            className={`w-full h-full object-cover transition-transform duration-500 group-hover:scale-105 transition-opacity duration-200 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
           />
         ) : (
           <span className="text-[2.25rem] font-semibold uppercase text-[#444]">{fallbackChar}</span>

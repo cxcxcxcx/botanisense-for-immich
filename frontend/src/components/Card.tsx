@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import type { ResultRow } from '../api/types';
 import { useApp } from '../state/AppContext';
 import { thumbUrl } from '../lib/thumb';
@@ -11,6 +12,10 @@ interface Props {
 
 export function Card({ row }: Props) {
   const { dispatch } = useApp();
+  // Show a shimmer under the image until it loads. Resets when the
+  // asset_id changes (a remount would too, but the same component
+  // can be re-keyed when the user re-sorts).
+  const [imgLoaded, setImgLoaded] = useState(false);
 
   const fullTop1 = row.top_predictions[0];
   const plantaeScore = row.taxon_scores?.Plantae;
@@ -33,12 +38,16 @@ export function Card({ row }: Props) {
       onClick={handleOpen}
       className="photo-card"
     >
+      {/* Shimmer placeholder under the real image. Sized the same as
+          the image so layout doesn't shift when the load completes. */}
+      {!imgLoaded && <div className="absolute inset-0 shimmer" aria-hidden="true" />}
       <img
         src={thumbUrl(row.asset_id, 'thumbnail')}
         alt={row.original_file_name}
         loading="lazy"
         decoding="async"
-        className="photo-card-image"
+        className={`photo-card-image transition-opacity duration-200 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
+        onLoad={() => setImgLoaded(true)}
       />
       {/* Bottom overlay: tier swatch + species name (wraps to 2 lines
           so long binomials aren't truncated) + confidence pill on
