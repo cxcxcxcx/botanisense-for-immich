@@ -12,6 +12,10 @@ import { ImmichSync } from './components/ImmichSync';
 import { LegendBar } from './components/LegendBar';
 import { StatusPanel } from './components/StatusPanel';
 import { KnnAlert } from './components/KnnAlert';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { Welcome } from './components/Welcome';
+import { HealthBanner } from './components/HealthBanner';
+import { PlantaeLegend } from './components/PlantaeLegend';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -23,7 +27,14 @@ export function App() {
   const view = useRoute();
   // Hoisted to the App so the "Edit params" toggle sits in the
   // Pipeline card header (per the mock) instead of inside the form.
-  const [paramsOpen, setParamsOpen] = useState(false);
+  // Default to open on first visit so the most consequential knob
+  // (`query`) is visible without an extra click; remember the user's
+  // preference in localStorage so it survives reloads.
+  const [paramsOpen, setParamsOpen] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return true;
+    const stored = localStorage.getItem('botanisense:params-open');
+    return stored === null ? true : stored === '1';
+  });
 
   // Whether the current URL filters narrow to a specific subset of
   // assets. This is the trigger for switching from the list view
@@ -97,6 +108,11 @@ export function App() {
   return (
     <>
       <Header view={view} />
+      {/* ErrorBoundary wraps the page body so a render exception in
+          Grid / Modal / etc. doesn't take the whole SPA down. The
+          Header above stays rendered so the user can still navigate. */}
+      <ErrorBoundary>
+      <HealthBanner />
       <main className={`pb-8 ${view === 'run' ? 'max-w-[1100px] mx-auto py-4 px-3 sm:px-6' : ''}`}>
         {view === 'run' ? (
           <section className="run-section">
@@ -116,7 +132,11 @@ export function App() {
                 <button
                   type="button"
                   className="run-card-edit-btn"
-                  onClick={() => setParamsOpen(o => !o)}
+                  onClick={() => setParamsOpen(o => {
+                    const next = !o;
+                    localStorage.setItem('botanisense:params-open', next ? '1' : '0');
+                    return next;
+                  })}
                   aria-expanded={paramsOpen}
                 >
                   {paramsOpen ? 'Hide params' : 'Edit params'}
@@ -145,7 +165,10 @@ export function App() {
             <Grid />
           </>
         ) : (
-          <Toolbar />
+          <>
+            <Welcome />
+            <Toolbar />
+          </>
         )}
       </main>
       <Modal
@@ -156,6 +179,11 @@ export function App() {
         {modal.kind === 'asset' && modal.assetId && <AssetDetail assetId={modal.assetId} />}
       </Modal>
       <JobPanel />
+      {/* PlantaeLegend — bottom-left on every view. The Run page
+          already has its own tier indicator next to the slider, so
+          we pass `dismissible={false}` there to avoid a duplicate. */}
+      <PlantaeLegend dismissible={view !== 'run'} />
+      </ErrorBoundary>
     </>
   );
 }

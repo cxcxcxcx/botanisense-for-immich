@@ -71,6 +71,10 @@ export function ParamsForm({ paramsOpen }: Props) {
   const [n, setN] = useState('');
   const [topK, setTopK] = useState('');
   const [batch, setBatch] = useState('');
+  // The three "advanced" params are tucked behind a separate
+  // disclosure so the most-used knob (`query`) gets the visual
+  // weight. Session-only state — no need to persist.
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   // Subscribe to the SSE pipeline status so the button reflects the
   // actual run state, not just "click is being processed".
   const { data: snapshot } = useEventStream<EventSnapshot>('/api/events');
@@ -162,8 +166,11 @@ export function ParamsForm({ paramsOpen }: Props) {
       </div>
 
       {paramsOpen && (
-        <fieldset role="group" className="flex flex-wrap items-start gap-x-5 gap-y-3 border-0 p-0 m-0">
-          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
+        <fieldset role="group" className="flex flex-col gap-3 border-0 p-0 m-0">
+          {/* `query` is the most consequential knob — visible
+              whenever params is open, with a one-line helper to nudge
+              new users toward concrete examples. */}
+          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px]">
             {FIELDS.query?.label}
             <input
               type="text"
@@ -174,59 +181,66 @@ export function ParamsForm({ paramsOpen }: Props) {
               title={FIELDS.query?.help}
             />
             <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-              {FIELDS.query?.help}
+              What to ask Immich's smart-search. Try{' '}
+              <em>"red flowers"</em>, <em>"moss on rocks"</em>, or{' '}
+              <em>"tree bark close-up"</em>.
             </small>
           </label>
 
-          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
-            {FIELDS.n_samples?.label}
-            <input
-              type="number"
-              className={`${inputCls} w-[110px]`}
-              value={n}
-              onChange={e => setN(e.target.value)}
-              min={FIELDS.n_samples?.min}
-              placeholder={FIELDS.n_samples?.placeholder}
-              title={FIELDS.n_samples?.help}
-            />
-            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-              {FIELDS.n_samples?.help}
-            </small>
-          </label>
+          {/* The other three knobs are tucked behind an Advanced
+              disclosure — most users just want "run with server
+              defaults". */}
+          <details
+            open={advancedOpen}
+            onToggle={e => setAdvancedOpen((e.target as HTMLDetailsElement).open)}
+            className="text-fg-1 text-[0.8rem]"
+          >
+            <summary className="cursor-pointer text-fg-1 hover:text-fg text-[0.8rem] py-1">
+              Advanced (batch, top-K, sample count)
+            </summary>
+            <div className="flex flex-wrap items-start gap-x-5 gap-y-3 pt-2">
+              <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[180px] flex-[1_1_180px]">
+                {FIELDS.n_samples?.label}
+                <input
+                  type="number"
+                  className={`${inputCls} w-[110px]`}
+                  value={n}
+                  onChange={e => setN(e.target.value)}
+                  min={FIELDS.n_samples?.min}
+                  placeholder={FIELDS.n_samples?.placeholder}
+                  title={FIELDS.n_samples?.help}
+                />
+              </label>
 
-          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
-            {FIELDS.top_k?.label}
-            <input
-              type="number"
-              className={`${inputCls} w-[110px]`}
-              value={topK}
-              onChange={e => setTopK(e.target.value)}
-              min={FIELDS.top_k?.min}
-              max={FIELDS.top_k?.max}
-              placeholder={FIELDS.top_k?.placeholder}
-              title={FIELDS.top_k?.help}
-            />
-            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-              {FIELDS.top_k?.help}
-            </small>
-          </label>
+              <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[180px] flex-[1_1_180px]">
+                {FIELDS.top_k?.label}
+                <input
+                  type="number"
+                  className={`${inputCls} w-[110px]`}
+                  value={topK}
+                  onChange={e => setTopK(e.target.value)}
+                  min={FIELDS.top_k?.min}
+                  max={FIELDS.top_k?.max}
+                  placeholder={FIELDS.top_k?.placeholder}
+                  title={FIELDS.top_k?.help}
+                />
+              </label>
 
-          <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[220px] flex-[1_1_220px]">
-            {FIELDS.batch_size?.label}
-            <input
-              type="number"
-              className={`${inputCls} w-[110px]`}
-              value={batch}
-              onChange={e => setBatch(e.target.value)}
-              min={FIELDS.batch_size?.min}
-              max={FIELDS.batch_size?.max}
-              placeholder={FIELDS.batch_size?.placeholder}
-              title={FIELDS.batch_size?.help}
-            />
-            <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-              {FIELDS.batch_size?.help}
-            </small>
-          </label>
+              <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[180px] flex-[1_1_180px]">
+                {FIELDS.batch_size?.label}
+                <input
+                  type="number"
+                  className={`${inputCls} w-[110px]`}
+                  value={batch}
+                  onChange={e => setBatch(e.target.value)}
+                  min={FIELDS.batch_size?.min}
+                  max={FIELDS.batch_size?.max}
+                  placeholder={FIELDS.batch_size?.placeholder}
+                  title={FIELDS.batch_size?.help}
+                />
+              </label>
+            </div>
+          </details>
         </fieldset>
       )}
     </form>

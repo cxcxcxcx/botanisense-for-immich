@@ -14,7 +14,7 @@
 // DOM. The legacy JobPanel still serves the per-cluster pill sync
 // (cluster kind) and the unrelated purge / person-backfill flows.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   getSyncDefaults,
   putSyncDefaults,
@@ -32,6 +32,7 @@ import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 import { Modal } from './Modal';
+import { BetaInfoModal } from './BetaInfoModal';
 
 // ---------- people-filter chip group ---------------------------------------
 // Per the mock: each rule row has a 3-button segmented control
@@ -45,6 +46,26 @@ const PEOPLE_OPTS: { value: PeopleFilter; label: string }[] = [
   { value: 0,    label: 'Without people' },
   { value: 1,    label: 'With people' },
 ];
+
+// "Beta" pill rendered inline next to cluster-sync controls. Click to
+// open the BetaInfoModal with the full explanation. Cluster sync may
+// produce stale album titles after a cluster rename (we don't
+// currently PATCH /api/albums/{id} when only the name changes), and
+// the bulk-remove always deletes the Immich albums — both behaviors
+// are intentional but worth flagging.
+function BetaTag({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="text-[0.6rem] uppercase tracking-wider px-1.5 py-0.5 rounded border border-[#a87] text-[#d8a] bg-[#2a1a2a] align-middle ml-1 cursor-pointer hover:bg-[#3a2a3a]"
+      title="Click for details on what's beta and why"
+      aria-label="Beta feature: click for details"
+    >
+      beta
+    </button>
+  );
+}
 
 function PeopleFilterChips({
   value,
@@ -118,9 +139,12 @@ function progressFromSnap(
   snap: JobSnapshot,
 ): { added: number; total: number } {
   if (action === 'sync-all') {
+    // Cluster-level progress (matches JobPanel's extractProgress). The
+    // server filters junk-drawer clusters out before computing totals,
+    // so n_clusters here is the post-filter count.
     return {
-      added: (snap.photos_added as number | undefined) ?? (snap.clusters_done as number | undefined) ?? 0,
-      total: (snap.n_assets_total as number | undefined) ?? 0,
+      added: (snap.clusters_done as number | undefined) ?? 0,
+      total: (snap.n_clusters as number | undefined) ?? 0,
     };
   }
   return {
@@ -156,7 +180,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
 
   // Load defaults on mount. The server seeds from env on first read;
   // we capture the `seeded` flag so we can show a one-time hint.
-  useEffect(() => {
+  const reloadDefaults = useCallback(() => {
     let cancelled = false;
     getSyncDefaults()
       .then(r => {
@@ -166,9 +190,18 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         setSeeded(r.seeded);
       })
       .catch(e => {
-        push({ kind: 'error', message: `Defaults load failed: ${e instanceof Error ? e.message : String(e)}` }, 4000);
+        push({
+          kind: 'error',
+          message: `Defaults load failed: ${e instanceof Error ? e.message : String(e)}`,
+          action: { label: 'Retry', onClick: () => reloadDefaults() },
+        }, 6000);
       });
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    reloadDefaults();
     // Run once on mount.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -264,10 +297,11 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
   // which action the modal is currently showing. Keeps the JSX small
   // and lets the per-action preview logic live in one place.
   const [modalFor, setModalFor] = useState<ActionKey | null>(null);
+  // Cluster-sync beta info modal — shared by the two beta-tag buttons.
+  const [showBetaInfo, setShowBetaInfo] = useState(false);
   const [overridePeople, setOverridePeople] = useState<PeopleFilter>(null);
   const [overrideScore, setOverrideScore] = useState<number>(0.6);
   const [overrideForce, setOverrideForce] = useState(false);
-  const [overrideRemoteDelete, setOverrideRemoteDelete] = useState(false);
   const [previewCount, setPreviewCount] = useState<number | null>(null);
   const [previewing, setPreviewing] = useState(false);
 
@@ -316,7 +350,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     setOverridePeople(defaultPeople);
     setOverrideScore(defaultScore);
     setOverrideForce(false);
-    setOverrideRemoteDelete(false);
     setPreviewCount(null);
     setModalFor(action);
     setPreviewing(true);
@@ -345,7 +378,11 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
       }
       setPreviewCount(n);
     } catch (e) {
-      push({ kind: 'error', message: `Preview failed: ${e instanceof Error ? e.message : String(e)}` }, 3000);
+      push({
+        kind: 'error',
+        message: `Preview failed: ${e instanceof Error ? e.message : String(e)}`,
+        action: { label: 'Retry', onClick: () => doPreview(action, pf, score) },
+      }, 6000);
       setPreviewCount(null);
     } finally {
       setPreviewing(false);
@@ -411,10 +448,11 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         push({ kind: 'info', message: `Syncing Fungi photos` }, 2000);
       } else if (action === 'remove') {
         setSlots(s => ({ ...s, remove: { ...s.remove, status: 'running' } }));
-        const r = await removeClusterAlbums({
-          cluster_ids: null,
-          delete_in_immich: overrideRemoteDelete,
-        });
+        // Cluster sync is beta; policy is "never leave orphans" — the
+        // Immich albums are always DELETEd alongside the local mapping.
+        // You can always re-sync to recreate them with the same
+        // `#BotaniSense` hashtag in the title.
+        const r = await removeClusterAlbums({ cluster_ids: null });
         setSlots(s => ({ ...s, remove: {
           ...emptySlot(),
           status: r.errors.length ? 'error' : 'done',
@@ -525,8 +563,18 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
       )}
 
       <div className="grid grid-cols-2 gap-2">
-        <button type="button" className={buttonCls} onClick={() => openModal('sync-all')} disabled={!draft}>
-          Sync clusters (all)
+        {/* Cluster-sync controls — both sync-all and remove-always are
+            tagged beta. Plantae/Fungi smart-album buttons stay
+            unmarked (those flows are stable). */}
+        <button
+          type="button"
+          className={buttonCls}
+          onClick={() => openModal('sync-all')}
+          disabled={!draft}
+          title="Cluster sync is beta — may produce stale titles after a cluster rename"
+        >
+          Sync clusters (all){' '}
+          <BetaTag onClick={() => setShowBetaInfo(true)} />
         </button>
         <button type="button" className={buttonCls} onClick={() => openModal('plantae')} disabled={!draft}>
           Sync Plantae photos
@@ -539,9 +587,10 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
           className={buttonCls}
           onClick={() => openModal('remove')}
           disabled={!draft || !syncedClusterCount}
-          title={!syncedClusterCount ? 'No clusters are currently synced' : 'One-click remove all synced cluster albums'}
+          title={!syncedClusterCount ? 'No clusters are currently synced' : 'Beta: deletes every synced cluster album in Immich — re-sync to recreate'}
         >
-          Remove synced clusters{syncedClusterCount != null ? ` (${syncedClusterCount})` : ''}
+          Remove synced clusters{syncedClusterCount != null ? ` (${syncedClusterCount})` : ''}{' '}
+          <BetaTag onClick={() => setShowBetaInfo(true)} />
         </button>
       </div>
 
@@ -584,13 +633,12 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
           setOverrideScore={setOverrideScore}
           overrideForce={overrideForce}
           setOverrideForce={setOverrideForce}
-          overrideRemoteDelete={overrideRemoteDelete}
-          setOverrideRemoteDelete={setOverrideRemoteDelete}
           previewCount={previewCount}
           previewing={previewing}
           syncedClusterCount={syncedClusterCount}
         />
       )}
+      <BetaInfoModal open={showBetaInfo} onClose={() => setShowBetaInfo(false)} />
     </section>
   );
 }
@@ -676,8 +724,6 @@ function ConfirmModal(props: {
   setOverrideScore: (v: number) => void;
   overrideForce: boolean;
   setOverrideForce: (v: boolean) => void;
-  overrideRemoteDelete: boolean;
-  setOverrideRemoteDelete: (v: boolean) => void;
   previewCount: number | null;
   previewing: boolean;
   syncedClusterCount: number | null;
@@ -687,7 +733,6 @@ function ConfirmModal(props: {
     overridePeople, setOverridePeople,
     overrideScore, setOverrideScore,
     overrideForce, setOverrideForce,
-    overrideRemoteDelete, setOverrideRemoteDelete,
     previewCount, previewing,
     syncedClusterCount,
   } = props;
@@ -710,17 +755,13 @@ function ConfirmModal(props: {
             <p className="m-0">
               {syncedClusterCount == null
                 ? 'Counting synced clusters…'
-                : `Remove ${syncedClusterCount} cluster→album mapping${syncedClusterCount === 1 ? '' : 's'} from the local DB.`}
+                : `Delete ${syncedClusterCount} cluster album${syncedClusterCount === 1 ? '' : 's'} from Immich and drop the local mapping${syncedClusterCount === 1 ? '' : 's'}.`}
             </p>
-            <label className="inline-flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={overrideRemoteDelete}
-                onChange={e => setOverrideRemoteDelete(e.target.checked)}
-                className="accent-accent"
-              />
-              Also delete the Immich albums (default off — safer)
-            </label>
+            <p className="m-0 text-fg-1 text-[0.8rem]">
+              Beta behavior: cluster sync always deletes the matching
+              Immich album (no orphan option). You can re-sync to recreate
+              the albums with the <code>#BotaniSense</code> hashtag.
+            </p>
           </>
         ) : (
           <>

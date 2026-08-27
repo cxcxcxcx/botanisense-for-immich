@@ -17,9 +17,9 @@ interface Props {
 type Phase = 'form' | 'running' | 'done' | 'error';
 
 const FIELD_CLS =
-  'block text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[280px] flex-[1_1_280px]';
+  'block text-fg-1 text-[0.8rem] flex flex-col gap-[2px]';
 const INPUT_CLS =
-  'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent w-full';
+  'bg-bg-2 text-fg border border-line2 px-2.5 py-1 rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent w-full';
 
 export function KnnBuildModal({ open, onClose }: Props) {
   const push = useToasts();
@@ -27,9 +27,10 @@ export function KnnBuildModal({ open, onClose }: Props) {
   const [args, setArgs] = useState<KnnBuildArgs>({
     parquet_glob: '/data/TOL/*.parquet',
     tag: 'v1',
-    index_dir: '/media/4T_Ext/bioclip_inventory/index',
+    index_dir: 'data/knn-index',
     kingdoms: '',
     index_type: 'ivf',
+    resume: false,
   });
   const [job, setJob] = useState<KnnBuildJobSnapshot | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -116,10 +117,10 @@ export function KnnBuildModal({ open, onClose }: Props) {
   return (
     <Modal open={open} onClose={onClose} title="🧠 Build KNN index">
       {phase === 'form' && (
-        <form onSubmit={handleSubmit} className="flex flex-col gap-3 text-[0.85rem]">
+        <form onSubmit={handleSubmit} className="flex flex-col gap-2 text-[0.85rem]">
           <p className="text-fg-1">
             Builds a FAISS IVF index from TreeOfLife-200M embeddings. Heavy: ~5–30 min depending on
-            dataset size and CPU. Output: <code className="font-mono text-fg">{args.index_dir}</code>.
+            dataset size and CPU. Output: <code className="font-mono text-fg">{args.index_dir}</code> (path must be writable by the server).
           </p>
           <label className={FIELD_CLS}>
             Parquet glob
@@ -150,7 +151,7 @@ export function KnnBuildModal({ open, onClose }: Props) {
               className={INPUT_CLS}
               value={args.index_dir ?? ''}
               onChange={e => setArgs({ ...args, index_dir: e.target.value })}
-              placeholder="/media/4T_Ext/bioclip_inventory/index"
+              placeholder="data/knn-index (or any path the server can write to)"
             />
           </label>
           <label className={FIELD_CLS}>
@@ -173,6 +174,17 @@ export function KnnBuildModal({ open, onClose }: Props) {
               <option value="ivf">ivf (default — fast for large libraries)</option>
               <option value="flat">flat (slow but exact — small libraries only)</option>
             </select>
+          </label>
+          <label className="flex items-center gap-2 text-fg-1 text-[0.8rem] cursor-pointer">
+            <input
+              type="checkbox"
+              checked={args.resume ?? false}
+              onChange={e => setArgs({ ...args, resume: e.target.checked })}
+              className="accent-accent"
+            />
+            <span>
+              Resume existing index (load &amp; continue adding instead of training fresh) — for multi-pass builds that exceed RLIMIT_DATA
+            </span>
           </label>
           <div className="flex gap-2 justify-end pt-1">
             <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={onClose}>Cancel</button>

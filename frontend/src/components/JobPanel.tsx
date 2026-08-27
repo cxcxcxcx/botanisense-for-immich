@@ -122,16 +122,21 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
     'sync-all': {
       title: () => 'Sync all clusters as albums',
       confirmText: () => 'Create one Immich album per cluster and add every photo?',
-      runningText: (added, total) => `Syncing ${added.toLocaleString()} / ${total.toLocaleString()} photos across clusters…`,
-      doneSubject: () => 'photos added across all cluster albums',
+      // Progress tracks clusters (the unit of work the user clicked on),
+      // not photos — one cluster can hold 10k+ photos which made the
+      // photo-count bar look frozen at 0% until the very last cluster.
+      // Junk-drawer clusters (no species-rank scores) are filtered out
+      // server-side, so n_clusters here is the post-filter count.
+      runningText: (done, total) => `Syncing cluster ${done.toLocaleString()} of ${total.toLocaleString()}…`,
+      doneSubject: () => 'clusters synced',
       hasPreview: false,
       hasAlbumLink: false,
       registryKey: 'cluster_album_jobs',
       preview: () => Promise.reject(new Error('no preview')),
       start: () => startSyncAllClusterAlbums(),
       extractProgress: snap => ({
-        added: (snap.photos_added as number | undefined) ?? (snap.clusters_done as number | undefined) ?? 0,
-        total: (snap.n_assets_total as number | undefined) ?? 0,
+        added: (snap.clusters_done as number | undefined) ?? 0,
+        total: (snap.n_clusters as number | undefined) ?? 0,
       }),
     },
     'purge-missing': {

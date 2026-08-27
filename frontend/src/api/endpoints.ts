@@ -9,6 +9,7 @@ import type {
   BulkClusterRemoveResponse,
   ClusterAlbumMapping,
   ClustersResponse,
+  Health,
   JobPreview,
   JobSnapshot,
   JobStart,
@@ -43,6 +44,12 @@ export const getKnnStatus = () =>
 
 export const getStatus    = () =>
   fetchJson<PipelineStatus>('/api/status');
+
+export const getHealth    = () =>
+  fetchJson<Health>('/api/health');
+
+export const getConfig    = () =>
+  fetchJson<{ immich_public_url: string }>('/api/config');
 
 export const getLogs      = (tail = 200) =>
   fetchJson<{ lines: string[] }>('/api/logs', { query: { tail } });
@@ -160,10 +167,13 @@ export const startSyncAllClusterAlbums = (
     body: p,
   });
 
-export const deleteClusterAlbum = (cluster_id: number, delete_in_immich: boolean) =>
+// Always deletes the Immich album too (cluster sync is beta, policy
+// is "never leave orphans"). If the Immich album is already gone
+// (404), `remote_deleted=false` is returned and treated as success.
+export const deleteClusterAlbum = (cluster_id: number) =>
   fetchJson<{ deleted: boolean; remote_deleted: boolean }>(
     `/api/album/cluster/${cluster_id}`,
-    { method: 'DELETE', query: { delete_in_immich: String(delete_in_immich) } },
+    { method: 'DELETE' },
   );
 
 // ---- Bulk-remove synced clusters --------------------------------------

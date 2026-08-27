@@ -18,8 +18,11 @@ export function KnnAlert() {
     return () => { cancelled = true; };
   }, []);
 
-  // Loading or healthy → no alert.
-  if (!data || data.index_built) return null;
+  // Loading, healthy, or build currently in flight → no alert.
+  // While building the JobPanel shows live progress; stacking the
+  // "missing" warning on top of an active build is misleading
+  // (looks like the build is doing nothing).
+  if (!data || data.index_built || data.building) return null;
 
   return (
     <div className="knn-alert" role="alert">
@@ -30,7 +33,17 @@ export function KnnAlert() {
       </svg>
       <div>
         <h4 className="knn-alert-title">KNN: reference index missing</h4>
-        <p className="knn-alert-body">reclassify will return 503 error.</p>
+        <p className="knn-alert-body">
+          Build a KNN index to enable re-classification. Open the Run
+          page → <strong>Build KNN index</strong> → pick a TreeOfLife-200M
+          parquet file. Builds take hours to days depending on size.
+          Until built, KNN reclassification is disabled.
+        </p>
+        {data.inventory_dir && (
+          <p className="knn-alert-body text-[10px] text-fg-1 mt-1">
+            Expected at: <code className="font-mono">{data.inventory_dir}</code>
+          </p>
+        )}
       </div>
     </div>
   );

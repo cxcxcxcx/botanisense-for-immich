@@ -205,6 +205,10 @@ export interface ClustersResponse {
 export interface KnnStatus {
   inventory_dir: string;
   index_built: boolean;
+  // True iff /api/knn/build has an active child process. UI suppresses
+  // the "missing index" warning while this is set (the JobPanel shows
+  // progress separately, and stacking both is confusing).
+  building?: boolean;
   version: string | null;
   n_rows: number;
   dim: number;
@@ -224,6 +228,11 @@ export interface KnnBuildArgs {
   index_dir?: string | null;
   kingdoms?: string | null;
   index_type?: string | null;
+  // If True, the build loads the existing index at index_dir and
+  // continues adding instead of training fresh. Used for multi-pass
+  // builds that exceed RLIMIT_DATA — split a 130M-row build into N
+  // sequential ~50M-row passes, the 2nd/3rd with resume=True.
+  resume?: boolean;
 }
 
 export interface KnnBuildJobSnapshot extends JobSnapshot {
@@ -237,6 +246,50 @@ export interface KnnBuildJobSnapshot extends JobSnapshot {
 export interface KnnBuildLogsResponse {
   job_id: string;
   lines: string[];
+}
+
+// /api/health — pre-flight check surfaced by HealthBanner.
+// Every field is optional at the type level because the endpoint is
+// best-effort and may degrade gracefully; the banner falls back to
+// "loading…" if the whole request fails.
+// /api/config — non-secret config surfaced to the SPA. Currently
+// just the public Immich URL, used by AssetDetail's "Open in Immich"
+// button. Extend as the UI needs more runtime info.
+export interface PublicConfig {
+  immich_public_url: string;
+}
+
+export interface HealthImmich {
+  ok?: boolean;
+  version?: string | null;
+  error?: string | null;
+}
+export interface HealthApiKey {
+  ok?: boolean;
+  scope?: 'ok' | 'none' | string;
+  error?: string | null;
+}
+export interface HealthKnn {
+  built?: boolean;
+  version?: string | null;
+  path?: string;
+  configured?: boolean;
+}
+export interface HealthBioclip {
+  weights_present?: boolean;
+  cache_path?: string;
+}
+export interface HealthDb {
+  ok?: boolean;
+  path?: string;
+  size_bytes?: number;
+}
+export interface Health {
+  immich?: HealthImmich;
+  api_key?: HealthApiKey;
+  knn?: HealthKnn;
+  bioclip?: HealthBioclip;
+  db?: HealthDb;
 }
 
 export interface PipelineStatus {
@@ -369,9 +422,12 @@ export interface SyncDefaultsResponse {
 // Bulk-remove cluster album mappings. Mirrors POST
 // /api/album/cluster/remove. `cluster_ids=null` means "all
 // currently synced clusters" — the default Run-page action.
+//
+// `delete_in_immich` was removed: cluster sync is beta, and the
+// policy is "never leave orphans" — the Immich album always goes
+// with the local mapping.
 export interface BulkClusterRemoveParams {
   cluster_ids: number[] | null;
-  delete_in_immich: boolean;
 }
 export interface BulkClusterRemoveError {
   cluster_id: number;

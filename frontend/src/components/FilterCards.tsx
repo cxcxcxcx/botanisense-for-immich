@@ -301,9 +301,31 @@ export function FilterCards() {
               />
             )}
             {isLoading && visibleCards.length === 0 && !stickyActive ? (
-              <div className="p-10 text-center text-fg-1 whitespace-pre-wrap col-span-full">Loading filters…</div>
+              <div className="p-10 text-center text-fg-1 whitespace-pre-wrap col-span-full">Loading…</div>
             ) : visibleCards.length === 0 && !stickyActive ? (
-              <div className="p-10 text-center text-fg-1 whitespace-pre-wrap col-span-full">No matches.</div>
+              // Empty state for Level 1. The most common cause is the
+              // local `q=` search pill filtering out every card; show
+              // which search and offer a one-click clear so the user
+              // doesn't have to hunt for the input.
+              <div className="p-10 text-center text-fg-1 whitespace-pre-wrap col-span-full">
+                {filters.q.trim() ? (
+                  <>
+                    <p className="m-0">No {filters.group_by}s match <code className="font-mono">"{filters.q.trim()}"</code>.</p>
+                    <button
+                      type="button"
+                      className="mt-3 px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345] hover:border-accent"
+                      onClick={() => {
+                        setSearchInput('');
+                        setFilters({ q: '', page: 0 });
+                      }}
+                    >
+                      Clear search
+                    </button>
+                  </>
+                ) : (
+                  <p className="m-0">No {filters.group_by}s in the library.</p>
+                )}
+              </div>
             ) : (
               visibleCards.map(c => (
                 <ClusterCardTile

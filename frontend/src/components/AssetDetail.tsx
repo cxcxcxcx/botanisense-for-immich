@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getAsset, reclassifyBbox, reclassify } from '../api/endpoints';
+import { getAsset, reclassifyBbox, reclassify, getConfig } from '../api/endpoints';
 import type { AssetDetail as AssetDetailType, PlantAttributionRow } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
@@ -64,6 +64,10 @@ export function AssetDetail({ assetId }: Props) {
   // 'preview' size. Reset on asset change so each asset tries fullsize
   // first.
   const [usePreview, setUsePreview] = useState(false);
+  // Public Immich URL for the "Open in Immich ↗" deep-link. Fetched
+  // once on mount; null hides the button (e.g. behind a misconfigured
+  // reverse proxy).
+  const [immichPublicUrl, setImmichPublicUrl] = useState<string | null>(null);
   const push = useToasts();
 
   useEffect(() => {
@@ -77,6 +81,14 @@ export function AssetDetail({ assetId }: Props) {
       .catch(e => { if (!cancelled) setError(e); });
     return () => { cancelled = true; };
   }, [assetId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getConfig()
+      .then(c => { if (!cancelled) setImmichPublicUrl(c.immich_public_url); })
+      .catch(() => { /* silently no link */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const handleReclassifyAll = async () => {
     try {
@@ -160,6 +172,17 @@ export function AssetDetail({ assetId }: Props) {
             }
           }}
         >{copied ? 'Copied ✓' : 'Copy ID'}</button>
+        {immichPublicUrl && (
+          <a
+            href={`${immichPublicUrl.replace(/\/$/, '')}/photos/${data.asset_id}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-1.5 py-0.5 rounded border border-[#345] bg-transparent text-[10px] text-fg-1 no-underline hover:bg-[#234] hover:border-accent"
+            title="Open this asset in the Immich web UI"
+          >
+            Open in Immich ↗
+          </a>
+        )}
         {/* Person chip — mirrors the grid filter state. Three states:
             true (👤, accent), false (no person, dim), null (unscanned,
             italic 'unscanned'). Drives from data.has_person which is

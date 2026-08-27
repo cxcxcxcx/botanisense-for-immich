@@ -47,9 +47,15 @@ export type EventStreamReadyState =
 
 type Subscriber<T> = (data: T | null) => void;
 
+// `subscribers` is `Set<(data: any) => void>` (not `Set<Subscriber<T>>`)
+// so a Subscriber<T1> can coexist with a Subscriber<T2> in the same
+// Set — the module-level `_streams` map holds one handle per `path`
+// across all subscribers regardless of T. Using `any` here keeps the
+// callbacks bivariant; the runtime type-check at `add()` time is the
+// caller's responsibility.
 interface StreamHandle<T> {
   es: EventSource;
-  subscribers: Set<Subscriber<T>>;
+  subscribers: Set<(data: any) => void>;
   lastData: T | null;
   readyState: EventStreamReadyState;
   readySubscribers: Set<(s: EventStreamReadyState) => void>;
@@ -133,10 +139,11 @@ export function useEventStream<T>(path: string): UseEventStreamResult<T> {
   const data = useSyncExternalStore<T | null>(
     (cb) => {
       const handle = _acquire<T>(path);
-      handle.subscribers.add(cb);
-      // Push current state immediately so the new subscriber doesn't
-      // have to wait for the next SSE event.
-      cb(handle.lastData);
+      // `cb` is the no-arg subscribe callback from useSyncExternalStore;
+      // we don't push current state through it (getSnapshot below
+      // returns the latest lastData on the next read). The cast to
+      // `(data: any) => void` is safe because cb ignores its args.
+      handle.subscribers.add(cb as unknown as (data: any) => void);
       return () => _release(path, cb);
     },
     () => (_streams.get(path)?.lastData ?? null) as T | null,
