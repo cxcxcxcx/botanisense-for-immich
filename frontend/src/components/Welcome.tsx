@@ -1,15 +1,47 @@
 import { useEffect, useState } from 'react';
 import { getResults, getStatus } from '../api/endpoints';
-import { useApp } from '../state/AppContext';
 import { navigate } from '../hooks/useRoute';
 
-// Onboarding panel shown on the browse-list view when the local DB is
-// empty (no pipeline runs yet). The user lands here after a fresh
-// install and is greeted with what to do next, instead of an
-// unexplained empty grid.
+// Onboarding wizard shown on the browse-list view when the local DB is
+// empty. Three steps — Connect → Seed query → First run — with a
+// localStorage-persisted "I'm done with this step" state so the user
+// doesn't see the same hint twice. Disappears automatically once a
+// pipeline run has produced any assets.
+//
+// Steps:
+//   1. Connect Immich — show the exact lines to paste into
+//      config.toml and .env (no server endpoint to write them, by
+//      design — secrets stay on disk).
+//   2. Seed query — text input; value persists to localStorage and
+//      is read by ParamsForm as the default.
+//   3. First run — a CTA that jumps to the Run page with the seed
+//      query pre-filled.
+
+type WizardStep = 'connect' | 'seed' | 'run' | 'done';
+
+const STEP_ORDER: WizardStep[] = ['connect', 'seed', 'run', 'done'];
+
+const STORAGE_KEY_STEP = 'botanisense:onboarded-step';
+const STORAGE_KEY_SEED = 'botanisense:seed-query';
+
+function readStep(): WizardStep {
+  if (typeof window === 'undefined') return 'connect';
+  const v = localStorage.getItem(STORAGE_KEY_STEP);
+  return v && (STEP_ORDER as string[]).includes(v) ? (v as WizardStep) : 'connect';
+}
+
+function readSeed(): string {
+  if (typeof window === 'undefined') return 'intentional plant photos';
+  return localStorage.getItem(STORAGE_KEY_SEED) || 'intentional plant photos';
+}
+
+function writeStep(s: WizardStep) {
+  localStorage.setItem(STORAGE_KEY_STEP, s);
+}
 
 export function Welcome() {
-  const { dispatch } = useApp();
+  const [step, setStep] = useState<WizardStep>(readStep);
+  const [seedQuery, setSeedQuery] = useState<string>(readSeed);
   const [hasRuns, setHasRuns] = useState<boolean | null>(null);
   const [totalAssets, setTotalAssets] = useState<number | null>(null);
 
@@ -17,14 +49,9 @@ export function Welcome() {
     let cancelled = false;
     Promise.all([
       getStatus().catch(() => null),
-      // 1-row probe to learn the global asset count without paying for
-      // the full results payload.
       getResults({ page: 0, page_size: 1 }).catch(() => null),
     ]).then(([status, resultsResp]) => {
       if (cancelled) return;
-      // hasRuns: best-effort signal that the pipeline has actually run.
-      // The status payload doesn't carry a run count, so we infer from
-      // stage_times (any pipeline run records at least one stage time).
       const ranSomething = status != null && (
         Object.keys(status.stage_times ?? {}).length > 0 ||
         status.status === 'running'
@@ -35,84 +62,216 @@ export function Welcome() {
     return () => { cancelled = true; };
   }, []);
 
-  // If the probe hasn't returned yet, render a lightweight placeholder
-  // so the empty grid below doesn't flash. Otherwise check both: a
-  // populated DB with no runs is the normal "ready to browse" state
-  // (we still show the welcome panel since they haven't seen a run).
-  const showWelcome = hasRuns === false && totalAssets === 0;
-  if (!showWelcome) return null;
+  // Once the DB has data, the wizard is done forever.
+  useEffect(() => {
+    if (hasRuns === true && totalAssets !== null && totalAssets > 0 && step !== 'done') {
+      setStep('done');
+      writeStep('done');
+    }
+  }, [hasRuns, totalAssets, step]);
+
+  if (step === 'done') return null;
+
+  const advance = (next: WizardStep) => {
+    setStep(next);
+    writeStep(next);
+  };
 
   return (
     <section
-      className="m-4 sm:m-6 p-6 sm:p-8 rounded-xl bg-bg-1 border border-line2 max-w-[640px]"
-      aria-label="Welcome"
+      className="m-4 sm:m-6 p-6 sm:p-8 rounded-xl bg-bg-1 border border-line2 max-w-[720px]"
+      aria-label="Setup wizard"
     >
-      <h2 className="text-xl sm:text-2xl m-0 mb-2">Welcome to BotaniSense</h2>
-      <p className="text-fg-1 text-[13px] sm:text-[14px] m-0 mb-5">
-        Browse your Immich library by plant species. BioCLIP-2 ranks
-        every photo against the TreeOfLife-200M label set; you group the
-        results, drill into clusters, and optionally push curated
-        albums back into Immich.
-      </p>
+      <header className="flex items-baseline justify-between gap-3 mb-3">
+        <h2 className="text-xl sm:text-2xl m-0">Welcome to BotaniSense</h2>
+        <span className="text-[11px] text-fg-1 font-mono">
+          Step {STEP_ORDER.indexOf(step) + 1} / 3
+        </span>
+      </header>
 
-      <ol className="m-0 p-0 list-none counter-reset-step space-y-3 mb-5">
-        <Step n={1} title="Connect Immich">
-          Set <code className="font-mono">[immich].base_url</code> in
-          {' '}<code className="font-mono">config.toml</code> and
-          {' '}<code className="font-mono">IMMICH_API_KEY</code> in
-          {' '}<code className="font-mono">.env</code>, then restart the
-          server.
-        </Step>
-        <Step n={2} title="Run your first pipeline">
-          Open the Run page, pick a seed query
-          {' '}(<em>red flowers</em>, <em>moss on rocks</em>, …), and
-          click <strong>Run</strong>. BioCLIP-2 loads lazily on first
-          use — expect ~5 GB RSS for the duration of the run.
-        </Step>
-        <Step n={3} title="Browse and sync">
-          Come back here to browse by cluster, species, genus, or
-          family. From the Run page you can push Plantae or per-cluster
-          albums back into Immich.
-        </Step>
-      </ol>
+      <Stepper current={step} />
 
-      <div className="flex flex-wrap gap-2">
-        <button
-          type="button"
-          className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
-          onClick={() => {
-            dispatch({ type: 'SET_FILTERS_COLLAPSED', collapsed: false });
-            navigate('run');
-          }}
+      {step === 'connect' && (
+        <Step
+          title="Connect Immich"
+          help="Two config files, both gitignored. Edit them once, restart the server."
         >
-          Open Run page →
-        </button>
-        <a
-          href="https://github.com/cxcxcxcx/botanisense-for-immich#quickstart"
-          target="_blank"
-          rel="noopener noreferrer"
-          className="px-3 py-1.5 rounded border border-line2 text-fg text-sm no-underline hover:border-accent"
+          <p className="text-fg-1 text-[13px] m-0 mb-3">
+            Copy the templates and fill in your Immich URL + admin API
+            key. The API key is generated in Immich → Administration →
+            Settings → API Keys.
+          </p>
+          <CodeBlock
+            lines={[
+              '# In config.toml',
+              '[immich]',
+              'base_url = "http://192.168.1.10:2283"',
+              '',
+              '# In .env',
+              'IMMICH_API_KEY=your-key-here',
+            ]}
+          />
+          <p className="text-fg-2 text-[12px] m-0 mt-3">
+            After editing, restart uvicorn (Ctrl+C, then re-run).
+          </p>
+          <StepActions onNext={() => advance('seed')} nextLabel="Next: pick a seed query" />
+        </Step>
+      )}
+
+      {step === 'seed' && (
+        <Step
+          title="Pick a seed query"
+          help="This is what the pipeline asks Immich's smart-search for. Try descriptive phrases — plants, scenes, or photo style."
         >
-          View setup guide ↗
-        </a>
-      </div>
+          <p className="text-fg-1 text-[13px] m-0 mb-3">
+            The default covers most libraries. Replace it with
+            something narrower if your photos need it.
+          </p>
+          <input
+            type="text"
+            value={seedQuery}
+            onChange={e => {
+              setSeedQuery(e.target.value);
+              localStorage.setItem(STORAGE_KEY_SEED, e.target.value);
+            }}
+            placeholder="intentional plant photos"
+            className="w-full bg-bg-2 text-fg border border-line2 px-2.5 py-2 rounded text-[0.9rem] font-mono focus:outline-none focus:border-accent"
+          />
+          <p className="text-fg-2 text-[11px] m-0 mt-2">
+            Examples: <em>red flowers</em>, <em>moss on rocks</em>, <em>tree bark close-up</em>, <em>succulents in pots</em>.
+          </p>
+          <StepActions
+            onBack={() => advance('connect')}
+            onNext={() => advance('run')}
+            nextLabel="Next: start first run"
+          />
+        </Step>
+      )}
+
+      {step === 'run' && (
+        <Step
+          title="Start first run"
+          help="BioCLIP-2 loads lazily on first use — expect ~5 GB RSS for the duration of the run."
+        >
+          <p className="text-fg-1 text-[13px] m-0 mb-4">
+            Run the pipeline with your seed query. It will pull the top
+            {` `}
+            <strong>10 000</strong>
+            {` `}matching photos from Immich and classify each one
+            against the TreeOfLife-200M label set. After it finishes,
+            you'll land back here on the Browse view.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
+              onClick={() => {
+                writeStep('done');
+                setStep('done');
+                navigate('run');
+              }}
+            >
+              Open Run page →
+            </button>
+            <button
+              type="button"
+              className="px-3 py-1.5 rounded border border-line2 text-fg text-sm no-underline hover:border-accent"
+              onClick={() => {
+                writeStep('done');
+                setStep('done');
+              }}
+            >
+              Skip for now
+            </button>
+          </div>
+        </Step>
+      )}
     </section>
   );
 }
 
-function Step({ n, title, children }: { n: number; title: string; children: React.ReactNode }) {
+function Step({ title, help, children }: { title: string; help: string; children: React.ReactNode }) {
   return (
-    <li className="flex gap-3 items-start">
-      <span
-        aria-hidden="true"
-        className="shrink-0 w-6 h-6 rounded-full bg-bg-2 border border-line2 text-fg-1 text-[12px] flex items-center justify-center font-mono"
+    <div>
+      <h3 className="text-base m-0 mb-1">{title}</h3>
+      <p className="text-fg-2 text-[11.5px] m-0 mb-3">{help}</p>
+      {children}
+    </div>
+  );
+}
+
+function StepActions({
+  onBack,
+  onNext,
+  nextLabel,
+}: {
+  onBack?: () => void;
+  onNext: () => void;
+  nextLabel: string;
+}) {
+  return (
+    <div className="flex gap-2 mt-4">
+      {onBack && (
+        <button
+          type="button"
+          className="px-2.5 py-1 rounded border border-line2 text-fg text-sm hover:border-accent"
+          onClick={onBack}
+        >
+          Back
+        </button>
+      )}
+      <button
+        type="button"
+        className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
+        onClick={onNext}
       >
-        {n}
-      </span>
-      <div>
-        <strong className="block text-[14px]">{title}</strong>
-        <span className="block text-fg-1 text-[12.5px]">{children}</span>
-      </div>
-    </li>
+        {nextLabel}
+      </button>
+    </div>
+  );
+}
+
+function Stepper({ current }: { current: WizardStep }) {
+  // Three-dot indicator above the active step.
+  const labels: Record<WizardStep, string> = {
+    connect: 'Connect',
+    seed: 'Seed query',
+    run: 'First run',
+    done: 'Done',
+  };
+  const order: WizardStep[] = ['connect', 'seed', 'run'];
+  const activeIdx = order.indexOf(current);
+  return (
+    <ol className="m-0 mb-4 p-0 list-none flex items-center gap-2 text-[11px] text-fg-1">
+      {order.map((s, i) => (
+        <li key={s} className="flex items-center gap-2">
+          <span
+            aria-hidden="true"
+            className={
+              'inline-flex items-center justify-center w-5 h-5 rounded-full border text-[10px] font-mono ' +
+              (i < activeIdx
+                ? 'bg-accent/30 border-accent text-accent'
+                : i === activeIdx
+                ? 'bg-bg-2 border-accent text-fg'
+                : 'bg-bg-2 border-line2 text-fg-1')
+            }
+          >
+            {i < activeIdx ? '✓' : i + 1}
+          </span>
+          <span className={i === activeIdx ? 'text-fg' : ''}>{labels[s]}</span>
+          {i < order.length - 1 && (
+            <span aria-hidden="true" className="text-fg-2">›</span>
+          )}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function CodeBlock({ lines }: { lines: string[] }) {
+  return (
+    <pre className="m-0 p-3 rounded bg-bg-2 border border-line2 text-[12px] font-mono text-fg overflow-x-auto">
+{lines.join('\n')}
+    </pre>
   );
 }
