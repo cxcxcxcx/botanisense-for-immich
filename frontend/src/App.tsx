@@ -16,6 +16,8 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import { Welcome } from './components/Welcome';
 import { HealthBanner } from './components/HealthBanner';
 import { PlantaeLegend } from './components/PlantaeLegend';
+import { ShortcutsHelpModal } from './components/ShortcutsHelpModal';
+import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
@@ -30,6 +32,16 @@ export function App() {
   // Default to open on first visit so the most consequential knob
   // (`query`) is visible without an extra click; remember the user's
   // preference in localStorage so it survives reloads.
+  const [showShortcuts, setShowShortcuts] = useState(false);
+
+  // Keyboard shortcuts — single keys for the two main views + help.
+  // Disabled while typing in an input (handled by the hook itself).
+  useKeyboardShortcuts([
+    { key: 'b', label: 'b', action: () => navigate('browse-list') },
+    { key: 'r', label: 'r', action: () => navigate('run') },
+    { key: '?', label: '?', action: () => setShowShortcuts(s => !s) },
+  ]);
+
   const [paramsOpen, setParamsOpen] = useState<boolean>(() => {
     if (typeof window === 'undefined') return true;
     const stored = localStorage.getItem('botanisense:params-open');
@@ -183,6 +195,7 @@ export function App() {
           already has its own tier indicator next to the slider, so
           we pass `dismissible={false}` there to avoid a duplicate. */}
       <PlantaeLegend dismissible={view !== 'run'} />
+      <ShortcutsHelpModal open={showShortcuts} onClose={() => setShowShortcuts(false)} />
       </ErrorBoundary>
     </>
   );
