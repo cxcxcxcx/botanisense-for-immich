@@ -1,8 +1,20 @@
 <!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <!-- Inline theme bootstrap: prefers localStorage, falls back to
+         prefers-color-scheme, defaults to dark. Mirrors the toggle in
+         Header.tsx so reloads don't flash the wrong theme. -->
+    <script>
+        (function () {
+          try {
+            var saved = localStorage.getItem('botanisense:theme');
+            var theme = saved || (window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+            document.documentElement.setAttribute('data-theme', theme);
+          } catch (e) { /* localStorage may be blocked; ignore */ }
+        })();
+      </script>
     <title>BotaniSense for Immich</title>
     <link rel="icon" href="/favicon.svg" />
   </head>

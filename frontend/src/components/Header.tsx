@@ -1,5 +1,6 @@
 import { navigate, topLevel, type View } from '../hooks/useRoute';
 import { useApp } from '../state/AppContext';
+import { useEffect, useState } from 'react';
 
 // Inline BotaniSense brand mark — same fan-of-blades SVG used by
 // `frontend/public/favicon.svg`. Drawn at 28×28 in the header so the
@@ -43,6 +44,22 @@ export function Header({ view }: Props) {
     !!state.filters.genus ||
     !!state.filters.family;
   const browseTarget: View = hasActiveFilter ? 'browse-content' : 'browse-list';
+
+  // Light/dark theme toggle. Initial value mirrors the inline
+  // bootstrap script in index.html — same precedence: localStorage >
+  // prefers-color-scheme > 'dark'.
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    if (typeof document !== 'undefined') {
+      const attr = document.documentElement.getAttribute('data-theme');
+      if (attr === 'light' || attr === 'dark') return attr;
+    }
+    return 'dark';
+  });
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    try { localStorage.setItem('botanisense:theme', theme); } catch { /* ignore */ }
+  }, [theme]);
+
   return (
     <header className="sticky top-0 z-50 bg-bg/95 backdrop-blur flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
       {/* Brand identity: bare fan-of-blades SVG (no gradient ring).
@@ -88,6 +105,20 @@ export function Header({ view }: Props) {
             <span className="hidden sm:inline">Run / Sync</span>
           </button>
         </div>
+        {/* Theme toggle — sun/moon icon flips data-theme between light
+            and dark. State is mirrored to <html data-theme> via the
+            useEffect above and persisted in localStorage. Inline
+            bootstrap in index.html reads the same key on first paint
+            to avoid a flash of the wrong theme. */}
+        <button
+          type="button"
+          aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
+          className="ml-1 p-1.5 rounded border border-line2 text-fg-1 hover:text-fg hover:border-accent"
+          onClick={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
+        >
+          {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+        </button>
       </div>
     </header>
   );
@@ -108,6 +139,30 @@ function RunIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <polyline points="4 17 10 11 4 5" />
       <line x1="12" y1="19" x2="20" y2="19" />
+    </svg>
+  );
+}
+
+function SunIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4" />
+      <path d="M12 2v2" />
+      <path d="M12 20v2" />
+      <path d="M4.93 4.93l1.41 1.41" />
+      <path d="M17.66 17.66l1.41 1.41" />
+      <path d="M2 12h2" />
+      <path d="M20 12h2" />
+      <path d="M4.93 19.07l1.41-1.41" />
+      <path d="M17.66 6.34l1.41-1.41" />
+    </svg>
+  );
+}
+
+function MoonIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" />
     </svg>
   );
 }

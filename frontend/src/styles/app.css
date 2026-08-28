@@ -38,6 +38,38 @@
   dialog > article > header > button.close:hover { opacity: 1; }
 }
 
+/* Light-theme overrides — minimal pass that flips the most-used
+   surfaces. Many ad-hoc Tailwind classes (bg-[#234], bg-[#345],
+   bg-[#161616], border-[#345], text-[#7ad]) are dark-only and
+   don't have light counterparts yet; the theme flip works for
+   Pico's defaults + body/header/cards/buttons via the token
+   remap below, with the rest of the dark-only classes still
+   rendering as dark accents on a light background. A full audit
+   of every hard-coded hex value is a separate task. */
+[data-theme='light'] {
+  --pico-background-color: #fafafa;
+  --pico-color: #1f2937;
+  --pico-card-background-color: #ffffff;
+  --pico-card-border-color: #e5e7eb;
+  --pico-muted-color: #6b7280;
+  --pico-muted-border-color: #d1d5db;
+}
+[data-theme='light'] body { @apply bg-white text-gray-900; }
+[data-theme='light'] .bg-bg   { background-color: #fafafa !important; }
+[data-theme='light'] .bg-bg-1 { background-color: #ffffff !important; }
+[data-theme='light'] .bg-bg-2 { background-color: #f3f4f6 !important; }
+[data-theme='light'] .text-fg   { color: #1f2937 !important; }
+[data-theme='light'] .text-fg-0 { color: #111827 !important; }
+[data-theme='light'] .text-fg-1 { color: #4b5563 !important; }
+[data-theme='light'] .text-fg-2 { color: #6b7280 !important; }
+[data-theme='light'] .border-line  { border-color: #e5e7eb !important; }
+[data-theme='light'] .border-line2 { border-color: #d1d5db !important; }
+[data-theme='light'] .border-accent { border-color: #2563eb !important; }
+[data-theme='light'] .bg-accent { background-color: #2563eb !important; }
+[data-theme='light'] .bg-accent-dark { background-color: #1d4ed8 !important; }
+[data-theme='light'] .text-accent { color: #2563eb !important; }
+[data-theme='light'] header.sticky { background-color: rgba(255,255,255,0.95) !important; }
+
 /* Components — small, named patterns the React tree references via
    @apply. Tailwind's color tokens are in tailwind.config.js. */
 @layer components {
