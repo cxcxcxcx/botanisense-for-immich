@@ -17,6 +17,7 @@ import { Welcome } from './components/Welcome';
 import { HealthBanner } from './components/HealthBanner';
 import { PlantaeLegend } from './components/PlantaeLegend';
 import { ShortcutsHelpModal } from './components/ShortcutsHelpModal';
+import { SelectionActionBar } from './components/SelectionActionBar';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
@@ -195,6 +196,7 @@ export function App() {
           already has its own tier indicator next to the slider, so
           we pass `dismissible={false}` there to avoid a duplicate. */}
       <PlantaeLegend dismissible={view !== 'run'} />
+      <SelectionActionBar />
       <ShortcutsHelpModal open={showShortcuts} onClose={() => setShowShortcuts(false)} />
       </ErrorBoundary>
     </>

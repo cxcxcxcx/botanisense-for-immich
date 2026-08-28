@@ -4225,6 +4225,44 @@ async def preview_person_backfill() -> dict:
     return {"n_assets": n}
 
 
+class AssetPlantaeOverridePayload(BaseModel):
+    """Body for POST /api/assets/batch/plantae-override (UX-17).
+
+    `value` semantics:
+      - null → clear the user override (revert to model score)
+      - 0     → force non-plant (excluded from Plantae albums even if BioCLIP says plant)
+      - 1     → force plant (included even if BioCLIP says non-plant)
+    """
+    asset_ids: list[str]
+    value: int | None
+
+
+@app.post("/api/assets/batch/plantae-override")
+async def batch_set_plantae_override(payload: AssetPlantaeOverridePayload) -> dict:
+    """Bulk-set `plantae_override` on the given assets. The first batch
+    action surfaced by the multi-select UI (UX-17); 'Mark selected as
+    non-plant' writes 0.
+
+    Asset ids that don't exist in the local DB are silently skipped
+    (the user batched a page-level selection and a photo may have
+    been re-synced between selection and action). Returns the number
+    of rows actually changed.
+
+    Invalidate /api/results and /api/clusters caches since downstream
+    filter counts and the 'Plantae only' cluster listing both depend
+    on this column.
+    """
+    updated = 0
+    with storage.connect(DB_PATH) as conn:
+        updated = storage.set_plantae_overrides(conn, payload.asset_ids, payload.value)
+    _invalidate_clusters_cache()
+    # Force /api/results to re-pull on next read; the cached payload
+    # includes plantae_score + plantae tier that no longer match.
+    with _results_lock:
+        _results_cache.clear()
+    return {"updated": updated}
+
+
 @app.post("/api/assets/purge-missing")
 async def purge_missing_assets(
     dry_run: bool = Query(default=True),

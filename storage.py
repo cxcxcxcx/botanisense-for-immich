@@ -67,7 +67,13 @@ CREATE TABLE IF NOT EXISTS assets (
   -- the asset has no GPS tag; treated as a single location when
   -- exactly one is set, so the UI should check both.
   latitude           REAL,
-  longitude          REAL
+  longitude          REAL,
+  -- User-set Plantae override. NULL = use the model score; 0 = force
+  -- non-plant (exclude from Plantae album even if BioCLIP says plant);
+  -- 1 = force plant (include even if BioCLIP says non-plant). Used by
+  -- the multi-select batch action (UX-17) — "Mark selected as
+  -- non-plant" writes 0 here.
+  plantae_override   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_assets_cluster ON assets(cluster_id);
 
@@ -281,6 +287,9 @@ def init_db(path: str | Path) -> None:
             # person found; NULL = not yet scanned (gate for the
             # pipeline's person stage). See pipeline.py:_stage_person.
             ("ALTER TABLE assets ADD COLUMN has_person INTEGER", "has_person"),
+            # User-set Plantae override (UX-17). NULL = use the model;
+            # 0 = force non-plant; 1 = force plant.
+            ("ALTER TABLE assets ADD COLUMN plantae_override INTEGER", "plantae_override"),
             # User-set cluster name override (UX-15). None = use the
             # computed name; otherwise this wins on every read.
             ("ALTER TABLE cluster_names ADD COLUMN manual_name TEXT", "manual_name"),
@@ -1241,6 +1250,26 @@ def list_cluster_albums(conn: sqlite3.Connection) -> list[dict]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def set_plantae_overrides(conn: sqlite3.Connection, asset_ids: list[str], value: int | None) -> int:
+    """Bulk-set plantae_override on the given assets.
+
+    `value` is None to clear the override, or 0/1 to set it. Returns
+    the number of rows actually changed. Missing asset_ids are
+    silently skipped (the caller probably batched the page-level
+    selection and a photo may have been re-synced out from under
+    them).
+    """
+    if not asset_ids:
+        return 0
+    placeholders = ",".join("?" for _ in asset_ids)
+    cur = conn.execute(
+        f"UPDATE assets SET plantae_override = ? "
+        f"WHERE asset_id IN ({placeholders})",
+        [value, *asset_ids],
+    )
+    return cur.rowcount
 
 
 def insert_cluster_album(conn: sqlite3.Connection, row: dict) -> None:

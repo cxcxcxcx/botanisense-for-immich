@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { ResultRow } from '../api/types';
-import { useApp } from '../state/AppContext';
+import { useApp, useSelection } from '../state/AppContext';
 import { thumbUrl } from '../lib/thumb';
 import { plantaeTier } from '../lib/plantae';
 import { formatPct } from '../lib/format';
@@ -12,6 +12,8 @@ interface Props {
 
 export function Card({ row }: Props) {
   const { dispatch } = useApp();
+  const selection = useSelection();
+  const selected = selection.has(row.asset_id);
   // Show a shimmer under the image until it loads. Resets when the
   // asset_id changes (a remount would too, but the same component
   // can be re-keyed when the user re-sorts).
@@ -32,11 +34,18 @@ export function Card({ row }: Props) {
     dispatch({ type: 'OPEN_MODAL', assetId: row.asset_id });
   };
 
+  // Multi-select checkbox (UX-17). Visible whenever the user has
+  // started selecting OR has the cursor over the card — keeps the
+  // grid clean by default but one click away from a multi-pick
+  // workflow. stopPropagation so clicking the checkbox doesn't also
+  // open the asset detail modal.
+  const showCheckbox = selected || selection.size > 0;
+
   return (
     <article
       id={`card-${row.asset_id}`}
       onClick={handleOpen}
-      className="photo-card"
+      className={`photo-card ${selected ? 'ring-2 ring-accent' : ''}`}
     >
       {/* Shimmer placeholder under the real image. Sized the same as
           the image so layout doesn't shift when the load completes. */}
@@ -49,6 +58,30 @@ export function Card({ row }: Props) {
         className={`photo-card-image transition-opacity duration-200 ${imgLoaded ? 'opacity-100' : 'opacity-0'}`}
         onLoad={() => setImgLoaded(true)}
       />
+      {/* Multi-select checkbox overlay — top-left corner. Wrapped in
+          a <label> so the entire checkbox area is the click target;
+          the click is intercepted by handleOpen via the
+          closest('button, label') check. */}
+      <label
+        className={`absolute top-1.5 left-1.5 w-6 h-6 rounded border-2 flex items-center justify-center cursor-pointer transition-opacity ${
+          showCheckbox ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+        } ${selected ? 'bg-accent border-accent' : 'bg-bg/80 border-fg-1 hover:border-accent'}`}
+        onClick={e => e.stopPropagation()}
+        title={selected ? 'Unselect' : 'Select'}
+      >
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={() => dispatch({ type: 'TOGGLE_SELECT', assetId: row.asset_id })}
+          className="sr-only"
+          aria-label={selected ? `Unselect ${row.original_file_name}` : `Select ${row.original_file_name}`}
+        />
+        {selected && (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        )}
+      </label>
       {/* Bottom overlay: tier swatch + species name (wraps to 2 lines
           so long binomials aren't truncated) + confidence pill on
           the right. Suppressed entirely for red-tier BioCLIP results

@@ -104,6 +104,11 @@ export interface AppState {
   // live in ImmichSync's local state — they don't go through the
   // reducer because they shouldn't survive a remount.
   syncDefaults: SyncDefaults | null;
+  // Multi-select state (UX-17). Set of asset_ids the user has
+  // checked via the Card checkbox. Lives in the global reducer so
+  // the floating action bar (rendered by Grid) and the cards can
+  // both read/write it without prop drilling.
+  selection: Set<string>;
 }
 
 export type Action =
@@ -119,7 +124,10 @@ export type Action =
   | { type: 'JOB_DONE'; added: number; album_id: string | null; album_url: string | null; reused: boolean }
   | { type: 'JOB_ERROR'; errorMsg: string }
   | { type: 'JOB_HIDE' }
-  | { type: 'SET_SYNC_DEFAULTS'; defaults: SyncDefaults | null };
+  | { type: 'SET_SYNC_DEFAULTS'; defaults: SyncDefaults | null }
+  | { type: 'TOGGLE_SELECT'; assetId: string }
+  | { type: 'SELECT_RANGE'; assetIds: string[]; selected: boolean }
+  | { type: 'CLEAR_SELECTION' };
 
 // ---- Initial state -------------------------------------------------------
 
@@ -141,6 +149,7 @@ const INITIAL: AppState = {
   job: defaultJob(),
   filtersCollapsed: false,
   syncDefaults: null,
+  selection: new Set<string>(),
 };
 
 // ---- Reducer -------------------------------------------------------------
@@ -223,6 +232,23 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, job: defaultJob() };
     case 'SET_SYNC_DEFAULTS':
       return { ...state, syncDefaults: action.defaults };
+    case 'TOGGLE_SELECT': {
+      const next = new Set(state.selection);
+      if (next.has(action.assetId)) next.delete(action.assetId);
+      else next.add(action.assetId);
+      return { ...state, selection: next };
+    }
+    case 'SELECT_RANGE': {
+      const next = new Set(state.selection);
+      for (const id of action.assetIds) {
+        if (action.selected) next.add(id);
+        else next.delete(id);
+      }
+      return { ...state, selection: next };
+    }
+    case 'CLEAR_SELECTION':
+      if (state.selection.size === 0) return state;
+      return { ...state, selection: new Set() };
     default:
       return state;
   }
@@ -261,4 +287,8 @@ export function useJob() {
 }
 export function useSyncDefaults() {
   return useApp().state.syncDefaults;
+}
+
+export function useSelection() {
+  return useApp().state.selection;
 }

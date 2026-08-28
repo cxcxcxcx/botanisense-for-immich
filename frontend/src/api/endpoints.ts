@@ -204,6 +204,14 @@ export const undoBulkRemoveClusterAlbums = (rows: ClusterAlbumMapping[]) =>
     { method: 'POST', body: { rows } },
   );
 
+// Multi-select batch action (UX-17). Sets plantae_override on every
+// asset_id in one round-trip; value=null clears the override.
+export const batchSetPlantaeOverride = (asset_ids: string[], value: 0 | 1 | null) =>
+  fetchJson<{ updated: number }>('/api/assets/batch/plantae-override', {
+    method: 'POST',
+    body: { asset_ids, value },
+  });
+
 // ---- Sync-to-IMMICH defaults (GET/PUT /api/settings/sync-defaults) ----
 // Persisted on the server so they survive browser changes and are
 // visible to non-browser callers. Seeded from env on first read; the
