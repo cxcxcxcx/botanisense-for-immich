@@ -174,10 +174,17 @@ export function AssetDetail({ assetId }: Props) {
     }
   };
 
-  const handleReclassifyBbox = async (bboxIndex: number) => {
+  const handleReclassifyBbox = async (detectionId: number) => {
+    if (!knnStatus?.index_built) {
+      push({ kind: 'info', message: 'Build the KNN index first (Run page → Build KNN index)' }, 3500);
+      return;
+    }
     try {
-      await reclassifyBbox({ asset_id: assetId, bbox_index: bboxIndex });
-      push({ kind: 'info', message: 'Per-crop reclassify is a no-op stub (use Reclassify with KNN)' }, 3000);
+      const r = await reclassifyBbox({ asset_id: assetId, detection_id: detectionId });
+      push({
+        kind: 'success',
+        message: `Crop KNN → ${r.result.top_species ?? '(no match)'} (${(r.result.score * 100).toFixed(1)}%)`,
+      }, 3500);
     } catch (e) {
       push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
     }
@@ -442,7 +449,7 @@ export function AssetDetail({ assetId }: Props) {
                 <button
                   type="button"
                   className="self-start text-[11px] text-fg-1 underline hover:text-fg"
-                  onClick={() => handleReclassifyBbox(i)}
+                  onClick={() => handleReclassifyBbox(d.id)}
                 >
                   Reclassify crop
                 </button>

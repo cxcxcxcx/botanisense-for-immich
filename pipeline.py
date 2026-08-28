@@ -969,6 +969,155 @@ def discover_plantae_assets(
     return accepted[:n_samples]
 
 
+def run_knn_reclassify_bbox(
+    conn,
+    *,
+    detection_id: int,
+    index_dir: Path,
+    k: int = 10,
+) -> dict:
+    """KNN reclassify a single cropped bbox (per-crop 'Reclassify crop'
+    button in AssetDetail).
+
+    Downloads the parent asset's image, crops to the bbox xywh,
+    runs BioCLIP on the crop to get a 768-d embedding, queries the
+    FAISS index, and writes the result to bbox_knn_predictions.
+
+    Cost: ~1 BioCLIP forward pass + 1 FAISS query (~ms). The pipeline
+    bbox-BioCLIP stage does the same per-crop work in batch — this is
+    a one-off trigger for users who want to retry a single crop with
+    a new KNN index without re-running the whole pipeline.
+
+    Returns the KNN result dict (same shape as
+    `run_knn_reclassify` minus the asset_id field).
+    """
+    import sys as _sys
+    import io as _io
+    _self = _sys.modules[__name__]
+    _knn = _self.knn
+
+    index_dir = Path(index_dir)
+    version_path = index_dir / "INDEX_VERSION.txt"
+    if not version_path.exists():
+        raise FileNotFoundError(
+            f"INDEX_VERSION.txt missing in {index_dir} — build the "
+            f"index with knn.build_faiss_index(...) first"
+        )
+    version_tag = next(
+        (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
+        "unknown",
+    )
+
+    # Look up the detection + the asset's image URL.
+    with storage.connect(DB_PATH) as conn_ro:
+        det = storage.get_detection_with_asset_url(
+            conn_ro, detection_id=detection_id,
+        )
+    if det is None:
+        raise ValueError(f"detection {detection_id} not found")
+
+    # Skip if cached for this (version, k).
+    with storage.connect(DB_PATH) as conn_ck:
+        if storage.bbox_knn_predictions_have_detection(
+            conn_ck,
+            detection_id=detection_id,
+            index_version=version_tag,
+            k=k,
+        ):
+            cached = storage.fetch_bbox_knn_predictions(
+                conn_ck,
+                detection_ids=[detection_id],
+                index_version=version_tag,
+                k=k,
+            ).get(detection_id)
+            if cached is not None:
+                _log.info(
+                    f"[knn bbox {detection_id}] cache hit  "
+                    f"v={version_tag} k={k} -> {cached.get('top_species')}"
+                )
+                return {
+                    "detection_id": detection_id,
+                    "asset_id": det["asset_id"],
+                    "index_version": version_tag,
+                    "k": k,
+                    "result": cached,
+                    "cached": True,
+                }
+
+    # Download the image. Prefer the asset's stored original_url
+    # (whatever Immich returned at ingest time); fall back to the
+    # /api/assets/{id}/original endpoint if the URL has since rotated.
+    client = ImmichClient(base_url=BASE_URL, api_key=API_KEY)
+    url = det.get("original_url") or f"/api/assets/{det['asset_id']}/original"
+    try:
+        img_bytes = client.download_bytes(url)
+    except Exception as e:
+        raise RuntimeError(f"download failed for {url}: {e}") from e
+
+    # Crop + BioCLIP embedding.
+    from PIL import Image
+    with Image.open(_io.BytesIO(img_bytes)) as im:
+        w_img, h_img = im.size
+        x = max(0.0, float(det["x"]))
+        y = max(0.0, float(det["y"]))
+        # detections stored as top-left xywh (floats 0..1 over image)
+        bw = max(1.0, float(det["w"]))
+        bh = max(1.0, float(det["h"]))
+        x0 = int(round(x * w_img))
+        y0 = int(round(y * h_img))
+        x1 = int(round((x + bw) * w_img))
+        y1 = int(round((y + bh) * h_img))
+        # Clamp to image bounds (the bbox coords are floats; rounding
+        # can spill past the edge by a pixel).
+        x0 = max(0, min(w_img, x0))
+        y0 = max(0, min(h_img, y0))
+        x1 = max(x0 + 1, min(w_img, x1))
+        y1 = max(y0 + 1, min(h_img, y1))
+        crop = im.convert("RGB").crop((x0, y0, x1, y1))
+
+    # BioCLIP embedding for the crop. classifier is heavy (5 GB) — only
+    # loaded on first use. _resolve_classifier() is process-global; the
+    # first call pays the load cost, subsequent calls share.
+    clf = _resolve_classifier()
+    if clf is None:
+        raise RuntimeError("classifier unavailable (BioCLIP weights not loaded?)")
+    with _clf_lock:
+        feats = clf.create_image_features([crop], normalize=True)
+    feats_np = feats.detach().cpu().numpy().astype("<f4")
+    del feats
+
+    # FAISS KNN.
+    results = _knn.classify_via_knn(
+        query_embeddings=feats_np, index_dir=index_dir, k=k,
+    )
+    if not results:
+        raise RuntimeError("KNN classifier returned no rows (empty index?)")
+    result = results[0]
+
+    # Persist + return.
+    with storage.connect(DB_PATH) as conn_wr:
+        storage.replace_bbox_knn_predictions(
+            conn_wr,
+            detection_id=detection_id,
+            index_version=version_tag,
+            k=k,
+            row=result,
+        )
+    _log.info(
+        f"[knn bbox {detection_id}] asset={det['asset_id']} "
+        f"v={version_tag} k={k} -> {result.get('top_species')} "
+        f"({result.get('score'):.3f})"
+    )
+    return {
+        "detection_id": detection_id,
+        "asset_id": det["asset_id"],
+        "index_version": version_tag,
+        "k": k,
+        "result": result,
+        "cached": False,
+    }
+
+
 def run_knn_reclassify(
     conn,
     *,
@@ -1181,14 +1330,31 @@ def run_pipeline(
             ordered_ids: list[str] = []
 
             # Stitch loop — populate / refresh the `assets` rows and
-            # decide which assets still need a BioCLIP predict. Two
-            # bulk SELECTs up front (existing rows + missing EXIF + per-
-            # asset prediction count) replace the N+1 of the old
+            # decide which assets still need a BioCLIP predict. Three
+            # bulk SELECTs up front (existing rows + missing EXIF +
+            # per-asset prediction count) replace the N+1 of the old
             # per-asset loop. For the common cached case (URLs match
             # AND captured_at is set AND predictions are complete) we
             # do ZERO writes — that was the 30-second silence between
             # "[search] reached target" and "query=... n_new=...".
+            #
+            # The user reported a still-suspicious gap between those
+            # two lines even after that fix. The three log lines
+            # below narrate what's happening in this section in plain
+            # English, with a wall-clock split between the bulk
+            # SELECTs and the in-Python loop, so a future slow run
+            # can be attributed to the right step. Elapsed seconds
+            # are measured from `_stage_end("search")` so they line
+            # up with whatever gap a user sees in the file log.
+            _stitch_t0 = time.time()
+            _log.info(
+                f"[stitch] starting: reconcile {len(assets)} Immich "
+                f"search results against the local SQLite cache — "
+                f"cache hits will skip both the EXIF fetch and the "
+                f"BioCLIP predict"
+            )
             asset_ids = [a.id for a in assets]
+            _bulk_t0 = time.time()
             existing_assets = storage.bulk_asset_rows(
                 conn, asset_ids=asset_ids
             )
@@ -1198,12 +1364,24 @@ def run_pipeline(
             cached_pred_counts = storage.bulk_fetch_prediction_counts(
                 conn, asset_ids=asset_ids, rank=rank_name
             )
+            _log.info(
+                f"[stitch] bulk SELECTs done in "
+                f"{time.time() - _bulk_t0:.2f}s — "
+                f"loaded {len(existing_assets)} existing asset rows so "
+                f"the loop can skip a URL refresh when URLs match, "
+                f"found {len(missing_captured_at)} assets still missing "
+                f"EXIF (those will trigger an Immich metadata fetch), "
+                f"found {len(cached_pred_counts)} assets that already "
+                f"have ≥{top_k} {rank_name} predictions (those can "
+                f"skip BioCLIP if their URLs also match)"
+            )
 
             n_stitched_skip = 0
             n_stitched_urls_only = 0
             n_stitched_exif_fetched = 0
             n_stitched_full_upsert = 0
 
+            _loop_t0 = time.time()
             for asset in assets:
                 original_url = f"{base_url}/api/assets/{asset.id}/original"
                 thumbnail_url = (
@@ -1282,6 +1460,20 @@ def run_pipeline(
             n_new = len(needs_bioclip)
             n_cached = len(assets) - n_new
 
+            # Two numbers worth keeping in the timeline: the in-
+            # Python walk that is doing the per-asset decision (this
+            # is the only thing the loop does), and the total time
+            # spent in the [stitch] section. If they match closely,
+            # the cost was in the loop; if there's a big gap, the
+            # cost lives outside this section (DB writes, state
+            # mirroring, etc.) and needs a different probe.
+            _log.info(
+                f"[stitch] reconcile loop walked {len(assets)} assets "
+                f"in {time.time() - _loop_t0:.2f}s — decided that "
+                f"{n_new} still need BioCLIP and {n_cached} are full "
+                f"cache hits; total [stitch] section time "
+                f"{time.time() - _stitch_t0:.2f}s"
+            )
             # One log line that explains the whole stitch. Counts
             # that are 0 are still printed — the user wants to know
             # the work actually happened (or didn't), and zero is a

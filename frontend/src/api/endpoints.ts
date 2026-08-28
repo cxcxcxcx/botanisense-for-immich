@@ -103,8 +103,23 @@ export const reclassifyVisible = (asset_ids?: string[]) =>
     { method: 'POST', body: { asset_ids } },
   );
 
-export const reclassifyBbox = (params: { asset_id: string; bbox_index: number }) =>
-  fetchJson<{ asset_id: string; bbox_index: number; note: string }>(
+export const reclassifyBbox = (params: { asset_id: string; detection_id: number }) =>
+  fetchJson<{
+    detection_id: number;
+    asset_id: string;
+    index_version: string;
+    k: number;
+    result: {
+      top_species: string | null;
+      common_name: string;
+      score: number;
+      kingdom: string;
+      family: string;
+      genus: string;
+      neighbors: { uuid: string; species: string; common_name: string; sim: number }[];
+    };
+    cached: boolean;
+  }>(
     '/api/reclassify-bbox',
     { method: 'POST', body: params },
   );

@@ -1127,10 +1127,14 @@ async def health() -> dict:
 
     # --- BioCLIP-2 weights ---
     # HuggingFace stores snapshots under
-    # ~/.cache/huggingface/models--imageomics--bioclip-2/snapshots/*/.
+    #   $HF_HOME/hub/models--imageomics--bioclip-2/snapshots/*/.
+    # Earlier this code read $HF_HOME/models--imageomics--bioclip-2 (no
+    # /hub/) which never matched the actual layout — a false-negative
+    # that made the UI say "weights not downloaded yet" even though
+    # they had been on disk since July.
+    from huggingface_hub.constants import HF_HUB_CACHE
     bioclip_weights = False
-    hf_cache = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
-    bioclip_dir = hf_cache / "models--imageomics--bioclip-2"
+    bioclip_dir = Path(HF_HUB_CACHE) / "models--imageomics--bioclip-2"
     if bioclip_dir.exists():
         for snap in bioclip_dir.glob("snapshots/*/"):
             if any(snap.glob("*.safetensors")) or any(snap.glob("*.bin")):
@@ -3668,25 +3672,49 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
 
 
 # ---- bbox-index reclassify (YOLO per-crop) -------------------------------
-# The /asset/.../modal page has a "Reclassify crop" button per detection
-# that posts {asset_id, bbox_index}. Currently we delegate to the
-# full-asset KNN reclassify (the existing pipeline), which is enough to
-# refresh the modal body. A dedicated bbox-only BioCLIP rerun is a
-# follow-up if/when the FAISS inventory exposes per-crop embeddings.
+# The AssetDetail "Reclassify crop" button (one per YOLO detection,
+# inside the debug disclosure) posts {asset_id, detection_id}.
+# We crop the parent asset to that detection's bbox xywh, run BioCLIP
+# on the crop, query the FAISS KNN index, and cache the result in
+# `bbox_knn_predictions`. The endpoint is synchronous (one crop, one
+# embedding pass, ~hundreds of ms). Requires KNN_INVENTORY_DIR to
+# have INDEX_VERSION.txt — returns 503 otherwise so the frontend can
+# surface a useful toast instead of a generic 500.
 
 class ReclassifyBboxParams(BaseModel):
     asset_id: str
-    bbox_index: int
+    detection_id: int
 
 
 @app.post("/api/reclassify-bbox")
 async def reclassify_bbox(params: ReclassifyBboxParams) -> dict:
-    """Stub: re-run KNN reclassify on the parent asset. Returns the
-    updated asset detail so the modal body can be swapped."""
-    # The modal calls this from an HTMX button; refresh the modal body
-    # with the same /asset/{id} fragment.
-    return {"asset_id": params.asset_id, "bbox_index": params.bbox_index,
-            "note": "see /api/reclassify for parent-asset rerun"}
+    """KNN-reclassify a single cropped bbox. See
+    pipeline.run_knn_reclassify_bbox for the full flow (download
+    image, crop, BioCLIP embed, FAISS query, cache)."""
+    if not str(KNN_INVENTORY_DIR):
+        raise HTTPException(
+            status_code=503,
+            detail="KNN not configured — set KNN_INVENTORY_DIR and build an index first",
+        )
+    if not (Path(KNN_INVENTORY_DIR) / "INDEX_VERSION.txt").exists():
+        raise HTTPException(
+            status_code=503,
+            detail=f"INDEX_VERSION.txt missing in {KNN_INVENTORY_DIR} — build the index first",
+        )
+    try:
+        return await asyncio.to_thread(
+            pipeline.run_knn_reclassify_bbox,
+            None,
+            detection_id=params.detection_id,
+            index_dir=Path(KNN_INVENTORY_DIR),
+            k=KNN_K,
+        )
+    except FileNotFoundError as e:
+        # Same as the upper check, but raised from the pipeline thread.
+        raise HTTPException(status_code=503, detail=str(e))
+    except ValueError as e:
+        # detection_id not found.
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 # ---- reclassify visible (bulk) -------------------------------------------

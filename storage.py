@@ -192,6 +192,28 @@ CREATE TABLE IF NOT EXISTS knn_predictions (
   PRIMARY KEY (asset_id, index_version, k)
 );
 CREATE INDEX IF NOT EXISTS idx_knn_asset ON knn_predictions(asset_id);
+
+-- Per-bbox KNN reclassification (UX: per-crop "Reclassify crop"
+-- button in AssetDetail). Mirrors knn_predictions but keyed on
+-- detection_id instead of asset_id; the BioCLIP embedding is
+-- computed from the cropped bbox region, not the whole image, so
+-- the top-K can differ from the asset-level reclassification.
+CREATE TABLE IF NOT EXISTS bbox_knn_predictions (
+  detection_id  INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
+  index_version TEXT NOT NULL,
+  k             INTEGER NOT NULL,
+  computed_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  top_species   TEXT NOT NULL,
+  common_name   TEXT NOT NULL DEFAULT '',
+  score         REAL NOT NULL,
+  kingdom       TEXT NOT NULL DEFAULT '',
+  family        TEXT NOT NULL DEFAULT '',
+  genus         TEXT NOT NULL DEFAULT '',
+  neighbors     TEXT NOT NULL,
+  PRIMARY KEY (detection_id, index_version, k)
+);
+CREATE INDEX IF NOT EXISTS idx_bbox_knn_detection
+  ON bbox_knn_predictions(detection_id);
 CREATE INDEX IF NOT EXISTS idx_knn_version ON knn_predictions(index_version);
 
 -- Human-readable cluster summaries, computed by compute_cluster_names()
@@ -1943,6 +1965,33 @@ def fetch_detections(
     return out
 
 
+def get_detection_with_asset_url(
+    conn: sqlite3.Connection,
+    *,
+    detection_id: int,
+) -> dict | None:
+    """Look up a single detection (id, asset_id, bbox xywh, label,
+    score) joined with the asset's `original_url`. Used by the
+    per-crop KNN reclassification endpoint to fetch the bbox's
+    bounding box and the URL of the image to download. Returns
+    None if either row is missing.
+    """
+    row = conn.execute(
+        """
+        SELECT d.id AS det_id, d.asset_id, d.label, d.score,
+               d.x, d.y, d.w, d.h,
+               a.original_url, a.original_file_name
+        FROM detections d
+        JOIN assets a ON a.asset_id = d.asset_id
+        WHERE d.id = ?
+        """,
+        (detection_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(row)
+
+
 # ---------- plant attribution --------------------------------------------
 # A small pure function that combines the whole-image BioCLIP top-K with
 # the YOLO bbox / BioCLIP-on-crop predictions into a single "plants in
@@ -2646,6 +2695,113 @@ def list_knn_versions(conn: sqlite3.Connection) -> list[dict]:
         """
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+# ---------- bbox_knn_predictions ----------------------------------------
+# Per-detection (cropped bbox) KNN reclassification — separate cache
+# from the asset-level knn_predictions so a per-crop rerun doesn't
+# invalidate the whole-asset row. Same shape as the asset-level row;
+# the cache key is (detection_id, version, k).
+
+def replace_bbox_knn_predictions(
+    conn: sqlite3.Connection,
+    *,
+    detection_id: int,
+    index_version: str,
+    k: int,
+    row: dict,
+) -> None:
+    """Delete any cached bbox_knn rows for (detection, version, k) and
+    insert the new one. `row` mirrors the per-asset KNN dict shape:
+    {top_species, common_name, score, kingdom, family, genus,
+    neighbors: [{uuid, species, common_name, sim}, ...]}.
+    """
+    conn.execute(
+        "DELETE FROM bbox_knn_predictions "
+        "WHERE detection_id=? AND index_version=? AND k=?",
+        (detection_id, index_version, k),
+    )
+    import json as _json
+    neighbors_json = _json.dumps(row.get("neighbors", []))
+    conn.execute(
+        """
+        INSERT INTO bbox_knn_predictions
+          (detection_id, index_version, k, top_species, common_name,
+           score, kingdom, family, genus, neighbors)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            detection_id,
+            index_version,
+            k,
+            row.get("top_species") or "",
+            row.get("common_name") or "",
+            float(row.get("score", 0.0)),
+            row.get("kingdom") or "",
+            row.get("family") or "",
+            row.get("genus") or "",
+            neighbors_json,
+        ),
+    )
+
+
+def fetch_bbox_knn_predictions(
+    conn: sqlite3.Connection,
+    *,
+    detection_ids: list[int],
+    index_version: str,
+    k: int,
+) -> dict[int, dict]:
+    """Bulk fetch bbox_knn rows. Returns {detection_id: {...}}.
+    Missing rows are omitted (caller should default-handle)."""
+    if not detection_ids:
+        return {}
+    import json as _json
+    placeholders = ",".join("?" for _ in detection_ids)
+    rows = conn.execute(
+        f"""
+        SELECT detection_id, top_species, common_name, score, kingdom,
+               family, genus, neighbors, computed_at
+        FROM bbox_knn_predictions
+        WHERE index_version=? AND k=? AND detection_id IN ({placeholders})
+        """,
+        [index_version, k, *detection_ids],
+    ).fetchall()
+    out: dict[int, dict] = {}
+    for r in rows:
+        try:
+            neighbors = _json.loads(r["neighbors"])
+        except Exception:
+            neighbors = []
+        out[int(r["detection_id"])] = {
+            "top_species": r["top_species"] or None,
+            "common_name": r["common_name"] or "",
+            "score": float(r["score"]),
+            "kingdom": r["kingdom"] or "",
+            "family": r["family"] or "",
+            "genus": r["genus"] or "",
+            "neighbors": neighbors,
+            "computed_at": r["computed_at"],
+        }
+    return out
+
+
+def bbox_knn_predictions_have_detection(
+    conn: sqlite3.Connection,
+    *,
+    detection_id: int,
+    index_version: str,
+    k: int,
+) -> bool:
+    """Cache check: is there already a bbox_knn row for (det, ver, k)?"""
+    row = conn.execute(
+        """
+        SELECT 1 FROM bbox_knn_predictions
+        WHERE detection_id=? AND index_version=? AND k=? LIMIT 1
+        """,
+        (detection_id, index_version, k),
+    ).fetchone()
+    return row is not None
 
 
 def enrich_with_knn(
