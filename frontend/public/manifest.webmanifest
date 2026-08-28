@@ -1,0 +1,18 @@
+{
+  "name": "BotaniSense for Immich",
+  "short_name": "BotaniSense",
+  "description": "Browse your Immich library by plant species. BioCLIP-2 zero-shot classification + optional KNN reclassification.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#161616",
+  "theme_color": "#161616",
+  "icons": [
+    {
+      "src": "favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
