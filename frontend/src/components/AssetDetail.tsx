@@ -1,39 +1,85 @@
 import { useEffect, useState } from 'react';
 import { getAsset, reclassifyBbox, reclassify, getConfig } from '../api/endpoints';
-import type { AssetDetail as AssetDetailType, PlantAttributionRow } from '../api/types';
+import type { AssetDetail as AssetDetailType } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
 import { DetectionBlock } from './DetectionBlock';
 import { BboxImage } from './BboxImage';
 import { useToasts } from './ToastProvider';
-import { plantaeColorClass } from '../lib/plantae';
 import { formatPct } from '../lib/format';
 
 interface Props {
   assetId: string;
 }
 
-// Per-row "source" chips (yolo crop / mixed) were removed — the
-// attribution pathway is visible from the row itself (highlighted
-// bbox on the image + the row's species label is the same as the
-// underlying top-1 prediction, so an extra "yolo crop" / "mixed"
-// pill was duplicating context that's already apparent).
+// ---------- icon set (inline SVGs; no lucide-react dep) ----------
+// Match lucide-react's stroke=2, rounded caps, 24×24 viewBox. Sized
+// via the `className` prop so callers control the visual weight.
+
+function IconX({ size = 18 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  );
+}
+
+function IconExternalLink({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6" />
+      <polyline points="15 3 21 3 21 9" />
+      <line x1="10" y1="14" x2="21" y2="3" />
+    </svg>
+  );
+}
+
+function IconCopy({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  );
+}
+
+function IconCheck({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="20 6 9 17 4 12" />
+    </svg>
+  );
+}
+
+function IconClock({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" />
+      <polyline points="12 6 12 12 16 14" />
+    </svg>
+  );
+}
+
+function IconChevronRight({ size = 12 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <polyline points="9 18 15 12 9 6" />
+    </svg>
+  );
+}
 
 // Build a Google search URL for a free-form taxonomy term. The query
 // keeps the actual name verbatim — quoted ("...") so Google searches
 // the exact phrase, and prepended with "plant" so a common English
 // word like "Rose" doesn't return recipes / nursery homepages.
 function googleSearchUrl(term: string, hint?: string): string {
-  const q = hint
-    ? `"${term}" ${hint}`
-    : `"${term}"`;
+  const q = hint ? `"${term}" ${hint}` : `"${term}"`;
   return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
 }
 
 // Official Google "G" logo as inline SVG. Sized via the `className`.
-// Source: Google's published brand assets (public domain). Stays
-// inline so the icon doesn't break if the bundle is loaded offline.
 function GoogleIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -50,6 +96,28 @@ function GoogleIcon({ className }: { className?: string }) {
   );
 }
 
+// Small colour-coded chip used in the taxonomy breadcrumb. Pulled
+// from the example: each rank gets its own subtle bg/fg pair so the
+// eye can scan the hierarchy at a glance.
+function TaxChip({
+  rank,
+  label,
+}: {
+  rank: 'kingdom' | 'family' | 'genus';
+  label: string;
+}) {
+  const cls = {
+    kingdom: 'bg-indigo-500/10 text-indigo-300',
+    family:  'bg-blue-500/10 text-blue-300',
+    genus:   'bg-green-500/10 text-green-400',
+  }[rank];
+  return (
+    <span className={`px-2 py-0.5 rounded ${cls} text-[12px] font-medium`}>
+      {label}
+    </span>
+  );
+}
+
 export function AssetDetail({ assetId }: Props) {
   const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
@@ -58,9 +126,7 @@ export function AssetDetail({ assetId }: Props) {
   // 'preview' size. Reset on asset change so each asset tries fullsize
   // first.
   const [usePreview, setUsePreview] = useState(false);
-  // Public Immich URL for the "Open in Immich ↗" deep-link. Fetched
-  // once on mount; null hides the button (e.g. behind a misconfigured
-  // reverse proxy).
+  // Public Immich URL for the "Open in Immich ↗" deep-link.
   const [immichPublicUrl, setImmichPublicUrl] = useState<string | null>(null);
   const push = useToasts();
 
@@ -102,170 +168,161 @@ export function AssetDetail({ assetId }: Props) {
     }
   };
 
+  const handleCopy = async () => {
+    if (!data) return;
+    try {
+      await navigator.clipboard.writeText(data.asset_id);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    } catch (e) {
+      push({ kind: 'error', message: 'Copy failed: ' + (e instanceof Error ? e.message : String(e)) }, 3000);
+    }
+  };
+
   if (error) return <div className="text-red-300">Failed to load asset: {error.message}</div>;
   if (!data) return <p aria-busy="true">Loading…</p>;
 
   const fullTop1 = data.top_predictions[0];
   const plantaeScore = data.taxon_scores?.Plantae;
-  const plantaeTier = plantaeColorClass(plantaeScore);
   const attribution = data.plant_attribution;
   const attributionRows = attribution?.rows ?? [];
   const highlightIds = attribution?.highlight_detection_ids ?? [];
 
   return (
-    <div className="text-[13px]">
-      {/* Image + YOLO boxes are drawn on a single <canvas> by
-          BboxImage (contain mode), so there is no separate overlay to
-          align — the boxes and the photo share one coordinate system
-          and are guaranteed to line up. The canvas lays out like an
-          <img>: max-h 220px, max-w 100%, aspect ratio preserved. The
-          text-center wrapper keeps it horizontally centered. A failed
-          fullsize load falls back to the preview size.
-          highlightDetectionIds pushes the attribution-accepted boxes
-          onto the canvas — even low-YOLO-score boxes are drawn when
-          the whole-image plantae score confirms the bbox. */}
-      <div className="text-center mb-2">
-        <figure className="m-0 inline-block bg-[#0a0a0a] rounded-md overflow-hidden border border-[#222] max-w-full align-top">
+    // Compact column, centered within the Modal. Matches the example's
+    // visual density (max-w-sm, gap-3.5) so a 380px-wide modal feels
+    // like a phone-screen card, not a stretched form.
+    <div className="text-[13px] max-w-sm w-full mx-auto flex flex-col gap-3.5">
+      {/* Photo + YOLO bboxes. Same BboxImage canvas-based overlay as
+          before; the box geometry is unchanged, just the framing is
+          narrower so it lines up with the rest of the compact layout. */}
+      <div className="flex justify-center">
+        <figure className="m-0 inline-block bg-[#0a0a0a] rounded-xl overflow-hidden border border-[#222]">
           <BboxImage
             src={thumbUrl(data.asset_id, usePreview ? 'preview' : 'fullsize')}
             detections={data.detections}
             highlightDetectionIds={highlightIds}
             fit="contain"
-            maxHeight={220}
+            maxHeight={224}
             ariaLabel={data.original_file_name}
             onError={() => setUsePreview(true)}
           />
         </figure>
       </div>
 
-      <div className="mb-0.5 flex items-center gap-2 flex-wrap">
-        <strong>{data.original_file_name}</strong>
-        {/* Prominent "Open in Immich" CTA — accent-coloured, placed
-            right after the filename so the user can jump to the
-            source photo without scrolling. Hidden when /api/config
-            hasn't returned an immich_public_url (no reverse-proxy
-            override configured yet). */}
+      {/* Filename + Open in Immich — side-by-side, filename
+          truncates, CTA stays visible. Green-tinted accent matches
+          the "Plants in this image" card below. */}
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-[14px] font-semibold text-fg truncate" title={data.original_file_name}>
+          {data.original_file_name}
+        </h3>
         {immichPublicUrl && (
           <a
             href={`${immichPublicUrl.replace(/\/$/, '')}/photos/${data.asset_id}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="px-2.5 py-0.5 rounded bg-accent-dark border border-accent text-white text-[11px] font-medium no-underline hover:bg-accent-hover"
+            className="flex-shrink-0 flex items-center gap-1 bg-[#22c55e]/15 text-[#4ade80] px-2 py-1 rounded-md text-[12px] font-medium hover:bg-[#22c55e]/25 transition-colors no-underline"
             title="Open this asset in the Immich web UI"
           >
-            Open in Immich ↗
+            Open in Immich
+            <IconExternalLink />
           </a>
         )}
       </div>
 
-      {/* Asset ID + copy button. Subtle monospace line so users can
-          grab the UUID (for sharing / debugging / pasting into
-          /api/asset/{id}) without scraping it from the URL. The
-          button label flips to "Copied" for 1.5s after a successful
-          clipboard write so the user gets visual feedback. */}
-      <p className="-mt-1 mb-2 text-[11px] text-fg-1 flex items-center gap-2 flex-wrap">
+      {/* Asset ID + Copy ID — monospace ID truncates, copy button
+          flips to a checkmark for 1.5s after a successful write. */}
+      <div className="flex items-center justify-between gap-2">
         <code
-          className="font-mono text-fg-1 select-all"
+          className="text-[11px] font-mono text-fg-1 truncate"
           title={data.asset_id}
         >{data.asset_id}</code>
         <button
           type="button"
-          className="px-1.5 py-0.5 rounded border border-[#345] bg-transparent text-[10px] text-fg-1 hover:bg-[#234] hover:border-accent"
-          onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(data.asset_id);
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1500);
-            } catch (e) {
-              push({ kind: 'error', message: 'Copy failed: ' + (e instanceof Error ? e.message : String(e)) }, 3000);
-            }
-          }}
-        >{copied ? 'Copied ✓' : 'Copy ID'}</button>
-      </p>
+          onClick={handleCopy}
+          className="flex-shrink-0 flex items-center gap-1 bg-bg-2 border border-line2 text-fg-1 px-2 py-0.5 rounded-md text-[11px] hover:border-accent transition-colors"
+          aria-label="Copy asset ID"
+        >
+          {copied ? (
+            <>
+              <span className="text-[#4ade80]"><IconCheck /></span>
+              <span className="text-[#4ade80]">Copied</span>
+            </>
+          ) : (
+            <>
+              <IconCopy />
+              Copy ID
+            </>
+          )}
+        </button>
+      </div>
 
-      {(data.captured_at || (data.latitude != null && data.longitude != null)) && (
-        <p className="-mt-1 mb-2 text-[11px] text-fg-1 flex flex-wrap gap-x-4 gap-y-1">
-          {data.captured_at && (
-            <span title={data.captured_at}>
-              🕒 {new Date(data.captured_at).toLocaleString()}
-            </span>
-          )}
-          {data.latitude != null && data.longitude != null && (
-            <a
-              href={`geo:${data.latitude},${data.longitude}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[#7ad] no-underline hover:underline"
-              title={`${data.latitude.toFixed(5)}, ${data.longitude.toFixed(5)}`}
-            >
-              📍 {data.latitude.toFixed(4)}, {data.longitude.toFixed(4)}
-            </a>
-          )}
-        </p>
+      {/* Capture time (always shown when available). Single line
+          with a small clock icon. */}
+      {data.captured_at && (
+        <div className="flex items-center text-[12px] text-fg-1 gap-1.5">
+          <IconClock />
+          <span>{new Date(data.captured_at).toLocaleString()}</span>
+        </div>
       )}
 
-      <nav className="flex flex-wrap items-center gap-x-1.5 gap-y-1 py-1 mb-0.5 text-[12px] leading-[1.3]" aria-label="taxonomy hierarchy">
-        {fullTop1?.kingdom && <span className="rank-kingdom">{fullTop1.kingdom}</span>}
-        {fullTop1?.family && (
-          <>
-            <span className="rank-sep">›</span>
-            <a
-              href={googleSearchUrl(fullTop1.family, 'plant family')}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={`Search Google for family ${fullTop1.family}`}
-              className="rank-family hover:text-accent hover:underline"
-            >{fullTop1.family}</a>
-          </>
-        )}
-        {fullTop1?.genus && (
-          <>
-            <span className="rank-sep">›</span>
-            <a
-              href={googleSearchUrl(fullTop1.genus, 'plant genus')}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={`Search Google for genus ${fullTop1.genus}`}
-              className="rank-genus hover:text-accent hover:underline"
-            >{fullTop1.genus}</a>
-          </>
-        )}
-        {fullTop1?.species && (
-          <>
-            <span className="rank-sep">›</span>
-            <a
-              href={googleSearchUrl(
-                fullTop1.genus ? `${fullTop1.genus} ${fullTop1.species}` : fullTop1.species,
-                'plant'
+      {/* Taxonomy breadcrumb — kingdom › family › genus, with a
+          separate row below for the species (italic) + Plantae%.
+          Each rank gets its own subtle colour so the hierarchy is
+          scannable at a glance. */}
+      {(fullTop1?.kingdom || fullTop1?.family || fullTop1?.genus) && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex flex-wrap items-center gap-1.5 text-[12px]">
+            {fullTop1?.kingdom && <TaxChip rank="kingdom" label={fullTop1.kingdom} />}
+            {fullTop1?.family && (
+              <>
+                <IconChevronRight />
+                <a
+                  href={googleSearchUrl(fullTop1.family, 'plant family')}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`Search Google for family ${fullTop1.family}`}
+                  className="no-underline"
+                ><TaxChip rank="family" label={fullTop1.family} /></a>
+              </>
+            )}
+            {fullTop1?.genus && (
+              <>
+                <IconChevronRight />
+                <a
+                  href={googleSearchUrl(fullTop1.genus, 'plant genus')}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`Search Google for genus ${fullTop1.genus}`}
+                  className="no-underline"
+                ><TaxChip rank="genus" label={fullTop1.genus} /></a>
+              </>
+            )}
+          </div>
+          {fullTop1?.species && (
+            <div className="flex items-center justify-between text-[13px] px-1">
+              <span className="italic font-medium text-fg truncate" title={fullTop1.species}>
+                {fullTop1.species}
+              </span>
+              {plantaeScore != null && (
+                <span className="text-fg-1 font-medium tabular-nums text-[12px]">
+                  Plantae {(plantaeScore * 100).toFixed(1)}%
+                </span>
               )}
-              target="_blank"
-              rel="noopener noreferrer"
-              title={`Search Google for ${fullTop1.species}`}
-              className="rank-species hover:text-accent hover:underline"
-            >{fullTop1.species}</a>
-          </>
-        )}
-        {plantaeScore != null && (
-          <span className={`inline-block ml-auto px-2 py-0.5 rounded font-bold text-[11px] font-mono ${plantaeTier}`}>
-            Plantae {(plantaeScore * 100).toFixed(1)}%
-          </span>
-        )}
-      </nav>
+            </div>
+          )}
+        </div>
+      )}
 
-      {/* "Plants in this image" — the headline answer. Combines the
-          whole-image BioCLIP top-K with YOLO bbox-bioclip into a
-          single deduped species list. Rendered as the FIRST content
-          block under the image so the user gets the answer before
-          the full top-K and YOLO debug sections below. */}
-      <section className="border border-[#234] rounded-md bg-[#0e1410] p-3 my-3" aria-label="Plants in this image">
-        <div className="flex items-baseline justify-between mb-2">
-          <h5 className="m-0 text-[0.95rem] text-[#ad9]">Plants in this image</h5>
-          {/* Right-side meta: species count only. The "source" pill
-              (whole image / yolo / mixed) was removed — the bbox
-              highlight on the image above already tells the user
-              which pathway produced each row. */}
+      {/* "Plants in this image" — green-tinted card matching the
+          example. Species count + first row visible; the rest of the
+          attribution rows live below as a compact list. */}
+      <section className="bg-[#13201a] border border-[#166534]/30 rounded-xl p-3 flex flex-col gap-2" aria-label="Plants in this image">
+        <div className="flex items-center justify-between">
+          <h4 className="text-[13px] font-medium text-[#86efac]">Plants in this image</h4>
           {attribution && attribution.source !== 'none' && (
-            <span className="text-[10px] text-fg-1 font-mono">
+            <span className="text-[11px] text-[#4ade80]/60">
               {attributionRows.length} species
             </span>
           )}
@@ -278,100 +335,67 @@ export function AssetDetail({ assetId }: Props) {
             )}
           </p>
         ) : (
-          <ul className="m-0 p-0 list-none">
-            {attributionRows.map((r, i) => {
-              // A binomial species name already starts with its genus
-              // ("Helianthus annuus" → "Helianthus"). Detect this
-              // case-insensitively on the first word so we can avoid
-              // duplicating it in both the Google query and the
-              // sub-line pill.
+          <ul className="m-0 p-0 list-none flex flex-col gap-1.5">
+            {attributionRows.slice(0, 5).map((r, i) => {
+              // Skip genus pill when binomial already shows it.
               const impliedGenus = !!(
                 r.genus && r.species &&
                 r.species.toLowerCase().split(/\s+/)[0] === r.genus.toLowerCase()
               );
-              const showGenusPill = !!r.genus && !impliedGenus;
-              // Species search: prepend the genus only when the
-              // species doesn't already start with it. Without this
-              // guard, "Helianthus annuus" + genus "Helianthus"
-              // produces a "Helianthus Helianthus annuus" query,
-              // which Google can't find anything for. The "plant"
-              // hint keeps the search botanical for vague single-word
-              // species.
               const speciesQuery = r.genus && !impliedGenus
                 ? `${r.genus} ${r.species}`
                 : r.species;
-              const speciesSearch = googleSearchUrl(speciesQuery, 'plant');
               return (
-                <li
-                  key={`${r.species}-${i}`}
-                  className="flex items-baseline justify-between gap-2 py-1 border-t border-[#222] first:border-t-0 text-[13px]"
-                >
-                  <div className="flex-1 min-w-0">
-                    <span className="italic font-semibold">{r.species}</span>
-                    {r.common_name && (
-                      <span className="text-fg-1 text-[11px] ml-1.5">({r.common_name})</span>
-                    )}
-                    {/* Google search link for the species. The icon
-                        is the official multicolored G so users get
-                        the same visual cue as in other Google
-                        products. target=_blank + rel=noopener keeps
-                        the modal open. */}
+                <li key={`${r.species}-${i}`} className="flex items-start justify-between gap-2 text-[13px]">
+                  <div className="flex items-center gap-1.5 min-w-0 flex-1">
                     <a
-                      href={speciesSearch}
+                      href={googleSearchUrl(speciesQuery, 'plant')}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      title={`Search Google for "${r.species}"`}
+                      className="text-[14px] font-bold text-fg italic truncate hover:text-accent no-underline"
+                    >{r.species}</a>
+                    {r.common_name && (
+                      <span className="text-[11px] text-fg-1 shrink-0">({r.common_name})</span>
+                    )}
+                    <a
+                      href={googleSearchUrl(speciesQuery, 'plant')}
                       target="_blank"
                       rel="noopener noreferrer"
                       title={`Search Google for "${r.species}"`}
                       aria-label={`Search Google for ${r.species}`}
-                      className="ml-1.5 inline-flex items-center align-baseline opacity-70 hover:opacity-100"
-                    >
-                      <GoogleIcon className="w-[12px] h-[12px]" />
-                    </a>
-                    <span className="block text-[11px] text-fg-1 truncate">
-                      {/* Skip the genus pill when the binomial already
-                          shows it — "Helianthus annuus" doesn't need
-                          "genus Helianthus" beneath it. */}
-                      {showGenusPill && (
-                        <a
-                          href={googleSearchUrl(r.genus as string, 'plant genus')}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title={`Search Google for genus ${r.genus}`}
-                          className="hover:text-accent hover:underline"
-                        >genus {r.genus}</a>
-                      )}
-                      {showGenusPill && r.family && (
-                        <span className="mx-1">·</span>
-                      )}
-                      {r.family && (
-                        <a
-                          href={googleSearchUrl(r.family, 'plant family')}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          title={`Search Google for family ${r.family}`}
-                          className="hover:text-accent hover:underline"
-                        >family {r.family}</a>
-                      )}
-                      {!showGenusPill && !r.family && (r.kingdom ?? '')}
-                    </span>
+                      className="flex items-center justify-center w-3.5 h-3.5 rounded-full bg-white text-black text-[9px] font-bold shrink-0 hover:opacity-80 no-underline"
+                    >G</a>
                   </div>
-                  <div className="flex items-center gap-1.5 flex-shrink-0">
-                    <span className="text-[#ad9] font-mono tabular-nums text-[12px] min-w-[42px] text-right">
-                      {formatPct(r.score)}
-                    </span>
-                  </div>
+                  <span className="text-[#4ade80] font-medium tabular-nums text-[13px] shrink-0">
+                    {formatPct(r.score)}
+                  </span>
                 </li>
               );
             })}
+            {attributionRows.length > 5 && (
+              <li className="text-[11px] text-fg-1 italic">
+                + {attributionRows.length - 5} more in Top-K below
+              </li>
+            )}
           </ul>
         )}
       </section>
 
+      {/* Library neighbours — the example renders a 4-col thumb grid
+          here. LibraryNeighbors already does that; the gap above is
+          enough visual separation. */}
       <LibraryNeighbors items={data.library_neighbors} />
 
-      {data.knn?.top_species ? (
-        <details className="my-3">
-          <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">KNN (re-classified)</summary>
-          <div className="px-3 pb-3 border-t border-dashed border-[#333] mt-1">
+      {/* KNN reclassification card (collapsed by default; the example
+          keeps it visible, but the user opens this modal to inspect
+          the raw BioCLIP top-K, not to retrain — keep the disclosure). */}
+      {data.knn?.top_species && (
+        <details className="-mt-1">
+          <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
+            KNN (re-classified)
+          </summary>
+          <div className="px-1 pb-2 border-t border-dashed border-[#333] mt-1">
             <div className="flex justify-between mb-1 text-[12px]">
               <span>
                 {data.knn.top_species}
@@ -380,38 +404,39 @@ export function AssetDetail({ assetId }: Props) {
               <small className="text-fg-1">{data.knn.kingdom}{data.knn.family ? ` · ${data.knn.family}` : ''}</small>
             </div>
             {(data.knn.neighbors ?? []).map((n, i) => (
-              <div key={`${n.species}-${i}`} className="flex justify-between gap-2.5 py-1 border-t border-[#222] text-[13px] first:border-t-0">
-                <div className="flex-1">
-                  {n.species}
-                  <div className="text-fg-1 text-[11px]">{n.common_name ?? ''}</div>
-                </div>
-                <div className="text-[#ad9] tabular-nums min-w-[56px] text-right">{formatPct(n.sim, 1)}</div>
+              <div key={`${n.species}-${i}`} className="flex justify-between gap-2.5 py-1 border-t border-[#222] text-[12px] first:border-t-0">
+                <div className="flex-1 truncate">{n.species}</div>
+                <div className="text-[#ad9] tabular-nums">{formatPct(n.sim, 1)}</div>
               </div>
             ))}
           </div>
         </details>
-      ) : null}
-      <button type="button" className="bg-[#234] text-fg border border-[#456] px-2.5 py-1 rounded text-[11px] cursor-pointer hover:bg-[#345] mt-1" onClick={handleReclassifyAll}>
+      )}
+
+      {/* Re-run KNN button — kept from the original layout but
+      styled to match the new compact theme. */}
+      <button
+        type="button"
+        className="self-start text-[11px] text-fg-1 underline hover:text-fg"
+        onClick={handleReclassifyAll}
+      >
         Re-run KNN
       </button>
 
-      {/* Debug panels — top-K BioCLIP and per-crop YOLO details. The
-          "Plants in this image" block above already answers the main
-          question; these are for users who want to see the raw
-          ranking under the hood. Collapsed by default so the modal
-          doesn't open with a wall of debug numbers. */}
-      <details className="my-3">
-        <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">
+      {/* Debug panels — collapsed by default; users who want the raw
+          ranking open these. */}
+      <details className="-mt-1">
+        <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
           Top-{data.top_predictions.length} predictions (debug)
         </summary>
-        <div className="pt-0 pb-3 px-3">
+        <div className="pt-1 pb-2 px-1">
           <Predictions items={(data.top_predictions ?? []).slice(0, 5)} />
         </div>
       </details>
 
       {(data.detections ?? []).filter(d => d.score >= 0.20).length > 0 && (
-        <details className="my-3">
-          <summary className="cursor-pointer text-[0.85rem] text-fg-1 hover:text-fg">
+        <details className="-mt-1">
+          <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
             YOLO detections (debug, per-crop)
           </summary>
           {(data.detections ?? [])
@@ -419,7 +444,11 @@ export function AssetDetail({ assetId }: Props) {
             .map((d, i) => (
               <div key={d.id}>
                 <DetectionBlock det={d} fullTop1={fullTop1} />
-                <button type="button" className="bg-[#234] text-fg border border-[#456] px-2.5 py-1 rounded text-[11px] cursor-pointer hover:bg-[#345] mt-1" onClick={() => handleReclassifyBbox(i)}>
+                <button
+                  type="button"
+                  className="self-start text-[11px] text-fg-1 underline hover:text-fg"
+                  onClick={() => handleReclassifyBbox(i)}
+                >
                   Reclassify crop
                 </button>
               </div>
