@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { getResults } from '../api/endpoints';
 import { ApiError } from '../api/client';
-import type { ResultRow, ResultsResponse } from '../api/types';
+import type { Pagination as PaginationType, ResultRow, ResultsResponse } from '../api/types';
 import { useFilters, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { navigate } from '../hooks/useRoute';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 import { FilterModal } from './FilterModal';
+import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
 import { useToasts } from './ToastProvider';
 
 // Photo-grid sort options — surfaced as a small native <select> in
@@ -56,10 +57,20 @@ export function Grid() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
   const push = useToasts();
+  // Last single-page response from /api/results. The render loop uses
+  // `accumulated` (all pages fetched so far) instead; `data` is kept
+  // for the pagination control and the loading/error state machine.
   const [data, setData] = useState<ResultsResponse | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
   const [filterModalOpen, setFilterModalOpen] = useState(false);
+  // UX-23 — infinite scroll accumulator. Reset by runFetch on any
+  // filter change. Appended to by loadMore when the bottom sentinel
+  // scrolls into view.
+  const [accumulated, setAccumulated] = useState<ResultRow[]>([]);
+  const [loadingMore, setLoadingMore] = useState(false);
+  // Guard against firing loadMore while a request is already in flight.
+  const loadingMoreRef = useRef(false);
   const reqIdRef = useRef(0);
 
   const activeFilterLabel: string | null = (() => {
@@ -88,6 +99,10 @@ export function Grid() {
     setLoading(true);
     setData(null);
     setError(null);
+    // Filter change → start the infinite-scroll accumulator from
+    // scratch. The next /api/results payload lands in `accumulated`
+    // below; loadMore appends subsequent pages.
+    setAccumulated([]);
     getResults({
       page: filters.page,
       page_size: filters.page_size,
@@ -105,7 +120,15 @@ export function Grid() {
       plantae: filters.plantae,
       sort: serverSort,
     })
-      .then(r => { if (reqId === reqIdRef.current) { setData(r); setError(null); } })
+      .then(r => {
+        if (reqId !== reqIdRef.current) return;
+        setData(r);
+        setError(null);
+        // Seed the accumulator with the first page. Empty filters +
+        // page=0 → infinite-scroll mode; anything else (URL deep-link
+        // to page > 0) is single-page and the user can paginate.
+        setAccumulated(r.results);
+      })
       .catch(e => {
         if (reqId !== reqIdRef.current) return;
         setError(e);
@@ -130,15 +153,70 @@ export function Grid() {
     filters.sort,
   ]);
 
+  // Append-next-page for infinite scroll. Skipped when:
+  //   - filters.page > 0 (URL deep-link to a non-first page → user is
+  //     in single-page mode; don't auto-fetch ahead)
+  //   - already loading
+  //   - data is null (first page hasn't landed yet)
+  //   - no more pages (data.pagination.page + 1 >= total_pages)
+  const loadMore = useCallback(() => {
+    if (!data) return;
+    if (filters.page > 0) return;
+    if (loadingMoreRef.current) return;
+    const nextPage = data.pagination.page + 1;
+    if (nextPage >= data.pagination.total_pages) return;
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    getResults({
+      page: nextPage,
+      page_size: filters.page_size,
+      cluster_id: filters.cluster_id,
+      species: filters.species,
+      genus: filters.genus,
+      family: filters.family,
+      has_person: filters.has_person,
+      plantae: filters.plantae,
+      sort: serverSort,
+    })
+      .then(r => {
+        setData(r);
+        setAccumulated(prev => [...prev, ...r.results]);
+      })
+      .catch(e => {
+        if (e instanceof ApiError && e.status >= 500) {
+          push({
+            kind: 'error',
+            message: `Server error: ${e.detail || 'HTTP ' + e.status}`,
+            action: { label: 'Retry', onClick: loadMore },
+          }, 6000);
+        }
+      })
+      .finally(() => {
+        loadingMoreRef.current = false;
+        setLoadingMore(false);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, filters.page, filters.page_size, filters.cluster_id, filters.species, filters.genus, filters.family, filters.has_person, filters.plantae, filters.sort]);
+
   useEffect(() => {
     runFetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runFetch]);
 
+  // Bottom-of-grid sentinel for infinite scroll. Only meaningful when
+  // the user is on the first page (deep-links to page > 0 stay in
+  // single-page mode).
+  const [sentinelRef, sentinelVisible] = useIntersectionObserver<HTMLDivElement>(
+    { rootMargin: '300px 0px' },
+  );
+  useEffect(() => {
+    if (sentinelVisible && !loadingMore) loadMore();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sentinelVisible]);
+
   const sortedRows = useMemo(() => {
-    if (!data) return [];
-    return sortRows(data.results, filters.sort);
-  }, [data, filters.sort]);
+    return sortRows(accumulated, filters.sort);
+  }, [accumulated, filters.sort]);
 
   const handleRowUpdated = async (assetId: string) => {
     void assetId;
@@ -260,7 +338,26 @@ export function Grid() {
                 <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
               ))}
             </div>
-            <Pagination data={data.pagination} />
+            {/* Infinite-scroll sentinel — observed by useIntersectionObserver.
+                Mounted only on the first page (deep-links to page > 0
+                stay in single-page mode, no sentinel). */}
+            {filters.page === 0 && (
+              <div
+                ref={sentinelRef}
+                className="h-10 flex items-center justify-center text-[11px] text-fg-1"
+                aria-live="polite"
+              >
+                {loadingMore
+                  ? 'Loading…'
+                  : data && data.pagination.page + 1 >= data.pagination.total_pages
+                  ? `End of results · ${accumulated.length.toLocaleString()} photos`
+                  : `Scroll to load more · ${accumulated.length.toLocaleString()} / ${data?.pagination.total.toLocaleString() ?? '?'}`}
+              </div>
+            )}
+            {/* Pagination still rendered for URL deep-links to page > 0
+                (manual page navigation case). Hidden when infinite-scroll
+                mode is in effect. */}
+            {filters.page > 0 && <Pagination data={data.pagination} />}
           </div>
         </>
       )}
