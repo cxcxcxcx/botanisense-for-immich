@@ -14,17 +14,11 @@ interface Props {
   assetId: string;
 }
 
-// Chip for the "source" of a plant-attribution row. We only render a
-// badge when the species came from a non-default source — YOLO crop
-// (yellow) or mixed (blue). Whole-image BioCLIP is the default
-// pathway, so labelling every row with "whole image" just adds noise.
-// The type stays exhaustive so the lookup at the call site is type-safe
-// even if whole_image is never displayed.
-const ATTRIBUTION_SOURCE_BADGE: Record<PlantAttributionRow['source'], { label: string; className: string; title: string } | null> = {
-  whole_image: null,
-  yolo:        { label: 'yolo crop', className: 'border-[#8a7a3a] text-[#e8c45c]', title: 'Plantae kingdom score < 0.10; below the whole-image confidence floor. Species comes from YOLO crop + BioCLIP-on-crop.' },
-  mixed:       { label: 'mixed',     className: 'border-[#3a6a8a] text-[#7ac8e8]', title: 'Both whole-image BioCLIP and a YOLO crop agree on this species.' },
-};
+// Per-row "source" chips (yolo crop / mixed) were removed — the
+// attribution pathway is visible from the row itself (highlighted
+// bbox on the image + the row's species label is the same as the
+// underlying top-1 prediction, so an extra "yolo crop" / "mixed"
+// pill was duplicating context that's already apparent).
 
 // Build a Google search URL for a free-form taxonomy term. The query
 // keeps the actual name verbatim — quoted ("...") so Google searches
@@ -266,16 +260,13 @@ export function AssetDetail({ assetId }: Props) {
       <section className="border border-[#234] rounded-md bg-[#0e1410] p-3 my-3" aria-label="Plants in this image">
         <div className="flex items-baseline justify-between mb-2">
           <h5 className="m-0 text-[0.95rem] text-[#ad9]">Plants in this image</h5>
-          {/* Right-side meta: species count + (when non-default)
-              source. "whole image" is the default pathway and adds
-              noise, so we only print the source when something
-              different happened (yolo / mixed). */}
+          {/* Right-side meta: species count only. The "source" pill
+              (whole image / yolo / mixed) was removed — the bbox
+              highlight on the image above already tells the user
+              which pathway produced each row. */}
           {attribution && attribution.source !== 'none' && (
             <span className="text-[10px] text-fg-1 font-mono">
               {attributionRows.length} species
-              {attribution.source !== 'whole_image' && (
-                <> · source: {attribution.source.replace('_', ' ')}</>
-              )}
             </span>
           )}
         </div>
@@ -289,7 +280,6 @@ export function AssetDetail({ assetId }: Props) {
         ) : (
           <ul className="m-0 p-0 list-none">
             {attributionRows.map((r, i) => {
-              const badge = ATTRIBUTION_SOURCE_BADGE[r.source];
               // A binomial species name already starts with its genus
               // ("Helianthus annuus" → "Helianthus"). Detect this
               // case-insensitively on the first word so we can avoid
@@ -365,15 +355,6 @@ export function AssetDetail({ assetId }: Props) {
                     </span>
                   </div>
                   <div className="flex items-center gap-1.5 flex-shrink-0">
-                    {/* Only render the chip for non-default sources
-                        (yolo crop, mixed). Whole-image rows show no
-                        chip — they're the default pathway. */}
-                    {badge && (
-                      <span
-                        className={`px-1.5 py-px rounded border text-[10px] font-mono ${badge.className}`}
-                        title={badge.title}
-                      >{badge.label}</span>
-                    )}
                     <span className="text-[#ad9] font-mono tabular-nums text-[12px] min-w-[42px] text-right">
                       {formatPct(r.score)}
                     </span>
