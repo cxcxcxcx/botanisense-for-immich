@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { getAsset, reclassifyBbox, reclassify, getConfig } from '../api/endpoints';
+import { getAsset, reclassifyBbox, getConfig } from '../api/endpoints';
 import type { AssetDetail as AssetDetailType } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
@@ -150,15 +150,6 @@ export function AssetDetail({ assetId }: Props) {
     return () => { cancelled = true; };
   }, []);
 
-  const handleReclassifyAll = async () => {
-    try {
-      await reclassify([assetId]);
-      push({ kind: 'success', message: 'Reclassify queued' }, 2000);
-    } catch (e) {
-      push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
-    }
-  };
-
   const handleReclassifyBbox = async (bboxIndex: number) => {
     try {
       await reclassifyBbox({ asset_id: assetId, bbox_index: bboxIndex });
@@ -222,7 +213,7 @@ export function AssetDetail({ assetId }: Props) {
             href={`${immichPublicUrl.replace(/\/$/, '')}/photos/${data.asset_id}`}
             target="_blank"
             rel="noopener noreferrer"
-            className="flex-shrink-0 flex items-center gap-1 bg-[#22c55e]/15 text-[#4ade80] px-2 py-1 rounded-md text-[12px] font-medium hover:bg-[#22c55e]/25 transition-colors no-underline"
+            className="flex-shrink-0 flex items-center gap-1 bg-bg-2 border border-line2 text-fg-1 px-2 py-1 rounded-md text-[12px] font-medium hover:border-accent hover:text-fg transition-colors no-underline"
             title="Open this asset in the Immich web UI"
           >
             Open in Immich
@@ -387,44 +378,10 @@ export function AssetDetail({ assetId }: Props) {
           enough visual separation. */}
       <LibraryNeighbors items={data.library_neighbors} />
 
-      {/* KNN reclassification card (collapsed by default; the example
-          keeps it visible, but the user opens this modal to inspect
-          the raw BioCLIP top-K, not to retrain — keep the disclosure). */}
-      {data.knn?.top_species && (
-        <details className="-mt-1">
-          <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
-            KNN (re-classified)
-          </summary>
-          <div className="px-1 pb-2 border-t border-dashed border-[#333] mt-1">
-            <div className="flex justify-between mb-1 text-[12px]">
-              <span>
-                {data.knn.top_species}
-                {data.knn.common_name ? ` (${data.knn.common_name})` : ''} · {formatPct(data.knn.score)}
-              </span>
-              <small className="text-fg-1">{data.knn.kingdom}{data.knn.family ? ` · ${data.knn.family}` : ''}</small>
-            </div>
-            {(data.knn.neighbors ?? []).map((n, i) => (
-              <div key={`${n.species}-${i}`} className="flex justify-between gap-2.5 py-1 border-t border-[#222] text-[12px] first:border-t-0">
-                <div className="flex-1 truncate">{n.species}</div>
-                <div className="text-[#ad9] tabular-nums">{formatPct(n.sim, 1)}</div>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
-
-      {/* Re-run KNN button — kept from the original layout but
-      styled to match the new compact theme. */}
-      <button
-        type="button"
-        className="self-start text-[11px] text-fg-1 underline hover:text-fg"
-        onClick={handleReclassifyAll}
-      >
-        Re-run KNN
-      </button>
-
       {/* Debug panels — collapsed by default; users who want the raw
-          ranking open these. */}
+          ranking open these. Re-run KNN lives in the Run page's
+          Data Tools ('Reclassify with KNN') — the AssetDetail modal
+          is for inspection, not for triggering background jobs. */}
       <details className="-mt-1">
         <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
           Top-{data.top_predictions.length} predictions (debug)
