@@ -38,14 +38,18 @@
   dialog > article > header > button.close:hover { opacity: 1; }
 }
 
-/* Light-theme overrides — minimal pass that flips the most-used
-   surfaces. Many ad-hoc Tailwind classes (bg-[#234], bg-[#345],
-   bg-[#161616], border-[#345], text-[#7ad]) are dark-only and
-   don't have light counterparts yet; the theme flip works for
-   Pico's defaults + body/header/cards/buttons via the token
-   remap below, with the rest of the dark-only classes still
-   rendering as dark accents on a light background. A full audit
-   of every hard-coded hex value is a separate task. */
+/* Light-theme overrides — second pass: remap the most-used
+   ad-hoc Tailwind hex classes that show up in components (dark
+   accents that read fine on #161616 but break on a light bg).
+
+   Strategy: a single rule per hex value, scoped to
+   [data-theme='light'] ancestor, with !important so it beats the
+   arbitrary-value Tailwind classes. The set below covers every
+   hard-coded color found in /src/components/*.tsx at audit time
+   (grep '#[0-9a-fA-F]\{3,6\}').
+
+   Add new colors here as they appear — the alternative is rewriting
+   every component to use theme tokens, which is a bigger refactor. */
 [data-theme='light'] {
   --pico-background-color: #fafafa;
   --pico-color: #1f2937;
@@ -68,6 +72,55 @@
 [data-theme='light'] .bg-accent { background-color: #2563eb !important; }
 [data-theme='light'] .bg-accent-dark { background-color: #1d4ed8 !important; }
 [data-theme='light'] .text-accent { color: #2563eb !important; }
+/* Hard-coded surfaces (Tailwind arbitrary values used inline). */
+[data-theme='light'] [class*="bg-[#161616]"] { background-color: #ffffff !important; }
+[data-theme='light'] [class*="bg-[#1a1a1a]"] { background-color: #f9fafb !important; }
+[data-theme='light'] [class*="bg-[#0a0a0a]"] { background-color: #f9fafb !important; }
+[data-theme='light'] [class*="bg-[#222]"]     { background-color: #e5e7eb !important; }
+[data-theme='light'] [class*="bg-[#234]"]     { background-color: #e5e7eb !important; }
+[data-theme='light'] [class*="bg-[#345]"]     { background-color: #d1d5db !important; }
+[data-theme='light'] [class*="bg-[#422]"]     { background-color: #fee2e2 !important; }
+[data-theme='light'] [class*="bg-[#2a1414]"]  { background-color: #fef2f2 !important; }
+[data-theme='light'] [class*="bg-[#2a1a2a]"]  { background-color: #fdf4ff !important; }
+[data-theme='light'] [class*="bg-[#2a2414]"]  { background-color: #fefce8 !important; }
+[data-theme='light'] [class*="hover\\:bg-[#234]"]:hover { background-color: #f3f4f6 !important; }
+[data-theme='light'] [class*="hover\\:bg-[#345]"]:hover { background-color: #e5e7eb !important; }
+[data-theme='light'] [class*="hover\\:bg-[#3a1414]"]:hover { background-color: #fee2e2 !important; }
+[data-theme='light'] [class*="hover\\:bg-[#3a2a3a]"]:hover { background-color: #fae8ff !important; }
+[data-theme='light'] [class*="border-[#222]"] { border-color: #e5e7eb !important; }
+[data-theme='light'] [class*="border-[#333]"] { border-color: #d1d5db !important; }
+[data-theme='light'] [class*="border-[#345]"] { border-color: #cbd5e1 !important; }
+[data-theme='light'] [class*="border-[#456]"] { border-color: #cbd5e1 !important; }
+[data-theme='light'] [class*="border-[#a44]"] { border-color: #fca5a5 !important; }
+[data-theme='light'] [class*="hover\\:border-accent"]:hover { border-color: #2563eb !important; }
+[data-theme='light'] [class*="text-[#7ad]"]   { color: #2563eb !important; }
+[data-theme='light'] [class*="text-[#ad9]"]   { color: #16a34a !important; }
+[data-theme='light'] [class*="text-[#a44]"]   { color: #dc2626 !important; }
+[data-theme='light'] [class*="text-[#d8a]"]   { color: #b45309 !important; }
+[data-theme='light'] [class*="text-[#fbb]"]   { color: #b91c1c !important; }
+[data-theme='light'] [class*="text-[#fdc]"]   { color: #a16207 !important; }
+[data-theme='light'] [class*="text-[#e8c45c]"] { color: #a16207 !important; }
+[data-theme='light'] [class*="text-[#5cc078]"] { color: #16a34a !important; }
+[data-theme='light'] [class*="text-[#d97878]"] { color: #b91c1c !important; }
+[data-theme='light'] [class*="text-[#444]"]   { color: #9ca3af !important; }
+[data-theme='light'] [class*="text-[#666]"]   { color: #6b7280 !important; }
+/* card image placeholder in BboxImage — gradient overlay reads
+   illegible on white. */
+[data-theme='light'] [class*="bg-gradient-to-t"][class*="from-black\\/90"] {
+  background-image: linear-gradient(to top, rgba(255,255,255,0.9), transparent) !important;
+}
+[data-theme='light'] [class*="from-black\\/90"] {
+  --tw-gradient-from: rgba(255,255,255,0.9) var(--tw-gradient-from-position);
+  --tw-gradient-to: rgba(255,255,255,0) var(--tw-gradient-to-position);
+}
+/* shimmer — uses a translucent white gradient; on light bg it
+   disappears entirely. Flip to a subtle gray sweep. */
+[data-theme='light'] .shimmer {
+  background: linear-gradient(90deg,
+    rgba(0,0,0,0.04) 0%,
+    rgba(0,0,0,0.10) 50%,
+    rgba(0,0,0,0.04) 100%) !important;
+}
 [data-theme='light'] header.sticky { background-color: rgba(255,255,255,0.95) !important; }
 
 /* Components — small, named patterns the React tree references via
