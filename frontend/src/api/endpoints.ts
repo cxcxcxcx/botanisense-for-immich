@@ -80,6 +80,14 @@ export const getClusteringStatus   = () =>
 export const runPipeline = (p: RunParams) =>
   fetchJson<unknown>('/api/run', { method: 'POST', body: p });
 
+// ---- Cluster rename ------------------------------------------------------
+
+export const renameCluster = (cluster_id: number, name: string | null) =>
+  fetchJson<{ cluster_id: number; name: string | null }>(
+    `/api/clusters/${cluster_id}`,
+    { method: 'PATCH', body: { name } },
+  );
+
 export const stopPipeline = () =>
   fetchJson<{ stopped: boolean; reason?: string }>(
     '/api/run/stop',
