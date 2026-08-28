@@ -2845,6 +2845,17 @@ class ClusterAlbumsRemoveParams(BaseModel):
     cluster_ids: list[int] | None = None
 
 
+class ClusterAlbumsUndoRemoveParams(BaseModel):
+    """Body for POST /api/album/cluster/undo-remove. The frontend
+    captures the full ClusterAlbumMapping rows before bulk-remove and
+    POSTs them back here within the undo TTL window (default 30s).
+    The endpoint re-inserts the cluster_albums rows but does NOT
+    recreate the Immich albums (those were deleted server-side) —
+    the user has to re-sync to get a fresh album with the same name.
+    """
+    rows: list[dict]
+
+
 @app.post("/api/album/cluster/remove")
 async def bulk_remove_cluster_albums(
     params: ClusterAlbumsRemoveParams,
@@ -2922,6 +2933,47 @@ async def bulk_remove_cluster_albums(
         "remote_deleted": remote_deleted,
         "errors": errors,
     }
+
+
+@app.post("/api/album/cluster/undo-remove")
+async def undo_bulk_remove_cluster_albums(
+    params: ClusterAlbumsUndoRemoveParams,
+) -> dict:
+    """Recreate the cluster_albums rows from a snapshot captured before
+    a bulk-remove. The Immich albums themselves are NOT restored —
+    they were DELETEd on the Immich side during the bulk-remove and
+    only the local mapping comes back. Re-sync to recreate the actual
+    albums.
+
+    Idempotent: re-inserting an existing cluster_id via INSERT OR
+    REPLACE overwrites it (so the user can Undo twice without
+    duplicating rows).
+    """
+    inserted = 0
+    skipped = 0
+    with storage.connect(DB_PATH) as conn:
+        for row in params.rows:
+            try:
+                cid = int(row["cluster_id"])
+                album_id = row.get("album_id") or ""
+                album_url = row.get("album_url") or ""
+                if not album_id or not album_url:
+                    skipped += 1
+                    continue
+                storage.insert_cluster_album(conn, {
+                    "cluster_id": cid,
+                    "album_id": album_id,
+                    "album_url": album_url,
+                    "n_assets": int(row.get("n_assets", 0)),
+                    "reused_existing": int(row.get("reused_existing", 0)),
+                    "created_at": row.get("created_at"),
+                    "last_synced_at": row.get("last_synced_at"),
+                })
+                inserted += 1
+            except Exception as e:  # noqa: BLE001 — per-row failures don't abort
+                _log.warning("undo-remove row %s failed: %s", row, e)
+                skipped += 1
+    return {"restored": inserted, "skipped": skipped}
 
 
 @app.get("/api/album/cluster")

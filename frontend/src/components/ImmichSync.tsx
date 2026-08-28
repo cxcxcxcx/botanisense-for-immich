@@ -33,6 +33,8 @@ import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 import { Modal } from './Modal';
 import { BetaInfoModal } from './BetaInfoModal';
+import { undoBulkRemoveClusterAlbums } from '../api/endpoints';
+import type { ClusterAlbumMapping } from '../api/types';
 
 // ---------- people-filter chip group ---------------------------------------
 // Per the mock: each rule row has a 3-button segmented control
@@ -452,6 +454,19 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         // Immich albums are always DELETEd alongside the local mapping.
         // You can always re-sync to recreate them with the same
         // `#BotaniSense` hashtag in the title.
+        //
+        // UX-14: capture the mappings BEFORE remove so we can offer
+        // an Undo in the success toast. The undo path restores the
+        // local mapping only — the Immich albums are gone — so the
+        // user has to re-sync for actual albums.
+        let snapshot: ClusterAlbumMapping[] = [];
+        try {
+          const before = await listClusterAlbums();
+          snapshot = before.albums;
+        } catch {
+          // non-fatal — undo just won't be offered if we couldn't
+          // read the pre-remove state.
+        }
         const r = await removeClusterAlbums({ cluster_ids: null });
         setSlots(s => ({ ...s, remove: {
           ...emptySlot(),
@@ -467,6 +482,29 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
             kind: 'error',
             message: `Removed ${r.removed} (${r.errors.length} failed)`,
           }, 4000);
+        } else if (r.removed > 0 && snapshot.length > 0) {
+          push({
+            kind: 'success',
+            message: `Removed ${r.removed} cluster album mapping${r.removed === 1 ? '' : 's'}.`,
+            action: {
+              label: 'Undo',
+              onClick: async () => {
+                try {
+                  const res = await undoBulkRemoveClusterAlbums(snapshot);
+                  push({
+                    kind: 'info',
+                    message: `Restored ${res.restored} mapping${res.restored === 1 ? '' : 's'} (re-sync to recreate albums)`,
+                  }, 3000);
+                  refreshSyncedCount();
+                } catch (e) {
+                  push({
+                    kind: 'error',
+                    message: e instanceof Error ? e.message : String(e),
+                  }, 4000);
+                }
+              },
+            },
+          }, 8000);
         } else {
           push({ kind: 'success', message: `Removed ${r.removed} cluster album(s)` }, 3000);
         }

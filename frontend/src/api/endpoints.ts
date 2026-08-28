@@ -194,6 +194,16 @@ export const removeClusterAlbums = (p: BulkClusterRemoveParams) =>
     body: p,
   });
 
+// Undo the last bulk-remove by re-inserting the snapshot the frontend
+// captured before the call. The Immich albums themselves are NOT
+// recreated (those were DELETEd server-side); only the local
+// mapping comes back. The user has to re-sync for actual albums.
+export const undoBulkRemoveClusterAlbums = (rows: ClusterAlbumMapping[]) =>
+  fetchJson<{ restored: number; skipped: number }>(
+    '/api/album/cluster/undo-remove',
+    { method: 'POST', body: { rows } },
+  );
+
 // ---- Sync-to-IMMICH defaults (GET/PUT /api/settings/sync-defaults) ----
 // Persisted on the server so they survive browser changes and are
 // visible to non-browser callers. Seeded from env on first read; the

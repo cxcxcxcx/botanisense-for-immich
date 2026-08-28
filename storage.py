@@ -1243,6 +1243,31 @@ def list_cluster_albums(conn: sqlite3.Connection) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def insert_cluster_album(conn: sqlite3.Connection, row: dict) -> None:
+    """Insert a single cluster_albums row. Used by the undo path
+    (UX-14) to recreate a mapping that was just bulk-removed. The
+    Immich album itself is NOT restored — only the local mapping —
+    because bulk-remove already DELETEd the album server-side. The
+    user has to re-sync to recreate the actual album."""
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO cluster_albums
+            (cluster_id, album_id, album_url, n_assets, reused_existing,
+             created_at, last_synced_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(row["cluster_id"]),
+            row["album_id"],
+            row["album_url"],
+            int(row["n_assets"]),
+            int(row.get("reused_existing", 0)),
+            row.get("created_at") or datetime.now(timezone.utc).isoformat(),
+            row.get("last_synced_at") or datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+
+
 # People-filter SQL fragment. `None` means "no filter" (default).
 # `0` means "without people" — treats unscanned (NULL) assets as
 # without-people so the gate stays inclusive while a YOLO person
