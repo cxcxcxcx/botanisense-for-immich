@@ -144,10 +144,25 @@ export function AssetDetail({ assetId }: Props) {
         </figure>
       </div>
 
-      <p className="mb-0.5">
+      <div className="mb-0.5 flex items-center gap-2 flex-wrap">
         <strong>{data.original_file_name}</strong>
-        {data.cluster_id != null && <small className="text-fg-1"> · cluster {data.cluster_id}</small>}
-      </p>
+        {/* Prominent "Open in Immich" CTA — accent-coloured, placed
+            right after the filename so the user can jump to the
+            source photo without scrolling. Hidden when /api/config
+            hasn't returned an immich_public_url (no reverse-proxy
+            override configured yet). */}
+        {immichPublicUrl && (
+          <a
+            href={`${immichPublicUrl.replace(/\/$/, '')}/photos/${data.asset_id}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="px-2.5 py-0.5 rounded bg-accent-dark border border-accent text-white text-[11px] font-medium no-underline hover:bg-accent-hover"
+            title="Open this asset in the Immich web UI"
+          >
+            Open in Immich ↗
+          </a>
+        )}
+      </div>
 
       {/* Asset ID + copy button. Subtle monospace line so users can
           grab the UUID (for sharing / debugging / pasting into
@@ -172,36 +187,6 @@ export function AssetDetail({ assetId }: Props) {
             }
           }}
         >{copied ? 'Copied ✓' : 'Copy ID'}</button>
-        {immichPublicUrl && (
-          <a
-            href={`${immichPublicUrl.replace(/\/$/, '')}/photos/${data.asset_id}`}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="px-1.5 py-0.5 rounded border border-[#345] bg-transparent text-[10px] text-fg-1 no-underline hover:bg-[#234] hover:border-accent"
-            title="Open this asset in the Immich web UI"
-          >
-            Open in Immich ↗
-          </a>
-        )}
-        {/* Person chip — mirrors the grid filter state. Three states:
-            true (👤, accent), false (no person, dim), null (unscanned,
-            italic 'unscanned'). Drives from data.has_person which is
-            set by the pipeline's "person" stage. */}
-        {data.has_person === true && (
-          <span className="px-1.5 py-0.5 rounded border border-accent text-accent text-[10px] font-medium" title="YOLO detected a person in this image">
-            👤 person
-          </span>
-        )}
-        {data.has_person === false && (
-          <span className="px-1.5 py-0.5 rounded border border-[#345] text-fg-1 text-[10px]" title="Scanned, no person detected">
-            no person
-          </span>
-        )}
-        {data.has_person === null && (
-          <span className="px-1.5 py-0.5 rounded border border-[#234] text-fg-1 text-[10px] italic" title="Person scan hasn't run on this asset yet">
-            unscanned
-          </span>
-        )}
       </p>
 
       {(data.captured_at || (data.latitude != null && data.longitude != null)) && (
