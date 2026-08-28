@@ -415,7 +415,7 @@ export function JobPanel() {
   };
 
   return (
-    <aside className="fixed bottom-6 right-6 z-[100] max-w-[32rem]">
+    <aside className="fixed bottom-6 right-6 left-6 sm:left-auto z-[100] sm:max-w-[32rem]">
       <article className="bg-[#161616] border border-[#333] rounded-lg p-4 shadow-[0_8px_32px_rgba(0,0,0,0.6)]">
         <header className="flex justify-between items-center mb-2 border-b border-[#222] pb-2">
           <h4 className="m-0 text-base">{cfg.title()}</h4>

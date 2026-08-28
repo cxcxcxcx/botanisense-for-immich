@@ -600,7 +600,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-2">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
         {/* Cluster-sync controls — both sync-all and remove-always are
             tagged beta. Plantae/Fungi smart-album buttons stay
             unmarked (those flows are stable). */}
