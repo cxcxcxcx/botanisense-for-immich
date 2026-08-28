@@ -1032,35 +1032,6 @@ async def recompute_cluster_names() -> dict:
     return {"recomputed": len(names)}
 
 
-class ClusterRenamePayload(BaseModel):
-    name: str | None  # None or empty string clears the override
-
-
-@app.patch("/api/clusters/{cluster_id}")
-async def rename_cluster(cluster_id: int, payload: ClusterRenamePayload) -> dict:
-    """Set or clear a user override for a cluster's display name.
-
-    Pass `{"name": null}` or `{"name": ""}` to clear the override
-    (revert to the computed name). Pass `{"name": "..."}` to set one;
-    the override survives subsequent pipeline runs and cluster
-    recomputes.
-    """
-    name_value = payload.name.strip() if payload.name else ""
-    new_value: str | None = name_value or None
-    with storage.connect(DB_PATH) as conn:
-        # Materialise the cluster row if needed so the override sticks
-        # even on clusters that haven't been summarised yet.
-        if not storage.set_cluster_manual_name(conn, cluster_id, new_value):
-            # No row in cluster_names yet — compute it first so the
-            # override has somewhere to land.
-            names = storage.ensure_cluster_names(conn)
-            if cluster_id not in names:
-                raise HTTPException(status_code=404, detail="cluster not found")
-            storage.set_cluster_manual_name(conn, cluster_id, new_value)
-    _invalidate_clusters_cache()
-    return {"cluster_id": cluster_id, "name": new_value}
-
-
 @app.get("/api/status")
 async def status() -> dict:
     """Pipeline state for the UI status panel.

@@ -206,10 +206,7 @@ CREATE TABLE IF NOT EXISTS cluster_names (
   n_total         INTEGER NOT NULL,     -- assets in cluster when computed
   top_species_json TEXT NOT NULL DEFAULT '[]',  -- top-3 species + counts
   top_genus_json  TEXT NOT NULL DEFAULT '[]',   -- top-3 genera + counts
-  computed_at     TEXT NOT NULL DEFAULT (datetime('now')),
-  -- User-set override that takes precedence over the computed `name`
-  -- in ensure_cluster_names(). Persists across pipeline runs.
-  manual_name     TEXT
+  computed_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 -- Idempotency for album-management features (e.g., "tag Plants album").
 -- The Plants-album button reads `plants_album_id` to know whether to reuse
@@ -290,9 +287,6 @@ def init_db(path: str | Path) -> None:
             # User-set Plantae override (UX-17). NULL = use the model;
             # 0 = force non-plant; 1 = force plant.
             ("ALTER TABLE assets ADD COLUMN plantae_override INTEGER", "plantae_override"),
-            # User-set cluster name override (UX-15). None = use the
-            # computed name; otherwise this wins on every read.
-            ("ALTER TABLE cluster_names ADD COLUMN manual_name TEXT", "manual_name"),
         ]:
             try:
                 conn.execute(stmt)
@@ -967,22 +961,7 @@ def ensure_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     pass) but the existing rows are still valid for the old clusters.
     On any divergence we recompute the whole table (cheap — one SQL
     pass over predictions).
-
-    User-set manual_name overrides the computed name. The override
-    survives recomputes because save_cluster_names() is destructive
-    (DELETE + INSERT) but we re-apply the manual overrides
-    immediately after.
     """
-    # Capture manual overrides before any destructive save below wipes
-    # them. We re-apply them at the end of this function.
-    manual_overrides: dict[int, str] = {
-        cid: name
-        for cid, name in conn.execute(
-            "SELECT cluster_id, manual_name FROM cluster_names "
-            "WHERE manual_name IS NOT NULL AND manual_name != ''"
-        ).fetchall()
-        if name
-    }
     cur_clusters = conn.execute(
         "SELECT COUNT(DISTINCT cluster_id) FROM assets WHERE cluster_id IS NOT NULL"
     ).fetchone()[0]
@@ -990,49 +969,8 @@ def ensure_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     if cur_clusters > saved_clusters:
         names = compute_cluster_names(conn)
         save_cluster_names(conn, names)
-        # Re-apply manual overrides that survived the rebuild.
-        for cid, name in manual_overrides.items():
-            if cid in names:
-                conn.execute(
-                    "UPDATE cluster_names SET manual_name = ? WHERE cluster_id = ?",
-                    (name, cid),
-                )
-        conn.commit()
         return names
     return load_cluster_names(conn)
-
-
-def set_cluster_manual_name(conn: sqlite3.Connection, cluster_id: int, name: str | None) -> bool:
-    """Set (or clear) the user override for a cluster's display name.
-
-    Returns True if the cluster row exists (manual_name was applied
-    even when name is None — None clears the override). Returns False
-    if the cluster_id has no row yet; the caller should call
-    compute_cluster_names() first to materialise it.
-    """
-    cur = conn.execute(
-        "SELECT 1 FROM cluster_names WHERE cluster_id = ?", (cluster_id,)
-    ).fetchone()
-    if cur is None:
-        return False
-    conn.execute(
-        "UPDATE cluster_names SET manual_name = ? WHERE cluster_id = ?",
-        (name, cluster_id),
-    )
-    conn.commit()
-    return True
-
-
-def get_cluster_manual_name(conn: sqlite3.Connection, cluster_id: int) -> str | None:
-    """Read the manual_name for a cluster (or None if no override)."""
-    row = conn.execute(
-        "SELECT manual_name FROM cluster_names WHERE cluster_id = ?",
-        (cluster_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    val = row["manual_name"]
-    return val if val else None
 
 
 # ---------- clusterer_state ---------------------------------------------

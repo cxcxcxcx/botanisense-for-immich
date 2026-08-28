@@ -625,10 +625,9 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
           className={buttonCls}
           onClick={() => openModal('remove')}
           disabled={!draft || !syncedClusterCount}
-          title={!syncedClusterCount ? 'No clusters are currently synced' : 'Beta: deletes every synced cluster album in Immich — re-sync to recreate'}
+          title={!syncedClusterCount ? 'No clusters are currently synced' : 'Delete every synced cluster album in Immich — re-sync to recreate'}
         >
-          Remove synced clusters{syncedClusterCount != null ? ` (${syncedClusterCount})` : ''}{' '}
-          <BetaTag onClick={() => setShowBetaInfo(true)} />
+          Remove synced clusters{syncedClusterCount != null ? ` (${syncedClusterCount})` : ''}
         </button>
       </div>
 
