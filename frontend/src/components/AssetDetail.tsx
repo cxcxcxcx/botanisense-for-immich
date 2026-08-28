@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { getAsset, reclassifyBbox, getConfig } from '../api/endpoints';
+import { getAsset, reclassifyBbox, reclassify, getConfig, getKnnStatus } from '../api/endpoints';
+import type { KnnStatus } from '../api/types';
 import type { AssetDetail as AssetDetailType } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
@@ -128,6 +129,12 @@ export function AssetDetail({ assetId }: Props) {
   const [usePreview, setUsePreview] = useState(false);
   // Public Immich URL for the "Open in Immich ↗" deep-link.
   const [immichPublicUrl, setImmichPublicUrl] = useState<string | null>(null);
+  // KNN status — fetched once on mount. When the reference index is
+  // built, "Re-run KNN on this asset" appears in the modal so the
+  // user can opt into per-asset KNN reclassification. Hidden when
+  // KNN isn't configured (the index build is hours-long; a button
+  // that always 503s is worse than no button).
+  const [knnStatus, setKnnStatus] = useState<KnnStatus | null>(null);
   const push = useToasts();
 
   useEffect(() => {
@@ -149,6 +156,23 @@ export function AssetDetail({ assetId }: Props) {
       .catch(() => { /* silently no link */ });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    getKnnStatus()
+      .then(s => { if (!cancelled) setKnnStatus(s); })
+      .catch(() => { /* silently null — button stays hidden */ });
+    return () => { cancelled = true; };
+  }, []);
+
+  const handleReclassifyAll = async () => {
+    try {
+      await reclassify([assetId]);
+      push({ kind: 'success', message: 'KNN reclassify queued for this asset' }, 2000);
+    } catch (e) {
+      push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
+    }
+  };
 
   const handleReclassifyBbox = async (bboxIndex: number) => {
     try {
@@ -378,10 +402,24 @@ export function AssetDetail({ assetId }: Props) {
           enough visual separation. */}
       <LibraryNeighbors items={data.library_neighbors} />
 
+      {/* Per-asset KNN reclassification (UX-15-ish workflow). Only
+          rendered when the reference index is built — fetching
+          /api/knn-status once on mount tells us. Users who want to
+          try KNN on a single asset can click this; for the whole
+          grid there's 'Reclassify with KNN' on the Run page. */}
+      {knnStatus?.index_built && (
+        <button
+          type="button"
+          className="self-start text-[11px] text-fg-1 underline hover:text-fg"
+          onClick={handleReclassifyAll}
+          title="Queue a KNN reclassification for this single asset"
+        >
+          Re-run KNN on this asset
+        </button>
+      )}
+
       {/* Debug panels — collapsed by default; users who want the raw
-          ranking open these. Re-run KNN lives in the Run page's
-          Data Tools ('Reclassify with KNN') — the AssetDetail modal
-          is for inspection, not for triggering background jobs. */}
+          ranking open these. */}
       <details className="-mt-1">
         <summary className="cursor-pointer text-[12px] text-fg-1 hover:text-fg">
           Top-{data.top_predictions.length} predictions (debug)
