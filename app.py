@@ -146,6 +146,10 @@ PORT = int(os.environ.get("PORT", "8765"))
 RUN_ON_STARTUP = os.environ.get("RUN_ON_STARTUP", "0") == "1"
 
 _log = logging.getLogger("app")
+# In-app scheduler state (UX-19b). _scheduler_loop sets this to the
+# ISO timestamp of the next scheduled run; the StatusPanel surfaces
+# it to the user. None when PIPELINE_CRON is unset.
+_next_run_at_iso: str | None = None
 # KNN reclassification — separate from the zero-shot pipeline. Set
 # KNN_INVENTORY_DIR (in config.toml [knn] or env) to the directory
 # holding tol200m_bioclip2.faiss + labels.parquet + INDEX_VERSION.txt.
@@ -763,9 +767,82 @@ async def lifespan(_app: FastAPI):
             _thumb_client = None
 
 
+async def _scheduler_loop(cron: str) -> None:
+    """In-app pipeline scheduler (UX-19b).
+
+    Format for `cron`: "HH:MM" 24-hour, daily. We deliberately avoid
+    pulling in croniter/apscheduler for a single feature — the
+    format is intentionally minimal. Users who need a full cron
+    expression can run an external `crontab` line (documented in
+    README.md → Known limits) until a richer scheduler ships.
+
+    Loop: compute seconds-until-next HH:MM, sleep, call run_pipeline
+    with default params, repeat. The /api/status endpoint exposes
+    the next scheduled time via _next_run_at_iso so the UI can
+    show "Next run at: …".
+    """
+    global _next_run_at_iso
+    try:
+        hh, mm = cron.split(":")
+        hh_i, mm_i = int(hh), int(mm)
+        if not (0 <= hh_i <= 23 and 0 <= mm_i <= 59):
+            raise ValueError("hour or minute out of range")
+    except (ValueError, AttributeError) as e:
+        _log.warning("scheduler: bad PIPELINE_CRON=%r (%s) — disabled", cron, e)
+        return
+
+    while True:
+        # Seconds from now until the next HH:MM. If that time is in
+        # the past today, roll forward to tomorrow.
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=hh_i, minute=mm_i, second=0, microsecond=0)
+        if target <= now:
+            target = target.replace(day=target.day + 1)
+        sleep_seconds = max(1.0, (target - now).total_seconds())
+        _next_run_at_iso = target.isoformat()
+        _log.info("scheduler: next run at %s (in %.0fs)", _next_run_at_iso, sleep_seconds)
+        try:
+            await asyncio.sleep(sleep_seconds)
+        except asyncio.CancelledError:
+            _next_run_at_iso = None
+            raise
+
+        # Run the pipeline with default params. Same call site as
+        # POST /api/run, but invoked in-process (no HTTP hop).
+        try:
+            from pipeline import run_pipeline  # local import: torch/bioclip is heavy
+            await asyncio.to_thread(
+                run_pipeline,
+                base_url=BASE_URL,
+                api_key=API_KEY,
+                query=QUERY,
+                n_samples=N_SAMPLES,
+                top_k=TOP_K,
+                batch_size=BATCH_SIZE,
+            )
+            _log.info("scheduler: scheduled run completed")
+        except Exception as e:  # noqa: BLE001
+            _log.warning("scheduler: scheduled run failed: %s", e)
+
+
 async def _lifespan_inner() -> None:
-    """Existing startup work (near-dup warm + optional auto-run),
-    pulled out so lifespan() stays focused on the shared HTTP client."""
+    """Existing startup work (near-dup warm + optional auto-run +
+    optional in-app scheduler), pulled out so lifespan() stays focused
+    on the shared HTTP client."""
+    # Spawn the in-app scheduler task if PIPELINE_CRON is set. We
+    # use a simple HH:MM daily schedule (e.g. "02:00") rather than a
+    # full cron parser to avoid pulling in croniter/apscheduler for
+    # a single feature. Format: "HH:MM" 24-hour. Empty / unset =
+    # scheduler disabled (default).
+    cron = os.environ.get("PIPELINE_CRON", "").strip()
+    if cron:
+        sched_task = asyncio.create_task(
+            _scheduler_loop(cron), name="pipeline-scheduler",
+        )
+        _log.info("scheduler: PIPELINE_CRON=%r enabled", cron)
+    else:
+        sched_task = None
+
     # NOTE: do NOT eagerly warm BioCLIP / YOLO here — browse-only mode
     # (~200 MB) is the default and we don't want to pay the ~3 GB cost
     # of model weights until the user actually hits POST /api/run.
@@ -994,6 +1071,9 @@ async def status() -> dict:
       idle state once the child exits, and the UI keeps showing the
       "Pipeline started" message with no final state.
     - Never run yet: parent's empty idle state.
+
+    The returned dict also picks up `next_run_at` from the in-app
+    scheduler (UX-19b) — null when PIPELINE_CRON is unset.
     """
     active = _get_active_job()
     if active is not None:
@@ -1002,13 +1082,18 @@ async def status() -> dict:
             try:
                 snap = json.loads(sp.read_text())
                 snap["job_id"] = active["job_id"]
+                snap["next_run_at"] = _next_run_at_iso
                 return snap
             except (json.JSONDecodeError, OSError):
                 pass
     last = await asyncio.to_thread(_last_completed_run)
     if last is not None:
+        if isinstance(last, dict):
+            last["next_run_at"] = _next_run_at_iso
         return last
-    return get_state()
+    base = get_state()
+    base["next_run_at"] = _next_run_at_iso
+    return base
 
 
 @app.get("/api/health")

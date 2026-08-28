@@ -119,6 +119,18 @@ export function StatusPanel({ compact = false }: Props = {}) {
         <small className="text-fg-1" style={{ display: pipeline?.eta_seconds != null ? 'inline' : 'none' }}>
           {etaParts.join(' · ')}
         </small>
+        {/* In-app scheduler hint (UX-19b). Only renders when the
+            server reports a `next_run_at` (i.e. PIPELINE_CRON is set).
+            Shows the next scheduled time so the user knows when the
+            next auto-run will fire. */}
+        {pipeline?.next_run_at && (
+          <small
+            className="text-fg-2 ml-auto"
+            title={`PIPELINE_CRON is set; the next run fires at ${pipeline.next_run_at}`}
+          >
+            Next run: {new Date(pipeline.next_run_at).toLocaleString()}
+          </small>
+        )}
       </div>
       {bars.length > 0 && (
         <>

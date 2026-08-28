@@ -302,6 +302,9 @@ export interface PipelineStatus {
   stage_times: Record<string, number>;
   stage_t0: number | null;
   last_error: string | null;
+  // ISO timestamp of the next scheduled run (UX-19b). null when
+  // PIPELINE_CRON is unset on the server.
+  next_run_at?: string | null;
 }
 
 export interface JobPreview {
