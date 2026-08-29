@@ -13,6 +13,67 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Theme tokens — defined as rgb triples so Tailwind's
+   `rgb(var(--c-X) / <alpha-value>)` shorthand can layer alpha on
+   top (this is what makes `bg-bg/90` etc. actually follow the
+   theme). The `:root` block is the dark default (no data-theme);
+   `[data-theme='light']` overrides. Every named token in
+   tailwind.config.js has a corresponding `--c-*` here. */
+:root {
+  --c-bg:        17  17  17;     /* bg-bg   — page background */
+  --c-bg-0:      10  10  10;     /* bg-bg-0 — deepest panel */
+  --c-bg-1:      20  24  29;     /* bg-bg-1 — card surface */
+  --c-bg-2:      26  26  26;     /* bg-bg-2 — input/chip surface */
+  --c-fg:       238 238 238;     /* fg   — primary text */
+  --c-fg-0:     170 170 170;     /* fg-0 — emphasised secondary */
+  --c-fg-1:     136 136 136;     /* fg-1 — muted body */
+  --c-fg-2:     119 119 119;     /* fg-2 — captions */
+  --c-fg-3:      68  68  68;     /* fg-3 — disabled / hint */
+  --c-line:      34  34  34;     /* line   — hairline borders */
+  --c-line2:     42  42  42;     /* line2  — emphasised borders */
+  --c-accent:    92 192 120;     /* accent — green CTA */
+  --c-accent-hover:  111 208 137;
+  --c-accent-dark:    44 138  74;
+  --c-plantae-green:  26  58  26;
+  --c-plantae-yellow: 58  58  26;
+  --c-plantae-red:    58  26  26;
+  --c-score-green:    44 138  74;
+  --c-score-red:     163  51  85;  /* hex shorthand 'a35' */
+  --c-stage-search:  74 158 255;
+  --c-stage-species: 80 200 120;
+  --c-stage-cluster: 245 166  35;
+  --c-stage-kingdom: 155  89 182;
+  --c-stage-yolo:    231  76  60;
+  --c-stage-bbox:     26 188 156;
+}
+[data-theme='light'] {
+  --c-bg:       250 250 250;
+  --c-bg-0:     245 245 245;
+  --c-bg-1:     255 255 255;
+  --c-bg-2:     243 244 246;     /* gray-100 */
+  --c-fg:        31  41  55;     /* gray-800 */
+  --c-fg-0:      17  24  39;     /* gray-900 */
+  --c-fg-1:      75  85  99;     /* gray-600 */
+  --c-fg-2:     107 114 128;     /* gray-500 */
+  --c-fg-3:     156 163 175;     /* gray-400 */
+  --c-line:     229 231 235;     /* gray-200 */
+  --c-line2:    209 213 219;     /* gray-300 */
+  --c-accent:    37  99 235;     /* blue-600 */
+  --c-accent-hover:  59 130 246; /* blue-500 */
+  --c-accent-dark:   29  78 216; /* blue-700 */
+  --c-plantae-green: 220 252 231; /* green-100 */
+  --c-plantae-yellow:254 249 195; /* yellow-100 */
+  --c-plantae-red:   254 226 226; /* red-100 */
+  --c-score-green:    22 163  74;  /* green-600 */
+  --c-score-red:     220  38  38;  /* red-600 */
+  --c-stage-search:   37  99 235;
+  --c-stage-species:  22 163  74;
+  --c-stage-cluster: 217 119   6;  /* amber-600 */
+  --c-stage-kingdom: 124  58 237;  /* violet-600 */
+  --c-stage-yolo:    220  38  38;
+  --c-stage-bbox:      5 150 105;  /* emerald-600 */
+}
+
 /* Base layer — body background + sane defaults for plain HTML
    elements the React tree renders (modal <dialog>, etc). */
 @layer base {
@@ -38,18 +99,11 @@
   dialog > article > header > button.close:hover { opacity: 1; }
 }
 
-/* Light-theme overrides — second pass: remap the most-used
-   ad-hoc Tailwind hex classes that show up in components (dark
-   accents that read fine on #161616 but break on a light bg).
-
-   Strategy: a single rule per hex value, scoped to
-   [data-theme='light'] ancestor, with !important so it beats the
-   arbitrary-value Tailwind classes. The set below covers every
-   hard-coded color found in /src/components/*.tsx at audit time
-   (grep '#[0-9a-fA-F]\{3,6\}').
-
-   Add new colors here as they appear — the alternative is rewriting
-   every component to use theme tokens, which is a bigger refactor. */
+/* Light-theme overrides — minimal pass for Pico CSS variables and a
+   handful of hard-coded surfaces that Tailwind can't reach via
+   opacity variants. Everything else flows through the CSS custom
+   properties defined in :root above (theme-aware via Tailwind's
+   rgb(var(--c-X) / <alpha-value>) shorthand in tailwind.config.js). */
 [data-theme='light'] {
   --pico-background-color: #fafafa;
   --pico-color: #1f2937;
@@ -58,70 +112,16 @@
   --pico-muted-color: #6b7280;
   --pico-muted-border-color: #d1d5db;
 }
-[data-theme='light'] body { @apply bg-white text-gray-900; }
-[data-theme='light'] .bg-bg   { background-color: #fafafa !important; }
-[data-theme='light'] .bg-bg-1 { background-color: #ffffff !important; }
-[data-theme='light'] .bg-bg-2 { background-color: #f3f4f6 !important; }
-[data-theme='light'] .text-fg   { color: #1f2937 !important; }
-[data-theme='light'] .text-fg-0 { color: #111827 !important; }
-[data-theme='light'] .text-fg-1 { color: #4b5563 !important; }
-[data-theme='light'] .text-fg-2 { color: #6b7280 !important; }
-[data-theme='light'] .border-line  { border-color: #e5e7eb !important; }
-[data-theme='light'] .border-line2 { border-color: #d1d5db !important; }
-[data-theme='light'] .border-accent { border-color: #2563eb !important; }
-[data-theme='light'] .bg-accent { background-color: #2563eb !important; }
-[data-theme='light'] .bg-accent-dark { background-color: #1d4ed8 !important; }
-[data-theme='light'] .text-accent { color: #2563eb !important; }
-/* Hard-coded surfaces (Tailwind arbitrary values used inline). */
-[data-theme='light'] [class*="bg-[#161616]"] { background-color: #ffffff !important; }
-[data-theme='light'] [class*="bg-[#1a1a1a]"] { background-color: #f9fafb !important; }
-[data-theme='light'] [class*="bg-[#0a0a0a]"] { background-color: #f9fafb !important; }
-[data-theme='light'] [class*="bg-[#222]"]     { background-color: #e5e7eb !important; }
-[data-theme='light'] [class*="bg-[#234]"]     { background-color: #e5e7eb !important; }
-[data-theme='light'] [class*="bg-[#345]"]     { background-color: #d1d5db !important; }
-[data-theme='light'] [class*="bg-[#422]"]     { background-color: #fee2e2 !important; }
-[data-theme='light'] [class*="bg-[#2a1414]"]  { background-color: #fef2f2 !important; }
-[data-theme='light'] [class*="bg-[#2a1a2a]"]  { background-color: #fdf4ff !important; }
-[data-theme='light'] [class*="bg-[#2a2414]"]  { background-color: #fefce8 !important; }
-[data-theme='light'] [class*="hover\\:bg-[#234]"]:hover { background-color: #f3f4f6 !important; }
-[data-theme='light'] [class*="hover\\:bg-[#345]"]:hover { background-color: #e5e7eb !important; }
-[data-theme='light'] [class*="hover\\:bg-[#3a1414]"]:hover { background-color: #fee2e2 !important; }
-[data-theme='light'] [class*="hover\\:bg-[#3a2a3a]"]:hover { background-color: #fae8ff !important; }
-[data-theme='light'] [class*="border-[#222]"] { border-color: #e5e7eb !important; }
-[data-theme='light'] [class*="border-[#333]"] { border-color: #d1d5db !important; }
-[data-theme='light'] [class*="border-[#345]"] { border-color: #cbd5e1 !important; }
-[data-theme='light'] [class*="border-[#456]"] { border-color: #cbd5e1 !important; }
-[data-theme='light'] [class*="border-[#a44]"] { border-color: #fca5a5 !important; }
-[data-theme='light'] [class*="hover\\:border-accent"]:hover { border-color: #2563eb !important; }
-[data-theme='light'] [class*="text-[#7ad]"]   { color: #2563eb !important; }
-[data-theme='light'] [class*="text-[#ad9]"]   { color: #16a34a !important; }
-[data-theme='light'] [class*="text-[#a44]"]   { color: #dc2626 !important; }
-[data-theme='light'] [class*="text-[#d8a]"]   { color: #b45309 !important; }
-[data-theme='light'] [class*="text-[#fbb]"]   { color: #b91c1c !important; }
-[data-theme='light'] [class*="text-[#fdc]"]   { color: #a16207 !important; }
-[data-theme='light'] [class*="text-[#e8c45c]"] { color: #a16207 !important; }
-[data-theme='light'] [class*="text-[#5cc078]"] { color: #16a34a !important; }
-[data-theme='light'] [class*="text-[#d97878]"] { color: #b91c1c !important; }
-[data-theme='light'] [class*="text-[#444]"]   { color: #9ca3af !important; }
-[data-theme='light'] [class*="text-[#666]"]   { color: #6b7280 !important; }
-/* card image placeholder in BboxImage — gradient overlay reads
-   illegible on white. */
-[data-theme='light'] [class*="bg-gradient-to-t"][class*="from-black\\/90"] {
-  background-image: linear-gradient(to top, rgba(255,255,255,0.9), transparent) !important;
-}
-[data-theme='light'] [class*="from-black\\/90"] {
-  --tw-gradient-from: rgba(255,255,255,0.9) var(--tw-gradient-from-position);
-  --tw-gradient-to: rgba(255,255,255,0) var(--tw-gradient-to-position);
-}
-/* shimmer — uses a translucent white gradient; on light bg it
-   disappears entirely. Flip to a subtle gray sweep. */
+
+/* Shimmer skeleton — translucent WHITE gradient on dark, but
+   disappears on light bg. Flip to a subtle dark sweep so it
+   remains visible. */
 [data-theme='light'] .shimmer {
   background: linear-gradient(90deg,
     rgba(0,0,0,0.04) 0%,
     rgba(0,0,0,0.10) 50%,
     rgba(0,0,0,0.04) 100%) !important;
 }
-[data-theme='light'] header.sticky { background-color: rgba(255,255,255,0.95) !important; }
 
 /* Components — small, named patterns the React tree references via
    @apply. Tailwind's color tokens are in tailwind.config.js. */
