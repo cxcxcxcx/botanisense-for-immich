@@ -29,10 +29,18 @@ base_url = "http://192.168.1.10:2283"
 inventory_dir = ""
 
 [cors]
-# Optional. Origins allowed to call /api/*. Default = same-origin only
-# (the bundled SPA on uvicorn). Set this when serving the SPA from a
-# different origin (e.g. behind a reverse proxy or a different host).
+# Optional. Origins allowed to call /api/*. Default = ANY origin (`*`),
+# which works out of the box for both the prod build (same-origin via
+# uvicorn) and dev (Vite on :5173 → uvicorn on :8765 cross-origin).
+# Narrow this list when exposing the app over a public reverse proxy:
 #
-# Example for Vite dev:
-#   origins = ["http://localhost:5173"]
-origins = []
+# Example for prod behind nginx:
+#   origins = ["https://botanisense.example.com"]
+#
+# `allow_credentials` stays False, so `*` is safe with browsers
+# (cookies aren't used; auth is the IMMICH_API_KEY sent per request).
+#
+# Set to an empty list `[]` to enforce same-origin only (stricter;
+# blocks the Vite dev server).
+# origins = []
+origins = ["*"]

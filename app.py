@@ -904,13 +904,23 @@ async def _lifespan_inner() -> None:
 
 app = FastAPI(title="BotaniSense for Immich", lifespan=lifespan)
 
-# CORS: the dev frontend is served by Vite on :5173 and calls /api/*
-# directly on uvicorn :8765 (bypassing Vite's proxy to avoid SSE
-# backpressure). Origins come from config.toml [cors] (default empty =
-# same-origin only, which is correct for the bundled SPA on uvicorn).
-# Add `["http://localhost:5173"]` for the Vite dev server, or your
-# reverse-proxy origin when exposing the app publicly.
-_cors_origins = _cfg.get("cors", {}).get("origins", []) or []
+# CORS: BotaniSense is a self-hosted single-user app — the typical
+# deployment is uvicorn serving both the SPA and the API (same-origin),
+# so CORS doesn't apply. But in dev the SPA is served by Vite on
+# :5173 and the API by uvicorn on :8765, and client.ts deliberately
+# bypasses Vite's /api proxy for /api/* (the SSE /api/events stream
+# would otherwise get buffered by Vite). That makes the dev case a
+# cross-origin request and CORS becomes load-bearing.
+#
+# Default: allow any origin. This is fine for a single-user LAN app
+# (the server isn't reachable from the public internet by default),
+# but it's the wrong default for a hardened deployment. To narrow,
+# set `[cors].origins` in config.toml — the env-var override still
+# wins. Allow_credentials stays False, so we can safely use "*"
+# (browsers reject wildcard + credentials; we don't use cookies).
+_cors_origins = _cfg.get("cors", {}).get("origins", None)
+if _cors_origins is None:
+    _cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
