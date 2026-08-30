@@ -42,7 +42,6 @@ import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Iterable
 
 import os as _os
 # Force pyarrow's default memory pool to system malloc instead of
@@ -113,29 +112,6 @@ BUILD_CHUNK_ROWS = 25_000
 CHECKPOINT_EVERY = 400
 
 
-def _quoted_columns() -> str:
-    """Return LABEL_COLUMNS + emb as a SELECT list. `class` and `order`
-    are SQL reserved words so they must be double-quoted."""
-    cols = []
-    for c in LABEL_COLUMNS + ("emb",):
-        if c in ("class", "order"):
-            cols.append(f'"{c}"')
-        else:
-            cols.append(c)
-    return ", ".join(cols)
-
-
-def _duckdb_filter_sql(
-    parquet_glob: str,
-    *,
-    kingdoms: Iterable[str] | None,
-) -> tuple[str, list]:
-    """Legacy helper kept for backwards compat — never called now that
-    the streaming reader is pyarrow.dataset. Returns an empty SQL string
-    and an empty param list as a no-op marker."""
-    return ("", [])
-
-
 def build_faiss_index(
     *,
     parquet_glob: str,
@@ -143,7 +119,6 @@ def build_faiss_index(
     labels_path: Path,
     kingdoms: Iterable[str] | None = None,
     version_tag: str,
-    on_progress=None,
     index_type: str = "ivf",
     ivf_nlist: int | None = None,
     # Default 200K (was 1M) — holds 200K * 768 * 4 = ~600 MB during
@@ -776,8 +751,6 @@ def build_faiss_index(
                     f"[knn.build] reloaded in {time.monotonic() - t_ck:.1f}s; "
                     f"ntotal={ivf.ntotal:,}, RSS should drop on next sample"
                 )
-            if on_progress is not None:
-                on_progress(chunk_idx, -1, n_rows)
 
     _flush()
 
@@ -1169,30 +1142,6 @@ def _load_index(
             f"{n_index:,}", health["max_sim"],
         )
     return index, labels, meta
-
-
-def _emb_column_to_numpy(
-    emb_col: pa.ChunkedArray, n: int
-) -> np.ndarray:
-    """Convert a pyarrow chunked array of list<float16/32> into an
-    (n, EMB_DIM) float32 contiguous numpy array."""
-    emb_arr = np.empty((n, EMB_DIM), dtype=np.float32)
-    offset = 0
-    for chunk in emb_col.chunks:
-        m = len(chunk)
-        try:
-            sub = np.asarray(
-                chunk.cast(pa.list_(pa.float32())),
-                dtype=np.float32,
-            ).reshape(m, EMB_DIM)
-        except (pa.ArrowNotImplementedError, pa.ArrowInvalid) as e:
-            _log.debug("pyarrow list cast unavailable, using pylist fallback: %s", e)
-            sub = np.asarray(chunk.to_pylist(), dtype=np.float32).reshape(
-                m, EMB_DIM
-            )
-        emb_arr[offset : offset + m] = sub
-        offset += m
-    return np.ascontiguousarray(emb_arr)
 
 
 def classify_via_knn(
