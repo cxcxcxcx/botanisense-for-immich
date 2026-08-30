@@ -288,22 +288,14 @@ def build_faiss_index(
     # clock is parquet decode + the in-place normalize + label writing,
     # not FAISS. Optimize there before touching thread counts again.
     try:
-        # Cap at 8 on a 16-core host (the sweet spot from the table
-        # above), but scale down on a memory-constrained host — each
-        # FAISS thread reserves its own mimalloc arena (~1 GB each
-        # under pyarrow's system allocator, less with ARROW_DEFAULT_MEMORY_POOL=system
-        # but still non-zero). With an 8 GB RLIMIT_DATA, 4 threads
-        # leaves more headroom for the IVF training buffer (1.8 GB at
-        # ivf_train_size=600K), the in-progress label batches, and
-        # the growing in-RAM IVFPQ.
-        _rlimit_gb = (_rlimit_bytes if "_rlimit_bytes" in dir() else 8 * 1024**3) / 1024**3
-        _cap = 4 if _rlimit_gb <= 8 else 8
-        _threads = max(1, min(_cap, (_os.cpu_count() or 4) - 2))
+        # Cap at 8 on a 16-core host. 16 is the worst setting
+        # (oversubscribes against pyarrow's reader threads and loses
+        # 1.7× to 8); 8 was the measured sweet spot in
+        # [[knn-build-checkpoint-thrashing]]. Don't go higher than
+        # cores-2 so OS + pyarrow still get CPU.
+        _threads = max(1, min(8, (_os.cpu_count() or 4) - 2))
         faiss.omp_set_num_threads(_threads)
-        _log.info(
-            f"[knn.build] faiss OpenMP threads = {_threads} "
-            f"(cap {_cap} chosen for RLIMIT_DATA = {_rlimit_gb:.0f} GB)"
-        )
+        _log.info(f"[knn.build] faiss OpenMP threads = {_threads}")
     except Exception as _e:  # pragma: no cover - faiss build without omp
         _log.warning(f"[knn.build] could not set faiss thread count: {_e}")
     # Resume mode: if a prior build wrote a valid IVFPQ index to
@@ -1409,31 +1401,34 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    # Apply RLIMIT_DATA early. The /api/knn/build path already does this
-    # via preexec_fn; the CLI path used to log but not apply, so a
-    # direct `python -m knn …` from a shell with unlimited rlimit would
-    # happily OOM-kill the entire box instead of failing the build.
-    #
-    # Default: 8 GB, the build budget for the constrained host. The
-    # app.py spawn path overrides this by setting
-    # _KNN_BUILD_MEM_LIMIT_BYTES env var (in bytes) — which wins over
-    # the default when both are present.
+    # Apply RLIMIT_DATA. The /api/knn/build path already does this
+    # via preexec_fn; the CLI path used to log but not apply. Without
+    # this, a direct `python -m knn ...` from a shell with unlimited
+    # rlimit would OOM-kill the entire box instead of failing the
+    # build. Pass `_KNN_BUILD_MEM_LIMIT_BYTES=0` (or "unlimited") to
+    # skip the cap; any other value is the cap in bytes.
     import resource
-    def _parse_mem(s):
-        s = s.strip().lower()
-        if s.endswith("g"): return int(float(s[:-1]) * 1024**3)
-        if s.endswith("m"): return int(float(s[:-1]) * 1024**2)
-        return int(s)
-    _default_rlimit_bytes = 8 * 1024**3  # 8 GB
-    _rlimit_bytes = (
-        _default_rlimit_bytes
-        if not _os.environ.get("_KNN_BUILD_MEM_LIMIT_BYTES")
-        else int(_os.environ["_KNN_BUILD_MEM_LIMIT_BYTES"])
-    )
-    try:
-        resource.setrlimit(resource.RLIMIT_DATA, (_rlimit_bytes, _rlimit_bytes))
-    except (ValueError, OSError) as _e:
-        _log.warning(f"[knn.build] could not set RLIMIT_DATA: {_e}")
+    _env_cap = _os.environ.get("_KNN_BUILD_MEM_LIMIT_BYTES", "").strip().lower()
+    if _env_cap not in ("", "0", "unlimited"):
+        try:
+            resource.setrlimit(
+                resource.RLIMIT_DATA,
+                (int(_env_cap), int(_env_cap)),
+            )
+        except (ValueError, OSError) as _e:
+            _log.warning(f"[knn.build] could not set RLIMIT_DATA: {_e}")
+    elif _env_cap == "":
+        # CLI default: 8 GB. The build's working set is ~5 GB (1.8 GB
+        # IVF training + 2 GB labels in flight + 1 GB index + heap), and
+        # 8 GB leaves room for both pyarrow's mmap'd parquet and any
+        # short-lived intermediates without taking down uvicorn or the
+        # other dev services on this host.
+        try:
+            resource.setrlimit(
+                resource.RLIMIT_DATA, (8 * 1024**3, 8 * 1024**3)
+            )
+        except (ValueError, OSError) as _e:
+            _log.warning(f"[knn.build] could not set default RLIMIT_DATA: {_e}")
 
     # Surface the actual rlimit in the log so an OOM in the field is
     # easy to diagnose — `RLIMIT_DATA` (12 GB on this host) is what the
