@@ -785,6 +785,25 @@ def build_faiss_index(
             "[knn.build] index validated (max unit-query sim %.4f)",
             health["max_sim"],
         )
+    # Index/labels alignment. classify_via_knn uses FAISS ids as label row
+    # offsets, so a mismatch means wrong species names, not just a count
+    # discrepancy. v1 shipped 851,660 rows out of step and needed a
+    # hand-written /tmp/trim_index.py to repair — check it here instead.
+    try:
+        n_labels = int(pq.read_metadata(labels_path).num_rows)
+    except Exception as _e:
+        n_labels = -1
+        _log.warning(f"[knn.build] could not read labels row count: {_e}")
+    n_index = int(index.ntotal)
+    aligned = (n_labels == n_index)
+    if n_labels >= 0 and not aligned:
+        _log.error(
+            f"[knn.build] MISALIGNED: index has {n_index:,} vectors but "
+            f"labels.parquet has {n_labels:,} rows. Species lookups will "
+            f"return the wrong row. Do not use this index."
+        )
+    elif aligned:
+        _log.info(f"[knn.build] index/labels aligned at {n_index:,} rows")
     # nlist sanity. The default derives from ivf_train_size, NOT corpus
     # size, so a big corpus with the default training set silently gets
     # far too few cells — v1 ended up with nlist=316 for 116M rows
@@ -819,6 +838,9 @@ def build_faiss_index(
         "segment_rows": segment_rows,
         "complete": not stopped_early,
         "health": health,
+        "n_index": n_index,
+        "n_labels": n_labels,
+        "aligned": aligned,
     }
 
 
@@ -1036,15 +1058,39 @@ def _load_index(
     # reading a multi-GB index off disk, and it runs exactly where a
     # corrupt index would otherwise start silently returning nonsense.
     health = validate_index(index)
+    # Alignment check: classify_via_knn maps FAISS ids straight into
+    # labels.parquet row offsets (`labels.take(I)`), so the two files
+    # MUST have the same row count and the same row order. If the index
+    # has more rows than the labels table, every neighbor id past the end
+    # is either an error or — worse — silently the wrong species.
+    #
+    # This has happened: the v1 build ended up with ntotal=117,070,179
+    # against labels.num_rows=116,218,519 (851,660 Animalia rows leaked
+    # into the tail) and had to be repaired by hand with a one-off
+    # /tmp/trim_index.py. Nothing in the library noticed. Now it does.
+    n_index = int(index.ntotal)
+    n_labels = int(_labels_md.num_rows)
+    if n_index != n_labels:
+        health = {
+            "ok": False,
+            "max_sim": health.get("max_sim"),
+            "reason": (
+                f"index has {n_index:,} vectors but labels.parquet has "
+                f"{n_labels:,} rows — FAISS ids are used directly as label "
+                f"row offsets, so species names are misaligned. Rebuild."
+            ),
+        }
     meta["health"] = health
+    meta["n_index"] = n_index
+    meta["n_labels"] = n_labels
     if health["ok"] is False:
         _log.error("[knn] INDEX FAILED VALIDATION: %s", health["reason"])
     elif health["ok"] is None:
         _log.warning("[knn] index validation inconclusive: %s", health["reason"])
     else:
         _log.info(
-            "[knn] index validation ok (max unit-query sim %.4f)",
-            health["max_sim"],
+            "[knn] index validation ok (%s vectors, max unit-query sim %.4f)",
+            f"{n_index:,}", health["max_sim"],
         )
     return index, labels, meta
 
