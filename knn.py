@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -1347,6 +1348,42 @@ def classify_via_knn(
     return out
 
 
+def _rss_watchdog(env_cap_str: str, stop_event: threading.Event) -> None:
+    """In-process RSS watchdog. Polls /proc/self/status every 5s and
+    `os._exit(137)` if RSS exceeds the cap. RLIMIT_DATA alone is
+    not enough — it caps the heap, but the kernel OOM killer will
+    still SIGKILL the build on a memory-tight host, taking the
+    parent shell with it. This gives the build a clean failure
+    instead."""
+    s = env_cap_str.strip().lower()
+    if s in ("", "0", "unlimited"):
+        return  # unlimited — nothing to watch
+    try:
+        cap_bytes = int(s)
+    except ValueError:
+        return
+    cap_mb = cap_bytes / 1024**2
+    while not stop_event.is_set():
+        stop_event.wait(timeout=5.0)
+        if stop_event.is_set():
+            return
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        rss_mb = int(line.split()[1]) / 1024
+                        if rss_mb > cap_mb:
+                            _log.error(
+                                f"[knn.build] RSS {rss_mb:.0f} MB exceeds "
+                                f"cap {cap_mb:.0f} MB; exiting cleanly to "
+                                f"avoid OOM-kill by the kernel."
+                            )
+                            _os._exit(137)
+                        break
+        except (FileNotFoundError, ProcessLookupError):
+            return
+
+
 def main() -> int:
     """CLI entry: build an index from a parquet glob."""
     import argparse
@@ -1400,13 +1437,6 @@ def main() -> int:
              "Use for multi-pass builds that exceed the memory budget.",
     )
     args = ap.parse_args()
-
-    # Apply RLIMIT_DATA. The /api/knn/build path already does this
-    # via preexec_fn; the CLI path used to log but not apply. Without
-    # this, a direct `python -m knn ...` from a shell with unlimited
-    # rlimit would OOM-kill the entire box instead of failing the
-    # build. Pass `_KNN_BUILD_MEM_LIMIT_BYTES=0` (or "unlimited") to
-    # skip the cap; any other value is the cap in bytes.
     import resource
     _env_cap = _os.environ.get("_KNN_BUILD_MEM_LIMIT_BYTES", "").strip().lower()
     if _env_cap not in ("", "0", "unlimited"):
@@ -1444,25 +1474,43 @@ def main() -> int:
     except (ValueError, OSError):
         _log.warning("[knn.build] could not read RLIMIT_DATA")
 
-    kingdoms = (
-        [k.strip() for k in args.kingdoms.split(",") if k.strip()]
-        if args.kingdoms
-        else None
-    )
-    stats = build_faiss_index(
-        parquet_glob=args.parquet_glob,
-        index_path=Path(args.index_dir) / "tol200m_bioclip2.faiss",
-        labels_path=Path(args.index_dir) / "labels.parquet",
-        kingdoms=kingdoms,
-        version_tag=args.tag,
-        index_type=args.index_type,
-        ivf_nlist=args.ivf_nlist,
-        ivf_train_size=args.ivf_train_size,
-        resume=args.resume,
-        max_segment_rows=args.max_segment_rows,
-    )
-    print(json.dumps(stats, indent=2, default=str))
-    return 0
+    # Start the in-process RSS watchdog AFTER rlimit is set so it
+    # watches the right cap. RLIMIT_DATA only caps the heap; the
+    # kernel OOM killer will still SIGKILL the build on a memory-
+    # tight host, taking the parent shell with it. The watchdog
+    # polls /proc/self/status every 5s and exits cleanly (status
+    # 137) if RSS exceeds the cap, so we fail loudly instead of
+    # being torn down silently.
+    _watchdog_stop = threading.Event()
+    threading.Thread(
+        target=_rss_watchdog,
+        args=(_os.environ.get("_KNN_BUILD_MEM_LIMIT_BYTES", ""), _watchdog_stop),
+        daemon=True,
+        name="knn-rss-watchdog",
+    ).start()
+
+    try:
+        kingdoms = (
+            [k.strip() for k in args.kingdoms.split(",") if k.strip()]
+            if args.kingdoms
+            else None
+        )
+        stats = build_faiss_index(
+            parquet_glob=args.parquet_glob,
+            index_path=Path(args.index_dir) / "tol200m_bioclip2.faiss",
+            labels_path=Path(args.index_dir) / "labels.parquet",
+            kingdoms=kingdoms,
+            version_tag=args.tag,
+            index_type=args.index_type,
+            ivf_nlist=args.ivf_nlist,
+            ivf_train_size=args.ivf_train_size,
+            resume=args.resume,
+            max_segment_rows=args.max_segment_rows,
+        )
+        print(json.dumps(stats, indent=2, default=str))
+        return 0
+    finally:
+        _watchdog_stop.set()
 
 
 if __name__ == "__main__":
