@@ -91,17 +91,25 @@ EMB_DIM = 768
 # a single-machine build (we keep ~1 GB free for FAISS + label arrays).
 BUILD_CHUNK_ROWS = 25_000
 # Periodic index reload — every CHECKPOINT_EVERY chunks (25K rows each)
-# the live IVFPQ index is written to a checkpoint file and read back.
-# Bounds the in-RAM index header / per-list bookkeeping that grows
-# monotonically with rows even when OnDiskInvertedLists is in use.
-# Empirically with in-RAM ArrayInvertedLists:
-#   - 100K rows → RSS ~700 MB after ckpt
-#   - 1M rows  → RSS ~1.5 GB after ckpt
-#   - 5M rows  → RSS ~1.7 GB after ckpt (peak ~2.5 GB just before ckpt)
-# 8 chunks = 200K rows ≈ every ~7s; ~650 checkpoints across a
-# 130M-row build. Each ckpt costs ~2s of write_index + read_index;
-# total wall-clock overhead is ~22 min on top of the ~75-minute build.
-CHECKPOINT_EVERY = 8
+# the live IVFPQ index is written to disk and read back, to bound the
+# in-RAM bookkeeping that grows with row count, and to leave a resumable
+# index behind if the build is killed.
+#
+# This used to be 8 (every 200K rows), on the assumption — see the old
+# comment, and the stale one still nearby in the checkpoint block — that
+# write_index only serialized a header because the PQ codes lived in an
+# .ivfdata file under OnDiskInvertedLists. That stopped being true when
+# the build switched to in-RAM ArrayInvertedLists: write_index now
+# serializes the WHOLE index, which grows linearly with the build.
+#
+# Measured on the 116M-row v2 build at CHECKPOINT_EVERY=8:
+#   - 13.5s per checkpoint at 78M rows, against ~9.6s of actual add work
+#   - throughput fell from ~20.8K rows/s (add-only) to ~7.2K rows/s
+#   - RSS it was meant to bound sat flat at ~5 GB with 15 GB headroom
+# So it was spending more than half the build serializing, to solve a
+# memory problem that wasn't occurring. 400 chunks = 10M rows keeps a
+# useful crash-recovery point while making the overhead negligible.
+CHECKPOINT_EVERY = 400
 
 
 def _quoted_columns() -> str:
@@ -262,6 +270,19 @@ def build_faiss_index(
     index = faiss.IndexFlatIP(EMB_DIM)
     ivf: faiss.IndexIVFFlat | None = None
     ivf_train_buf: list[np.ndarray] = []
+    # FAISS parallelizes add()/train() with OpenMP. Left alone it spawns
+    # a thread per core and the oversubscription against pyarrow's own
+    # reader threads costs more than it gains; the out-of-tree runner
+    # measured 48K rows/s single-threaded vs 126K rows/s at 8 threads on
+    # this 16-core host, and knn.py never set it at all. Cap at 8 (or
+    # cores-2 on smaller machines) to leave headroom for the parquet
+    # reader and the OS.
+    try:
+        _threads = max(1, min(8, (_os.cpu_count() or 4) - 2))
+        faiss.omp_set_num_threads(_threads)
+        _log.info(f"[knn.build] faiss OpenMP threads = {_threads}")
+    except Exception as _e:  # pragma: no cover - faiss build without omp
+        _log.warning(f"[knn.build] could not set faiss thread count: {_e}")
     # Resume mode: if a prior build wrote a valid IVFPQ index to
     # index_path, load it back and skip training. Subsequent .add()
     # calls append PQ codes to the same in-RAM invlists. Caller is
@@ -606,25 +627,32 @@ def build_faiss_index(
                 and CHECKPOINT_EVERY > 0
                 and chunk_idx % CHECKPOINT_EVERY == 0
             ):
-                ckpt_path = Path(str(index_path) + f".ckpt.{chunk_idx}")
                 _log.info(
-                    f"[knn.build] checkpointing {n_rows:,} rows → {ckpt_path.name}"
+                    f"[knn.build] checkpointing {n_rows:,} rows"
                 )
                 t_ck = time.monotonic()
-                # write_index on IVFPQ writes:
-                #   - the IVF header (nlist, nprobe, quantizer, codebook)
-                #   - the OnDiskInvertedLists state (file path + size)
-                # PQ codes themselves are NOT copied — they stay in
-                # .ivfdata. So write cost is tiny (KB-ish).
-                faiss.write_index(ivf, str(ckpt_path))
-                # Also overwrite the canonical index_path so a crashed
-                # build leaves a usable index on disk for the next
-                # --resume pass to load. Without this, an OOM kills the
-                # process before the final write_index() and ALL progress
-                # since the last ckpt is lost. With this, a multi-pass
-                # build can be restarted from the last successful ckpt
-                # even if the current pass gets killed.
+                # Write ONCE, to the canonical path. Previously this
+                # wrote a second `.ckpt.<chunk_idx>` file as well, on the
+                # belief that write_index only serialized a header (true
+                # under OnDiskInvertedLists, false since the switch to
+                # in-RAM ArrayInvertedLists). It actually serializes the
+                # whole index, so that was double the I/O — and because
+                # each ckpt was named by chunk_idx, nothing ever deleted
+                # them: a 116M-row build accumulated 391 files / 355 GB
+                # before running the disk down. The canonical path is
+                # overwritten in place, so it can't leak, and it's the
+                # file --resume looks for anyway.
                 faiss.write_index(ivf, str(index_path))
+                # Advance the resume cursor IN THE SAME breath as the
+                # index write. These two must agree: the index says
+                # "these rows are in me", state.json says "start here
+                # next time". Previously state.json was only written at
+                # end-of-build, so a killed build left an index full of
+                # rows and no cursor — and --resume would start from row
+                # 0 and add every one of them a second time.
+                state_path.write_text(
+                    json.dumps({"next_offset_rows": consumed_rows})
+                )
                 # Free the old index BEFORE reloading — that's where
                 # the memory reclaim comes from. Note `index` (the
                 # fallback IndexFlatIP for non-IVF builds) might still
@@ -633,13 +661,8 @@ def build_faiss_index(
                 del ivf
                 import gc
                 gc.collect()
-                # Reload the index from the checkpoint. The OnDiskInvertedLists
-                # inside FAISS's read_index() deserialization will be
-                # re-bound to the same .ivfdata file because we passed
-                # its path through the .ckpt header. New add() calls will
-                # APPEND to .ivfdata (the file descriptor keeps its
-                # current offset across the round-trip).
-                ivf = faiss.read_index(str(ckpt_path))
+                # Reload so the accumulated in-RAM bookkeeping is dropped.
+                ivf = faiss.read_index(str(index_path))
                 # Keep the `index` alias pointing at the live IVFPQ so
                 # the final write_index() at end-of-build uses the
                 # current object (not a stale reference to the deleted

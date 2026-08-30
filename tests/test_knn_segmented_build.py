@@ -58,13 +58,13 @@ def source(tmp_path):
 
 def _build(knn, source, out_dir, **kw):
     out_dir.mkdir(parents=True, exist_ok=True)
+    kw.setdefault("index_type", "flat")
     return knn.build_faiss_index(
         parquet_glob=str(source),
         index_path=out_dir / "tol200m_bioclip2.faiss",
         labels_path=out_dir / "labels.parquet",
         kingdoms=["Plantae"],
         version_tag="test",
-        index_type="flat",
         **kw,
     )
 
@@ -144,3 +144,47 @@ def test_resume_with_corrupt_state_refuses(source, tmp_path):
     (out / "state.json").write_text("{not json")
     with pytest.raises(ValueError, match="unreadable"):
         _build(knn, source, out, resume=True)
+
+
+def test_checkpoint_advances_the_resume_cursor(source, tmp_path, monkeypatch):
+    """A checkpoint writes the index AND the cursor together.
+
+    They used to disagree: the index was written at every checkpoint but
+    state.json only at end-of-build, so a killed build left rows in the
+    index and no cursor — and --resume then re-added every one of them.
+    """
+    import knn
+    monkeypatch.setattr(knn, "BUILD_CHUNK_ROWS", 100)
+    monkeypatch.setattr(knn, "CHECKPOINT_EVERY", 1)
+    out = tmp_path / "idx"
+
+    seen: list[int] = []
+    real_write = knn.faiss.write_index
+
+    def spy(idx, path):
+        real_write(idx, path)
+        sp = out / "state.json"
+        if sp.exists():
+            seen.append(json.loads(sp.read_text())["next_offset_rows"])
+
+    monkeypatch.setattr(knn.faiss, "write_index", spy)
+    _build(knn, source, out, ivf_train_size=300, index_type="ivf")
+
+    assert seen, "no checkpoint wrote a cursor"
+    # The cursor advances during the build, not only at the end.
+    assert max(seen) > 0
+    assert seen == sorted(seen), f"cursor went backwards: {seen}"
+
+
+def test_checkpoints_do_not_leak_files(source, tmp_path, monkeypatch):
+    """Checkpointing overwrites one canonical file. It used to also
+    write a .ckpt.<chunk> per checkpoint and never delete them — 391
+    files / 355 GB on a 116M-row build."""
+    import knn
+    monkeypatch.setattr(knn, "BUILD_CHUNK_ROWS", 100)
+    monkeypatch.setattr(knn, "CHECKPOINT_EVERY", 1)
+    out = tmp_path / "idx"
+    _build(knn, source, out, ivf_train_size=300, index_type="ivf")
+
+    strays = list(out.glob("*.ckpt*"))
+    assert strays == [], f"checkpoint files leaked: {strays}"
