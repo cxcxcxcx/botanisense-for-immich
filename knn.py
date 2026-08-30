@@ -157,9 +157,6 @@ def build_faiss_index(
     vectors — BioCLIP-2 features are normalized upstream by
     `create_image_features(..., normalize=True)`).
 
-    `on_progress` is an optional callback (chunk_idx, total_chunks,
-    rows_so_far) for the UI.
-
     **Segmented builds.** `resume=True` continues adding to an existing
     index. It reads `state.json` (next to the index) for how many source
     rows previous segments already consumed and skips exactly that many
@@ -211,13 +208,6 @@ def build_faiss_index(
             )
             stale_state.unlink()
     columns = list(LABEL_COLUMNS) + ["emb"]
-    kingdom_filter = None
-    if kingdoms:
-        # Build an OR-of-equalities filter. pyarrow's scanner pushes
-        # this down to the row-group statistics level, so any shard
-        # whose kingdom column is entirely != {Plantae, Fungi} gets
-        # skipped at file open (no parquet decode, no mmap).
-        kingdom_filter = _pac.field("kingdom").isin(list(kingdoms))
 
     def _shard_stream():
         for f in parquet_files:
