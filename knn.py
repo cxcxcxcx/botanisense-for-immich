@@ -270,13 +270,25 @@ def build_faiss_index(
     index = faiss.IndexFlatIP(EMB_DIM)
     ivf: faiss.IndexIVFFlat | None = None
     ivf_train_buf: list[np.ndarray] = []
-    # FAISS parallelizes add()/train() with OpenMP. Left alone it spawns
-    # a thread per core and the oversubscription against pyarrow's own
-    # reader threads costs more than it gains; the out-of-tree runner
-    # measured 48K rows/s single-threaded vs 126K rows/s at 8 threads on
-    # this 16-core host, and knn.py never set it at all. Cap at 8 (or
-    # cores-2 on smaller machines) to leave headroom for the parquet
-    # reader and the OS.
+    # FAISS parallelizes add()/train() with OpenMP. The default here is
+    # all 16 cores, and add() has always been parallel — but 16 threads
+    # oversubscribe against pyarrow's reader threads and lose badly.
+    # Measured (200K x 768 synthetic adds into a trained nlist=4096
+    # IVFPQ, no disk in the loop):
+    #     threads= 1   11,372 rows/s
+    #     threads= 2   21,176 rows/s
+    #     threads= 4   34,938 rows/s
+    #     threads= 8   38,618 rows/s   <- best
+    #     threads=16   22,432 rows/s   <- the default, 1.7x worse than 8
+    # So capping at 8 is worth ~1.7x. Do NOT "simplify" this away on the
+    # theory that FAISS already picks a sensible default — it picks
+    # cpu_count, which is the worst of the five settings above.
+    #
+    # For context on where the rest of the build's time goes: that
+    # 38.6K rows/s is the add-only ceiling, while the full build sustains
+    # ~18.3K rows/s at only ~3 of 16 cores busy. Roughly half the wall
+    # clock is parquet decode + the in-place normalize + label writing,
+    # not FAISS. Optimize there before touching thread counts again.
     try:
         _threads = max(1, min(8, (_os.cpu_count() or 4) - 2))
         faiss.omp_set_num_threads(_threads)
