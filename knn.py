@@ -246,21 +246,19 @@ def build_faiss_index(
     def _shard_stream():
         for f in parquet_files:
             try:
-                ds_ = _pads.dataset(
-                    f, format="parquet",
-                    partitioning=_pads.HivePartitioning.discover(),
-                )
-                scanner = ds_.scanner(
-                    columns=columns,
-                    filter=kingdom_filter,
-                    batch_size=BUILD_CHUNK_ROWS,
-                )
+                # No columns projection AND no filter on the scanner —
+                # in pyarrow 25 the combination of `columns=...` (which
+                # includes the `emb` list<float> column) with a kingdom
+                # `filter=` silently yields zero batches. The bug is
+                # invisible because the build just returns "0 rows" and
+                # exits cleanly. Apply the kingdom filter per-batch in
+                # the consumer loop instead (see for batch in stream:
+                # below) — cheaper than re-encoding `emb` and identical
+                # in cost (we read the column anyway).
+                ds_ = _pads.dataset(f, format="parquet")
+                scanner = ds_.scanner(batch_size=BUILD_CHUNK_ROWS)
                 for batch in scanner.to_batches():
                     yield batch
-                # File handle released when scanner + ds_ go out of
-                # scope. pyarrow scans each shard's row groups lazily
-                # and releases the mmap'd pages once it advances past
-                # them.
                 del scanner, ds_
             except Exception as _e:
                 _log.warning(f"[knn.build] could not read {f}: {_e}")
@@ -305,20 +303,33 @@ def build_faiss_index(
     # The index file at index_path is OVERWRITTEN at end of build, so
     # pass --resume only on the FIRST pass that finds no existing file.
     # On later passes it appends to the prior index.
-    if resume and index_path.exists() and index_type == "ivf":
+    if resume and index_path.exists():
+        # Loads the prior index and CONTINUES adding. Used to be gated
+        # on index_type == "ivf", which silently ignored the persisted
+        # index when the test used "flat" — the resumed build started
+        # from 0 vectors, so labels and index drifted apart and the
+        # alignment check fired.
         prev = faiss.read_index(str(index_path))
-        if not isinstance(prev, faiss.IndexIVFPQ):
+        if isinstance(prev, faiss.IndexIVFPQ):
+            ivf = prev
+            ivf_nlist = ivf.nlist
+            index = ivf
+        elif isinstance(prev, faiss.IndexFlatIP):
+            # Flat resume: keep `index` as a fresh IndexFlatIP with the
+            # prior ntotal preserved by calling read_index. The trick:
+            # IndexFlatIP is not designed for incremental addition via
+            # .add() — but it IS — .add() appends and ntotal grows.
+            # So we just take the loaded object as `index`. It has the
+            # prior vectors and is already-trained for `add()`.
+            index = prev
+        else:
             raise ValueError(
                 f"resume requested but {index_path} is "
-                f"{type(prev).__name__}, not IndexIVFPQ"
+                f"{type(prev).__name__}, neither IndexIVFPQ nor IndexFlatIP"
             )
-        ivf = prev
-        ivf_nlist = ivf.nlist
-        index = ivf
         _log.info(
-            f"[knn.build] RESUME: loaded {ivf.ntotal:,} rows from "
-            f"{index_path.name}; nlist={ivf.nlist}, "
-            f"is_trained={ivf.is_trained}; continuing add()"
+            f"[knn.build] RESUME: loaded {prev.ntotal:,} rows from "
+            f"{index_path.name}; type={type(prev).__name__}; continuing add()"
         )
     if index_type == "ivf":
         # nlist = sqrt(n_rows) is the rule of thumb. We don't know n_rows
@@ -365,11 +376,70 @@ def build_faiss_index(
     # of accumulating in a Python list. Schema is derived from the
     # first batch and frozen for the rest of the build.
     label_writer: pq.ParquetWriter | None = None
+    # ---- source-offset tracking (segmented builds) ----------------------
+    # `consumed_rows` counts every filtered source row this build has seen,
+    # including rows skipped to catch up to a previous segment. It is the
+    # cursor persisted to state.json. `skip_target` is where this run
+    # starts adding. A from-scratch build always starts at 0 and resets
+    # the file, so a stale state.json can't silently truncate a rebuild.
+    skip_target = 0
+    state_path = index_path.parent / "state.json"
+    if resume and state_path.exists():
+        try:
+            skip_target = int(
+                json.loads(state_path.read_text()).get("next_offset_rows", 0)
+            )
+        except Exception as _e:
+            raise ValueError(
+                f"resume requested but {state_path} is unreadable ({_e}). "
+                f"Refusing to continue: without a valid offset this build "
+                f"would re-add rows already in the index."
+            )
+        _log.info(
+            f"[knn.build] RESUME: skipping first {skip_target:,} source rows"
+        )
+    elif resume:
+        _log.warning(
+            "[knn.build] RESUME with no state.json — starting at offset 0. "
+            "If the index already holds rows, this WILL duplicate them."
+        )
+    # On resume, before we start writing new labels, we stream the
+    # *previous* segment's labels through this same writer row-group by
+    # row-group. This way the on-disk labels file is built up one write
+    # at a time and never materializes either the old or the new table
+    # in full. ParquetWriter has no append mode; the "append" is the
+    # file we recreate here by streaming. The previous labels file
+    # remains untouched until the new one is fully written, so a crash
+    # partway through loses at most the current segment's labels.
+    if resume and labels_path.exists():
+        _prev = pq.ParquetFile(str(labels_path))
+        label_writer = pq.ParquetWriter(
+            str(labels_path) + ".new",
+            _prev.schema_arrow,
+            compression="zstd",
+        )
+        # Stream ALL prior labels through the new writer. The skip in
+        # the source-row loop is for VECTORS, not labels: prior segments
+        # already wrote labels[0..skip_target-1] to disk, and those rows
+        # are what align with index ids 0..skip_target-1. The current
+        # segment will append labels[skip_target..skip_target+N-1] for
+        # the new vectors. Result on disk: skip_target + N rows, matching
+        # the index's skip_target + N rows. Exactly aligned.
+        n_streamed = 0
+        for rg in range(_prev.num_row_groups):
+            tbl = _prev.read_row_group(rg)
+            label_writer.write_table(tbl)
+            n_streamed += tbl.num_rows
+        del _prev
+        _log.info(
+            f"[knn.build] RESUME: streamed {n_streamed:,} prior labels "
+            f"into {labels_path.name}.new"
+        )
     # n_rows tracks how many rows THIS segment has added. In resume
     # mode the loaded IVFPQ already has prev_n rows from the previous
     # segment; we initialize n_rows to prev_n so the per-chunk progress
     # log shows the cumulative total.
-    n_rows = ivf.ntotal if (resume and ivf is not None) else 0
+    n_rows = index.ntotal if (resume and index_path.exists()) else 0
     by_kingdom: Counter[str] = Counter()
     # Label slices held between flushes, as zero-copy pyarrow
     # RecordBatch views. Each is the 12 label columns of one DuckDB
@@ -391,27 +461,8 @@ def build_faiss_index(
     # cursor persisted to state.json. `skip_target` is where this run
     # starts adding. A from-scratch build always starts at 0 and resets
     # the file, so a stale state.json can't silently truncate a rebuild.
-    state_path = index_path.parent / "state.json"
-    skip_target = 0
-    if resume and state_path.exists():
-        try:
-            skip_target = int(
-                json.loads(state_path.read_text()).get("next_offset_rows", 0)
-            )
-        except Exception as _e:
-            raise ValueError(
-                f"resume requested but {state_path} is unreadable ({_e}). "
-                f"Refusing to continue: without a valid offset this build "
-                f"would re-add rows already in the index."
-            )
-        _log.info(
-            f"[knn.build] RESUME: skipping first {skip_target:,} source rows"
-        )
-    elif resume:
-        _log.warning(
-            "[knn.build] RESUME with no state.json — starting at offset 0. "
-            "If the index already holds rows, this WILL duplicate them."
-        )
+    # (state.json path + skip_target are computed ABOVE the writer-open
+    # block so the resume label-stream can reference them.)
     consumed_rows = 0
     segment_rows = 0  # rows actually added by this invocation
     stopped_early = False
@@ -488,10 +539,11 @@ def build_faiss_index(
         # NOT as `to_pylist()`-produced Python dicts — the to_pylist
         # path took ~4.5 s per 25K-row chunk (creating 325K Python
         # objects under the GIL) and was the dominant build bottleneck.
-        # In resume mode we skip the per-chunk write — labels are held
-        # in pending_label_batches until the close-path concats them
-        # with the existing labels.parquet.
-        if pending_label_batches and not resume:
+        # On a non-resume build the writer was opened on the first batch;
+        # on resume it's writing to <labels>.new after streaming the
+        # previous labels row-group by row-group. Either way we just
+        # stream every chunk through it.
+        if pending_label_batches and label_writer is not None:
             for rb in pending_label_batches:
                 label_writer.write_table(pa.Table.from_batches([rb]))
             pending_label_batches.clear()
@@ -501,7 +553,25 @@ def build_faiss_index(
         # waiting for the next chunk's reassignment.
         mat = None
 
+    # Per-batch kingdom filter. We can't put it on the scanner because
+    # pyarrow 25 + the `emb` list<float> column projection kills the
+    # filter silently (yields zero batches). Pre-compute the allowed
+    # set once.
+    kingdom_allowed = (
+        set(kingdoms) if kingdoms else None
+    )
     for batch in stream:
+        if kingdom_allowed is not None:
+            keep = _pac.is_in(
+                batch.column("kingdom"),
+                value_set=pa.array(sorted(kingdom_allowed)),
+            )
+            # Skip entire batches that match no rows — common when
+            # the source has other kingdoms interleaved.
+            if not _pac.any(keep).as_py():
+                consumed_rows += batch.num_rows
+                continue
+            batch = batch.filter(keep)
         # Fast-forward past rows a previous segment already added. We
         # count them but touch nothing else — no embedding decode, no
         # label write, no .add(). Whole batches only: BUILD_CHUNK_ROWS is
@@ -528,6 +598,18 @@ def build_faiss_index(
                 f"[knn.build] segment cap reached "
                 f"({segment_rows:,} >= {max_segment_rows:,}); stopping"
             )
+            # Flush whatever this segment has accumulated so labels and
+            # embeddings leave together. Without this, an early-cap
+            # segment ends with the FAISS index holding N rows but
+            # labels.parquet holding N - chunk_rows, which trips the
+            # alignment check and would misalign species on the next
+            # segment if anyone tried to use it.
+            _flush()
+            # Persist the index too. The end-of-build write_index()
+            # below is bypassed when we break out early, so without this
+            # the next segment would resume against an empty index on
+            # disk — duplicating every row that was just added.
+            faiss.write_index(index, str(index_path))
             break
         consumed_rows += batch.num_rows
         segment_rows += batch.num_rows
@@ -581,15 +663,19 @@ def build_faiss_index(
         # Lazily initialize the parquet writer on the first batch so we
         # have a real schema to freeze. Subsequent batches are converted
         # to Table in _flush() and written.
-        # In resume mode we DON'T initialize a writer — labels for this
-        # segment stay in pending_label_batches in RAM until the close
-        # path concats them with the existing labels.parquet.
-        if label_writer is None and not resume:
+        # On resume, the writer was already opened above (writing to
+        # labels_path + ".new"), so this branch only fires for fresh
+        # builds.
+        if label_writer is None:
+            # Open with the schema but DON'T clear pending yet — the
+            # flush immediately below needs to drain pending into the
+            # new writer. The previous code cleared pending here, so
+            # the first batch's labels never reached disk when the cap
+            # fired on that same batch.
             first_table = pa.Table.from_batches(pending_label_batches)
             label_writer = pq.ParquetWriter(
                 str(labels_path), first_table.schema, compression="zstd"
             )
-            pending_label_batches.clear()
 
         if batch.num_rows >= BUILD_CHUNK_ROWS:
             _flush()
@@ -721,36 +807,20 @@ def build_faiss_index(
     state_path.write_text(json.dumps({"next_offset_rows": consumed_rows}))
     _log.info(f"[knn.build] state saved: next_offset_rows={consumed_rows:,}")
 
-    # Close the streaming parquet writer — labels were appended per
-    # chunk via write_table() in _flush(). Edge case: if zero rows
-    # were processed the writer was never opened; in that case write
-    # an empty table with the canonical schema so consumers can still
-    # read the file.
-    if resume and pending_label_batches:
-        # Resume path: labels for this segment are still in RAM. Concat
-        # with the previous segment's labels (still on disk at
-        # labels_path) and write the merged file. This costs ~1 GB
-        # read + ~1.3 GB write for a 50M-row segment — well within
-        # the 12 GB cap.
-        new_table = pa.Table.from_batches(pending_label_batches)
-        if labels_path.exists():
-            prev = pq.read_table(str(labels_path))
-            _log.info(
-                f"[knn.build] RESUME: merging {prev.num_rows:,} old labels "
-                f"with {new_table.num_rows:,} new → {labels_path}"
-            )
-            combined = pa.concat_tables([prev, new_table])
-        else:
-            _log.info(
-                f"[knn.build] RESUME: no prev labels found; "
-                f"writing {new_table.num_rows:,} new → {labels_path}"
-            )
-            combined = new_table
-        pq.write_table(combined, str(labels_path), compression="zstd")
-        pending_label_batches.clear()
-    elif label_writer is not None:
+    # Close the streaming parquet writer. On resume we wrote to
+# <labels>.new; swap it into place atomically so a reader never sees
+# a half-written file. The previous labels file is removed only AFTER
+# the rename, so a crash before this point leaves both files and the
+# caller can retry by inspecting which is which.
+    if label_writer is not None:
         label_writer.close()
-    else:
+        new_path = Path(str(labels_path) + ".new")
+        if new_path.exists():
+            new_path.replace(labels_path)
+            _log.info(f"[knn.build] resumed labels swapped into {labels_path.name}")
+    elif not labels_path.exists():
+        # Edge case: zero rows were processed and nothing was written.
+        # Consumers still need a file with the canonical schema.
         empty = pa.Table.from_pylist(
             [{c: None for c in LABEL_COLUMNS}]
         ).slice(0, 0)
