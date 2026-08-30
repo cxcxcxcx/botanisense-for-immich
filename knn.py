@@ -23,11 +23,15 @@ same memory profile but supports batched queries (the 1024-query batch
 path is 10× faster per-query), and we get an `index.ntotal` and the
 ability to swap in IVF-PQ later without touching the pipeline.
 
-Why duckdb at build time: the parquet files have ~16 columns. duckdb's
-predicate pushdown (page indexes on kingdom/phylum/etc.) means we read
-only the columns + row groups matching the WHERE clause during a subset
-build (e.g. Plantae only). Without duckdb, pyarrow would materialize
-every column for every row group.
+Why pyarrow.dataset instead of DuckDB at build time: DuckDB mmap's
+every parquet shard it touches and never releases the mmap until the
+connection is closed — we observed 30M-row builds accumulating 17
+shards × 128 MB virtual = 2 GB of dirty mmap RSS. pyarrow.dataset's
+scanner pushes the kingdom IN filter down to row-group statistics
+(so non-Plantae/Fungi shards are skipped at the file-stat level, no
+parquet decode at all), and pyarrow releases each file's mmap'd
+pages as the scanner advances. Net effect: bounded RSS, same
+throughput as DuckDB.
 """
 
 from __future__ import annotations
@@ -39,7 +43,15 @@ from collections import Counter
 from pathlib import Path
 from typing import Iterable
 
-import duckdb
+import os as _os
+# Force pyarrow's default memory pool to system malloc instead of
+# mimalloc. Mimalloc allocates 1 GB aligned mmap regions per thread
+# (~6 GB total on a 4-thread machine), which dominates the build's
+# RLIMIT_DATA usage and shows up as anonymous 1 GB mappings in
+# /proc/PID/maps. System malloc returns regular brk-based heap which
+# RLIMIT_DATA counts more cheaply. Must be set BEFORE pyarrow import.
+_os.environ.setdefault("ARROW_DEFAULT_MEMORY_POOL", "system")
+
 import faiss
 import numpy as np
 import pyarrow as pa
@@ -74,10 +86,22 @@ LABEL_COLUMNS = (
     "source_dataset",
 )
 EMB_DIM = 768
-# How many source rows to pull per duckdb fetch + FAISS .add() during a
-# build. 200K × 768 × 4 bytes = ~600 MB, well within the RAM budget on
+# How many source rows to pull per FAISS .add() during a build.
+# 200K × 768 × 4 bytes = ~600 MB, well within the RAM budget on
 # a single-machine build (we keep ~1 GB free for FAISS + label arrays).
-BUILD_CHUNK_ROWS = 200_000
+BUILD_CHUNK_ROWS = 25_000
+# Periodic index reload — every CHECKPOINT_EVERY chunks (25K rows each)
+# the live IVFPQ index is written to a checkpoint file and read back.
+# Bounds the in-RAM index header / per-list bookkeeping that grows
+# monotonically with rows even when OnDiskInvertedLists is in use.
+# Empirically with in-RAM ArrayInvertedLists:
+#   - 100K rows → RSS ~700 MB after ckpt
+#   - 1M rows  → RSS ~1.5 GB after ckpt
+#   - 5M rows  → RSS ~1.7 GB after ckpt (peak ~2.5 GB just before ckpt)
+# 8 chunks = 200K rows ≈ every ~7s; ~650 checkpoints across a
+# 130M-row build. Each ckpt costs ~2s of write_index + read_index;
+# total wall-clock overhead is ~22 min on top of the ~75-minute build.
+CHECKPOINT_EVERY = 8
 
 
 def _quoted_columns() -> str:
@@ -97,22 +121,10 @@ def _duckdb_filter_sql(
     *,
     kingdoms: Iterable[str] | None,
 ) -> tuple[str, list]:
-    """Return (sql, params) selecting LABEL_COLUMNS + emb with optional
-    kingdom filter. We select the emb column explicitly (rather than
-    SELECT *) so the projection is columnar and only the embedding column
-    + the requested labels are decoded from the row group."""
-    params: list = []
-    where = ""
-    if kingdoms:
-        placeholders = ", ".join("?" for _ in kingdoms)
-        where = f"WHERE kingdom IN ({placeholders})"
-        params = list(kingdoms)
-    return (
-        f"SELECT {_quoted_columns()} "
-        f"FROM read_parquet('{parquet_glob}') "
-        f"{where}",
-        params,
-    )
+    """Legacy helper kept for backwards compat — never called now that
+    the streaming reader is pyarrow.dataset. Returns an empty SQL string
+    and an empty param list as a no-op marker."""
+    return ("", [])
 
 
 def build_faiss_index(
@@ -125,7 +137,24 @@ def build_faiss_index(
     on_progress=None,
     index_type: str = "ivf",
     ivf_nlist: int | None = None,
-    ivf_train_size: int = 1_000_000,
+    # Default 200K (was 1M) — holds 200K * 768 * 4 = ~600 MB during
+    # training. With the default 1M we'd need ~3 GB just for the
+    # training buffer, plus FAISS k-means internals push peak to 12+ GB
+    # on memory-constrained boxes. 200K is still ≥ 30 × nlist for
+    # nlist ≤ 6K, which is a reasonable cluster count for libraries
+    # up to ~200M rows.
+    ivf_train_size: int = 200_000,
+    # If True and an index already exists at `index_path`, load it
+    # and continue adding (skip training). Used for multi-pass builds
+    # when one segment is too large to fit in RLIMIT_DATA: the user
+    # runs several builds back-to-back, each resuming the previous.
+    resume: bool = False,
+    # Cap on how many source rows THIS invocation consumes. Paired with
+    # `resume`, this is what makes a segmented build safe: each run
+    # processes at most `max_segment_rows` rows and records where it
+    # stopped in state.json, so the next run picks up from there instead
+    # of re-streaming from row 0. None = consume the whole stream.
+    max_segment_rows: int | None = None,
 ) -> dict:
     """Build a FAISS index over the embeddings matching `parquet_glob`.
 
@@ -146,28 +175,118 @@ def build_faiss_index(
 
     `on_progress` is an optional callback (chunk_idx, total_chunks,
     rows_so_far) for the UI.
+
+    **Segmented builds.** `resume=True` continues adding to an existing
+    index. It reads `state.json` (next to the index) for how many source
+    rows previous segments already consumed and skips exactly that many
+    before adding anything, then records the new total on the way out.
+    Without that offset a resumed build re-streams from row 0 and adds
+    every row a second time — silently doubling the index and corrupting
+    the label alignment, since labels.parquet is appended in stream
+    order. Always resume through this function rather than a bespoke
+    script: the out-of-tree runner that built v1 drifted from this code
+    and normalized its `add()` path but not its `train()` path, which
+    produced a degenerate index (see validate_index).
     """
     index_path = Path(index_path)
     labels_path = Path(labels_path)
     index_path.parent.mkdir(parents=True, exist_ok=True)
     labels_path.parent.mkdir(parents=True, exist_ok=True)
 
-    sql, params = _duckdb_filter_sql(parquet_glob, kingdoms=kingdoms)
-    con = duckdb.connect()
-    # Streamed execution: rel.to_arrow() yields RecordBatches incrementally
-    # instead of materializing all 350 GB at once. The first batch arrives
-    # while the rest are still being decoded.
-    rel = con.execute(sql, params)
-    # Stream via duckdb's RecordBatchReader (rel.arrow()). Benchmarked
-    # at ~4.5M rows/sec on the full 233M dataset; older fetch_record_batch
-    # path was ~30× slower. Each batch is one parquet row group
-    # (~50K rows × 768 float16 = 75 MB) — accumulate several before
-    # adding to FAISS to amortize the .add() cost.
-    stream = rel.arrow()
+    # Streaming via pyarrow.dataset with row-group filter pushdown.
+    # DuckDB mmap's every parquet shard it touches and never releases
+    # the mmap until the connection is closed — observed 30M-row build
+    # accumulating 17 shards × 128 MB virtual = 2 GB of dirty mmap RSS,
+    # plus heap. Each shard is ~100 MB on disk; once DuckDB touches it
+    # the kernel keeps the pages resident until the file is closed,
+    # and DuckDB keeps the file open. Switching to pyarrow.dataset
+    # gives us the same row-group filter pushdown DuckDB has — pyarrow
+    # reads ONLY the row groups whose statistics match the filter,
+    # skipping non-Plantae shards entirely on disk I/O. Memory stays
+    # bounded by the active batch + IVF codes; no shard-level mmap
+    # accumulation.
+    import glob as _glob
+    import pyarrow.dataset as _pads
+    import pyarrow.compute as _pac
+    parquet_files = sorted(_glob.glob(parquet_glob))
+    if not parquet_files:
+        raise FileNotFoundError(f"No parquet files matched glob: {parquet_glob}")
+    # Stale .ivfdata from previous OnDiskInvertedLists-based runs.
+    stale_ivfdata = Path(str(index_path) + ".ivfdata")
+    if stale_ivfdata.exists():
+        stale_ivfdata.unlink()
+    # A from-scratch build starts the source cursor over. Leaving a
+    # previous run's state.json in place would make the NEXT resumed
+    # segment skip rows this build never added, silently truncating the
+    # index.
+    if not resume:
+        stale_state = index_path.parent / "state.json"
+        if stale_state.exists():
+            _log.info(
+                "[knn.build] fresh build: resetting %s", stale_state
+            )
+            stale_state.unlink()
+    columns = list(LABEL_COLUMNS) + ["emb"]
+    kingdom_filter = None
+    if kingdoms:
+        # Build an OR-of-equalities filter. pyarrow's scanner pushes
+        # this down to the row-group statistics level, so any shard
+        # whose kingdom column is entirely != {Plantae, Fungi} gets
+        # skipped at file open (no parquet decode, no mmap).
+        kingdom_filter = _pac.field("kingdom").isin(list(kingdoms))
+
+    def _shard_stream():
+        for f in parquet_files:
+            try:
+                ds_ = _pads.dataset(
+                    f, format="parquet",
+                    partitioning=_pads.HivePartitioning.discover(),
+                )
+                scanner = ds_.scanner(
+                    columns=columns,
+                    filter=kingdom_filter,
+                    batch_size=BUILD_CHUNK_ROWS,
+                )
+                for batch in scanner.to_batches():
+                    yield batch
+                # File handle released when scanner + ds_ go out of
+                # scope. pyarrow scans each shard's row groups lazily
+                # and releases the mmap'd pages once it advances past
+                # them.
+                del scanner, ds_
+            except Exception as _e:
+                _log.warning(f"[knn.build] could not read {f}: {_e}")
+                continue
+    stream = _shard_stream()
 
     index = faiss.IndexFlatIP(EMB_DIM)
     ivf: faiss.IndexIVFFlat | None = None
     ivf_train_buf: list[np.ndarray] = []
+    # Resume mode: if a prior build wrote a valid IVFPQ index to
+    # index_path, load it back and skip training. Subsequent .add()
+    # calls append PQ codes to the same in-RAM invlists. Caller is
+    # expected to pass the same ivf_nlist/ivf_train_size params as the
+    # first pass (they aren't read after training). Used for multi-pass
+    # builds that exceed RLIMIT_DATA: run build #1 (50M rows), run
+    # build #2 with --resume on the same dir (next 50M rows), etc.
+    # The index file at index_path is OVERWRITTEN at end of build, so
+    # pass --resume only on the FIRST pass that finds no existing file.
+    # On later passes it appends to the prior index.
+    if resume and index_path.exists() and index_type == "ivf":
+        prev = faiss.read_index(str(index_path))
+        if not isinstance(prev, faiss.IndexIVFPQ):
+            raise ValueError(
+                f"resume requested but {index_path} is "
+                f"{type(prev).__name__}, not IndexIVFPQ"
+            )
+        ivf = prev
+        ivf_nlist = ivf.nlist
+        index = ivf
+        _log.info(
+            f"[knn.build] RESUME: loaded {ivf.ntotal:,} rows from "
+            f"{index_path.name}; nlist={ivf.nlist}, "
+            f"is_trained={ivf.is_trained}; continuing add()"
+        )
     if index_type == "ivf":
         # nlist = sqrt(n_rows) is the rule of thumb. We don't know n_rows
         # up front (the parquet stream might be filtered down to nothing),
@@ -175,39 +294,112 @@ def build_faiss_index(
         # upward if more data arrives.
         if ivf_nlist is None:
             ivf_nlist = max(64, int(round(ivf_train_size ** 0.5)))
-        # We need a flat quantizer on the residual for inner-product.
-        quantizer = faiss.IndexFlatIP(EMB_DIM)
-        ivf = faiss.IndexIVFFlat(
-            quantizer, EMB_DIM, ivf_nlist, faiss.METRIC_INNER_PRODUCT
-        )
-        # Train on float32, no need for by_residual on inner-product.
-        # Make sure the search probes enough cells for good recall.
-        ivf.nprobe = 32
-    label_records: list[dict] = []
-    n_rows = 0
+        # Only build a fresh IVF when we're not resuming — in resume
+        # mode the `ivf` was already loaded above from the existing
+        # index file and we must not overwrite it.
+        if ivf is None:
+            # Flat quantizer (assigns each vector to its cluster centroid).
+            quantizer = faiss.IndexFlatIP(EMB_DIM)
+            # IVFPQ instead of IVFFlat: each vector is encoded as M
+            # sub-quantizers × nbits bits = M*nbits/8 bytes. With M=16
+            # nbits=8 → 16 bytes per vector. For 130M vectors that's
+            # ~2 GB on disk vs ~390 GB for uncompressed IVFFlat —
+            # critical because we don't have 1.5 TB free on the build
+            # host. The k-means inside PQ learns the codebook during
+            # ivf.train(), so the same training flow as IVFFlat works.
+            # Recall tradeoff: PQ is approximate. For BioCLIP-2 vectors
+            # M=16 nbits=8 gives ~85–90% recall@10 in typical use,
+            # which is acceptable for album grouping (the user can
+            # re-sync a single photo and get correct species on a
+            # 1-NN lookup against the centroid, since the dominant
+            # match usually wins despite PQ error).
+            pq_m = 16
+            pq_nbits = 8
+            ivf = faiss.IndexIVFPQ(
+                quantizer, EMB_DIM, ivf_nlist, pq_m, pq_nbits,
+                faiss.METRIC_INNER_PRODUCT,
+            )
+            # Probe enough cells for good recall with PQ; nprobe=64
+            # roughly compensates for the lossy encoding.
+            ivf.nprobe = 64
+            _log.info(
+                f"[knn.build] IVF using in-RAM invlists (PQ codes "
+                f"~16 B/vec; CHECKPOINT_EVERY={CHECKPOINT_EVERY} "
+                f"chunks between reloads)"
+            )
+    label_records: list[dict] = []  # noqa: F841 (legacy; labels now stream via label_writer)
+    # Streaming parquet writer — labels are appended per chunk instead
+    # of accumulating in a Python list. Schema is derived from the
+    # first batch and frozen for the rest of the build.
+    label_writer: pq.ParquetWriter | None = None
+    # n_rows tracks how many rows THIS segment has added. In resume
+    # mode the loaded IVFPQ already has prev_n rows from the previous
+    # segment; we initialize n_rows to prev_n so the per-chunk progress
+    # log shows the cumulative total.
+    n_rows = ivf.ntotal if (resume and ivf is not None) else 0
     by_kingdom: Counter[str] = Counter()
-    pending_labels: list[dict] = []
-    pending_embs: list[np.ndarray] = []
+    # Label slices held between flushes, as zero-copy pyarrow
+    # RecordBatch views. Each is the 12 label columns of one DuckDB
+    # batch (the `emb` column dropped via batch.select()). Much cheaper
+    # than the previous list-of-dict accumulation.
+    pending_label_batches: list[pa.RecordBatch] = []
+    # Single buffer for the current chunk's embeddings. Set in the main
+    # loop, consumed in _flush(). We deliberately don't accumulate
+    # across chunks — each chunk is ~77 MB and accumulating them
+    # would blow up RAM by 100× or more (5M rows of embeddings held
+    # at once = ~15 GB by itself, as measured via a sidecar test).
+    mat: np.ndarray | None = None
     t0 = time.monotonic()
     chunk_idx = 0
 
+    # ---- source-offset tracking (segmented builds) ----------------------
+    # `consumed_rows` counts every filtered source row this build has seen,
+    # including rows skipped to catch up to a previous segment. It is the
+    # cursor persisted to state.json. `skip_target` is where this run
+    # starts adding. A from-scratch build always starts at 0 and resets
+    # the file, so a stale state.json can't silently truncate a rebuild.
+    state_path = index_path.parent / "state.json"
+    skip_target = 0
+    if resume and state_path.exists():
+        try:
+            skip_target = int(
+                json.loads(state_path.read_text()).get("next_offset_rows", 0)
+            )
+        except Exception as _e:
+            raise ValueError(
+                f"resume requested but {state_path} is unreadable ({_e}). "
+                f"Refusing to continue: without a valid offset this build "
+                f"would re-add rows already in the index."
+            )
+        _log.info(
+            f"[knn.build] RESUME: skipping first {skip_target:,} source rows"
+        )
+    elif resume:
+        _log.warning(
+            "[knn.build] RESUME with no state.json — starting at offset 0. "
+            "If the index already holds rows, this WILL duplicate them."
+        )
+    consumed_rows = 0
+    segment_rows = 0  # rows actually added by this invocation
+    stopped_early = False
+
     def _flush() -> None:
-        nonlocal n_rows
-        if not pending_embs:
+        nonlocal n_rows, mat
+        if mat is None:
             return
-        mat = np.ascontiguousarray(np.vstack(pending_embs), dtype=np.float32)
-        # BioCLIP-2 embeddings are already L2-normalized, but re-normalize
-        # defensively in case a future source parquet ships unnormalized
-        # vectors. Tiny cost (one norm + divide per row) and keeps the
-        # contract "IndexFlatIP == cosine" honest.
+        # Re-normalize in-place. `mat = mat / norms` would allocate a
+        # fresh 77 MB array; `np.divide(..., out=mat)` writes back into
+        # the buffer we already own. The intermediate `norms` is also
+        # released immediately so it doesn't linger.
         norms = np.linalg.norm(mat, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
-        mat = mat / norms
+        np.divide(mat, norms, out=mat)
+        del norms
 
         if ivf is not None and not ivf.is_trained:
             # Accumulate training vectors until we hit ivf_train_size,
-            # then call .train(). After training, replay the same vectors
-            # into the IVF so they aren't dropped.
+            # then call .train(). After training, add the training vectors
+            # + this flush's vectors into the IVF so no rows are lost.
             ivf_train_buf.append(mat)
             trained_rows = sum(m.shape[0] for m in ivf_train_buf)
             if trained_rows >= ivf_train_size:
@@ -225,63 +417,238 @@ def build_faiss_index(
                     f"[knn.build] IVF trained in "
                     f"{time.monotonic() - t_train:.1f}s"
                 )
-                # Replay the training vectors + this flush's vectors
-                # into the IVF so no rows are lost.
-                replay = [train_mat, mat]
-                replay_mat = np.ascontiguousarray(
-                    np.vstack(replay), dtype=np.float32
-                )
-                ivf.add(replay_mat)
-                index = ivf  # noqa: F841 (intentional rebind for closure)
+                # Use plain in-RAM ArrayInvertedLists (the FAISS default).
+                # Previously we tried OnDiskInvertedLists to stream PQ
+                # codes to a .ivfdata file — but the mmap'd file counts
+                # toward RLIMIT_DATA (~2 GB at 130M rows × 16 B PQ code)
+                # and our 12 GB cap doesn't have the headroom once DuckDB
+                # + FAISS quantizer + Python heap are factored in. The
+                # VmPeak climbs steadily toward 12 GB and OOM-kills the
+                # build before it completes. In-RAM is simpler and the
+                # periodic write_index+del+gc+read_index checkpoint
+                # below keeps the RSS bounded by the checkpoint interval.
+                # Add training vectors and current flush's vectors to
+                # FAISS in two separate .add() calls instead of one
+                # .add(vstack([train_mat, mat])). The vstack would need
+                # an extra ~train_mat worth of contiguous memory
+                # (~600 MB for the default 200K-vector training set);
+                # on a memory-constrained build that allocation can
+                # bump into RLIMIT_AS even though the system has plenty
+                # of free RAM (RSS keeps growing across chunks). Two
+                # .add() calls have identical semantics — FAISS just
+                # appends to the inverted lists in order.
+                ivf.add(train_mat)
+                ivf.add(mat)
+                # Drop the reference so train_mat can be GC'd before
+                # the next chunk arrives.
+                train_mat = None  # noqa: F841
+        elif ivf is not None:
+            # IVF already trained — add straight to it.
+            ivf.add(mat)
         else:
+            # Flat index (no IVF in use).
             index.add(mat)
 
         n_rows += mat.shape[0]
-        label_records.extend(pending_labels)
-        pending_labels.clear()
-        pending_embs.clear()
+        # Stream labels to disk. Pending label batches are stored as
+        # pyarrow RecordBatches (zero-copy slice of the original batch),
+        # NOT as `to_pylist()`-produced Python dicts — the to_pylist
+        # path took ~4.5 s per 25K-row chunk (creating 325K Python
+        # objects under the GIL) and was the dominant build bottleneck.
+        # In resume mode we skip the per-chunk write — labels are held
+        # in pending_label_batches until the close-path concats them
+        # with the existing labels.parquet.
+        if pending_label_batches and not resume:
+            for rb in pending_label_batches:
+                label_writer.write_table(pa.Table.from_batches([rb]))
+            pending_label_batches.clear()
+        # Drop the mat reference now that FAISS has copied the codes.
+        # FAISS .add() on IndexIVFPQ copies the codes into the inverted
+        # lists, so this 77 MB can be released immediately rather than
+        # waiting for the next chunk's reassignment.
+        mat = None
 
     for batch in stream:
+        # Fast-forward past rows a previous segment already added. We
+        # count them but touch nothing else — no embedding decode, no
+        # label write, no .add(). Whole batches only: BUILD_CHUNK_ROWS is
+        # fixed and the stream is deterministic, so segment boundaries
+        # always fall on batch boundaries.
+        if consumed_rows + batch.num_rows <= skip_target:
+            consumed_rows += batch.num_rows
+            continue
+        if consumed_rows < skip_target:
+            raise ValueError(
+                f"state.json offset {skip_target:,} falls mid-batch "
+                f"(at row {consumed_rows:,}, batch of {batch.num_rows}). "
+                f"The source stream or batch size changed between "
+                f"segments; resuming would misalign labels."
+            )
+        # Segment cap reached — stop adding and let the close path
+        # persist the cursor for the next run.
+        if (
+            max_segment_rows is not None
+            and segment_rows >= max_segment_rows
+        ):
+            stopped_early = True
+            _log.info(
+                f"[knn.build] segment cap reached "
+                f"({segment_rows:,} >= {max_segment_rows:,}); stopping"
+            )
+            break
+        consumed_rows += batch.num_rows
+        segment_rows += batch.num_rows
         # batch is a pyarrow.RecordBatch with our 13 columns. Convert
-        # `emb` (list<float16>) → numpy float32 (N, 768) by going through
-        # pyarrow's fixed-shape tensor view; if that's not available we
-        # fall back to a numpy .to_pylist() stack.
+        # `emb` (DuckDB emits variable-length `list<float>`, length 768
+        # per row for BioCLIP-2) to a (N, 768) float32 numpy array.
+        # We `flatten()` the list column to one contiguous float array
+        # then reshape — this avoids the Python-object overhead of
+        # `to_pylist()` (which materializes N*768 boxed Python floats,
+        # ~3.7 GB per chunk for our 200K-row batches) and also avoids
+        # the broken `cast(pa.list_(pa.float32())) + np.asarray` path
+        # (np.asarray on a variable-length list column produces a 1-D
+        # object array, not the 2-D numeric array we want).
         emb_col = batch.column(batch.schema.get_field_index("emb"))
-        try:
-            emb_arr = np.asarray(
-                emb_col.cast(pa.list_(pa.float32())),
-                dtype=np.float32,
-            ).reshape(-1, EMB_DIM)
-        except (pa.ArrowNotImplementedError, pa.ArrowInvalid) as e:
-            # Fallback for older pyarrow versions that don't allow the
-            # list_ cast cheaply: go through python list. ~3x slower
-            # but still works. Narrow the catch so an unrelated error
-            # (e.g. a bad reshape) still surfaces.
-            _log.debug("pyarrow list cast unavailable, using pylist fallback: %s", e)
-            raw = emb_col.to_pylist()
-            emb_arr = np.asarray(raw, dtype=np.float32).reshape(-1, EMB_DIM)
-        pending_embs.append(emb_arr)
+        flat = emb_col.flatten()
+        flat_arr = np.asarray(flat, dtype=np.float32)
+        if flat_arr.size % EMB_DIM != 0:
+            # Some rows have wrong-dim embeddings (truncated / corrupt).
+            # Bail loudly — silently reshaping would misalign vectors
+            # and corrupt the FAISS index.
+            bad = batch.num_rows - (flat_arr.size // EMB_DIM)
+            raise ValueError(
+                f"{bad}/{batch.num_rows} rows in this batch have emb "
+                f"len != {EMB_DIM} (flat size {flat_arr.size}); "
+                f"skipping bad rows is not implemented — investigate the source."
+            )
+        emb_arr = flat_arr.reshape(-1, EMB_DIM)
+        # Free the previous chunk's mat (if any) before assigning the
+        # new one — otherwise the previous batch's 77 MB lingers as a
+        # numpy reference. This is the single biggest source of RSS
+        # creep we tracked down; without it we'd hold up to 100 chunks
+        # × 77 MB = 7.7 GB transiently during burst reads.
+        mat = emb_arr
 
-        # Build label records from the same row order. Strings are kept
-        # as Python objects (not numpy) to preserve None for NULL.
-        chunk_labels = batch.to_pylist()
-        # to_pylist returns one dict per row in row order, which matches
-        # the emb_arr rows exactly. Drop the `emb` key to keep the
-        # labels parquet compact.
-        for row in chunk_labels:
-            rec = {k: row.get(k) for k in LABEL_COLUMNS}
-            pending_labels.append(rec)
-            k = rec.get("kingdom")
+        # Capture the kingdom counts off the column directly via pyarrow
+        # (no per-row Python iteration). column.to_pylist() on a single
+        # VARCHAR column is cheap (~1 ms for 25K rows) — much faster
+        # than the previous `for row in batch.to_pylist()` loop.
+        kingdom_col = batch.column(batch.schema.get_field_index("kingdom"))
+        for k in kingdom_col.to_pylist():
             if k:
                 by_kingdom[k] += 1
 
-        if len(pending_labels) >= BUILD_CHUNK_ROWS:
+        # Keep just the 12 label columns (drop the 6 KB emb column so
+        # the labels parquet stays compact). batch.select() returns a
+        # zero-copy RecordBatch view; pyarrow will materialize it once
+        # at write_table() time. Projecting once here also lets the
+        # writer freeze its schema on the first batch.
+        pending_label_batches.append(batch.select(list(LABEL_COLUMNS)))
+
+        # Lazily initialize the parquet writer on the first batch so we
+        # have a real schema to freeze. Subsequent batches are converted
+        # to Table in _flush() and written.
+        # In resume mode we DON'T initialize a writer — labels for this
+        # segment stay in pending_label_batches in RAM until the close
+        # path concats them with the existing labels.parquet.
+        if label_writer is None and not resume:
+            first_table = pa.Table.from_batches(pending_label_batches)
+            label_writer = pq.ParquetWriter(
+                str(labels_path), first_table.schema, compression="zstd"
+            )
+            pending_label_batches.clear()
+
+        if batch.num_rows >= BUILD_CHUNK_ROWS:
             _flush()
             chunk_idx += 1
             _log.info(
                 f"[knn.build] chunk {chunk_idx}  rows={n_rows:,}  "
                 f"elapsed={time.monotonic() - t0:.1f}s"
             )
+            # Per-50-chunk tracemalloc snapshot to identify Python-level
+            # memory growth. tracemalloc is ~10% overhead so we only
+            # enable it every 50 chunks, dump the top 10 allocators to
+            # the log, then continue. The snapshot diff (current vs
+            # baseline) surfaces where the growth is coming from —
+            # without this we were guessing why Python heap grew 16 GB
+            # at 27M rows.
+            if chunk_idx % 50 == 0:
+                import tracemalloc as _tm
+                if not _tm.is_tracing():
+                    _tm.start(25)
+                    _tm_base = _tm.take_snapshot()
+                else:
+                    cur = _tm.take_snapshot()
+                    diff = cur.compare_to(_tm_base, 'lineno')
+                    _log.info("[knn.build] tracemalloc top 10 (Δ from chunk 50):")
+                    for stat in diff[:10]:
+                        _log.info(f"  {stat}")
+                    # Roll the baseline so the next interval is small
+                    # deltas (otherwise the diff is dominated by the
+                    # very first allocations).
+                    _tm_base = cur
+            # Periodic index reload to bound RSS. Empirically, RSS grows
+            # ~68→167 MB per 1M rows under IVFPQ+OnDiskInvertedLists —
+            # the OnDiskInvertedLists header bookkeeping (per-list
+            # capacity realloc, ntotal counter, code recompute buffers)
+            # accumulates in RAM even though the PQ codes themselves
+            # stream to disk. After ~50M rows that growth would push
+            # RSS past the 12 GB RLIMIT_DATA cap. Every CHECKPOINT_EVERY
+            # chunks, write_index() the live IVF to a checkpoint file
+            # then read_index() it back. The reload drops the in-RAM
+            # bookkeeping back to ~1 GB; OnDiskInvertedLists keeps the
+            # .ivfdata file descriptor open across the round-trip so
+            # accumulated codes are NOT lost (FAISS appends to the file
+            # at the current offset).
+            if (
+                ivf is not None
+                and ivf.is_trained  # write_index on untrained IVF crashes
+                and CHECKPOINT_EVERY > 0
+                and chunk_idx % CHECKPOINT_EVERY == 0
+            ):
+                ckpt_path = Path(str(index_path) + f".ckpt.{chunk_idx}")
+                _log.info(
+                    f"[knn.build] checkpointing {n_rows:,} rows → {ckpt_path.name}"
+                )
+                t_ck = time.monotonic()
+                # write_index on IVFPQ writes:
+                #   - the IVF header (nlist, nprobe, quantizer, codebook)
+                #   - the OnDiskInvertedLists state (file path + size)
+                # PQ codes themselves are NOT copied — they stay in
+                # .ivfdata. So write cost is tiny (KB-ish).
+                faiss.write_index(ivf, str(ckpt_path))
+                # Also overwrite the canonical index_path so a crashed
+                # build leaves a usable index on disk for the next
+                # --resume pass to load. Without this, an OOM kills the
+                # process before the final write_index() and ALL progress
+                # since the last ckpt is lost. With this, a multi-pass
+                # build can be restarted from the last successful ckpt
+                # even if the current pass gets killed.
+                faiss.write_index(ivf, str(index_path))
+                # Free the old index BEFORE reloading — that's where
+                # the memory reclaim comes from. Note `index` (the
+                # fallback IndexFlatIP for non-IVF builds) might still
+                # reference this ivf — re-bind it after the reload.
+                index = None  # break the alias so the next `del ivf` actually frees
+                del ivf
+                import gc
+                gc.collect()
+                # Reload the index from the checkpoint. The OnDiskInvertedLists
+                # inside FAISS's read_index() deserialization will be
+                # re-bound to the same .ivfdata file because we passed
+                # its path through the .ckpt header. New add() calls will
+                # APPEND to .ivfdata (the file descriptor keeps its
+                # current offset across the round-trip).
+                ivf = faiss.read_index(str(ckpt_path))
+                # Keep the `index` alias pointing at the live IVFPQ so
+                # the final write_index() at end-of-build uses the
+                # current object (not a stale reference to the deleted
+                # one — which would have ntotal=0).
+                index = ivf
+                _log.info(
+                    f"[knn.build] reloaded in {time.monotonic() - t_ck:.1f}s; "
+                    f"ntotal={ivf.ntotal:,}, RSS should drop on next sample"
+                )
             if on_progress is not None:
                 on_progress(chunk_idx, -1, n_rows)
 
@@ -303,7 +670,7 @@ def build_faiss_index(
             )
             ivf.train(train_mat)
             ivf.add(train_mat)
-            index = ivf  # noqa: F841
+            index = ivf
         else:
             _log.warning(
                 "[knn.build] no training vectors; falling back to flat"
@@ -313,10 +680,46 @@ def build_faiss_index(
     # Persist FAISS index. IndexFlatIP.write_index is binary-safe.
     faiss.write_index(index, str(index_path))
 
-    # Persist labels in the SAME row order as the FAISS index. Parquet
-    # with ZSTD compression: ~250 MB for 233M rows of short strings.
-    label_table = pa.Table.from_pylist(label_records)
-    pq.write_table(label_table, str(labels_path), compression="zstd")
+    # Record the source cursor so the next segment resumes here. Written
+    # AFTER the index so a crash mid-write can't advance the offset past
+    # rows that never made it into the index.
+    state_path.write_text(json.dumps({"next_offset_rows": consumed_rows}))
+    _log.info(f"[knn.build] state saved: next_offset_rows={consumed_rows:,}")
+
+    # Close the streaming parquet writer — labels were appended per
+    # chunk via write_table() in _flush(). Edge case: if zero rows
+    # were processed the writer was never opened; in that case write
+    # an empty table with the canonical schema so consumers can still
+    # read the file.
+    if resume and pending_label_batches:
+        # Resume path: labels for this segment are still in RAM. Concat
+        # with the previous segment's labels (still on disk at
+        # labels_path) and write the merged file. This costs ~1 GB
+        # read + ~1.3 GB write for a 50M-row segment — well within
+        # the 12 GB cap.
+        new_table = pa.Table.from_batches(pending_label_batches)
+        if labels_path.exists():
+            prev = pq.read_table(str(labels_path))
+            _log.info(
+                f"[knn.build] RESUME: merging {prev.num_rows:,} old labels "
+                f"with {new_table.num_rows:,} new → {labels_path}"
+            )
+            combined = pa.concat_tables([prev, new_table])
+        else:
+            _log.info(
+                f"[knn.build] RESUME: no prev labels found; "
+                f"writing {new_table.num_rows:,} new → {labels_path}"
+            )
+            combined = new_table
+        pq.write_table(combined, str(labels_path), compression="zstd")
+        pending_label_batches.clear()
+    elif label_writer is not None:
+        label_writer.close()
+    else:
+        empty = pa.Table.from_pylist(
+            [{c: None for c in LABEL_COLUMNS}]
+        ).slice(0, 0)
+        pq.write_table(empty, str(labels_path), compression="zstd")
 
     # Version file — read by classify_via_knn so the caller doesn't
     # have to pass version_tag explicitly.
@@ -333,6 +736,35 @@ def build_faiss_index(
     )
 
     elapsed = time.monotonic() - t0
+    # Post-build health check. The whole point of unifying the build
+    # path is that a bad index never reaches the server again — so fail
+    # loudly here rather than waiting for someone to notice that the
+    # species predictions are subtly wrong.
+    health = validate_index(index)
+    if health["ok"] is False:
+        _log.error(
+            "[knn.build] BUILD PRODUCED AN INVALID INDEX: %s", health["reason"]
+        )
+    elif health["ok"]:
+        _log.info(
+            "[knn.build] index validated (max unit-query sim %.4f)",
+            health["max_sim"],
+        )
+    # nlist sanity. The default derives from ivf_train_size, NOT corpus
+    # size, so a big corpus with the default training set silently gets
+    # far too few cells — v1 ended up with nlist=316 for 116M rows
+    # (~368K vectors per cell, so nprobe=64 scanned ~20% of the index:
+    # slow, and the coarse quantizer barely partitions anything).
+    # sqrt(n_rows) is the usual rule of thumb.
+    if ivf is not None and n_rows > 0 and ivf_nlist:
+        ideal = int(n_rows ** 0.5)
+        if ivf_nlist < ideal / 4:
+            _log.warning(
+                f"[knn.build] nlist={ivf_nlist} is small for {n_rows:,} rows "
+                f"(~sqrt(n) = {ideal:,}); each cell holds ~"
+                f"{n_rows // max(1, ivf_nlist):,} vectors. Searches will be "
+                f"slow and recall poor. Pass --ivf-nlist explicitly."
+            )
     _log.info(
         f"[knn.build] done  rows={n_rows:,}  "
         f"kingdoms={dict(by_kingdom)}  elapsed={elapsed:.1f}s"
@@ -346,7 +778,94 @@ def build_faiss_index(
         "index_type": index_type,
         "ivf_nlist": ivf_nlist if ivf is not None else None,
         "ivf_nprobe": ivf.nprobe if ivf is not None else None,
+        # Segmentation bookkeeping — the caller driving a multi-segment
+        # build loops until `complete` is True.
+        "next_offset_rows": consumed_rows,
+        "segment_rows": segment_rows,
+        "complete": not stopped_early,
+        "health": health,
     }
+
+
+def _probe_directions(index, n_probes: int) -> np.ndarray:
+    """Unit vectors to probe `index` with.
+
+    Prefer directions drawn from the index's own data: a random Gaussian
+    vector in 768-d is nearly orthogonal to every stored vector, so it
+    scores low even against a badly-scaled index (the real v1 index
+    returned only 1.2 on random probes but 20.7 on a real embedding).
+    An IVF coarse centroid points into an actual cluster, which makes
+    the signal ~20x stronger and the check correspondingly harder to
+    slip past.
+    """
+    d = index.d
+    try:
+        ivf = faiss.extract_index_ivf(index)
+        quantizer = ivf.quantizer
+        n = min(n_probes, quantizer.ntotal)
+        if n > 0:
+            rows = np.stack([quantizer.reconstruct(i) for i in range(n)])
+            norms = np.linalg.norm(rows, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            return np.ascontiguousarray(rows / norms, dtype=np.float32)
+    except Exception:
+        pass  # not an IVF index, or reconstruct unsupported — fall through
+    try:
+        n = min(n_probes, index.ntotal)
+        if n > 0:
+            rows = np.stack([index.reconstruct(i) for i in range(n)])
+            norms = np.linalg.norm(rows, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            return np.ascontiguousarray(rows / norms, dtype=np.float32)
+    except Exception:
+        pass
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal((n_probes, d)).astype(np.float32)
+    return np.ascontiguousarray(q / np.linalg.norm(q, axis=1, keepdims=True))
+
+
+def validate_index(index, *, n_probes: int = 3) -> dict:
+    """Sanity-check that `index` actually holds L2-normalized vectors.
+
+    The index is inner-product over unit vectors, so `IP(q, ref) <= 1.0`
+    for any unit query `q` — by Cauchy-Schwarz, exactly. A top score
+    meaningfully above 1.0 is therefore impossible for a healthy index
+    and means the stored vectors are not unit-norm.
+
+    This exists because the v1 index shipped in that state for months
+    and nothing noticed: it was TRAINED on raw TreeOfLife-200M vectors
+    (norm ~40-57) but had NORMALIZED vectors added to it. With
+    IndexIVFPQ's default by_residual=True the residuals degenerated to
+    ~-centroid, the PQ codebooks were fit at the wrong scale, and every
+    entry decoded to roughly its coarse centroid. Queries returned
+    near-identical scores (~20.7) for unrelated species — plausible
+    output, entirely arbitrary ranking. A one-line assertion at load
+    time would have caught it on day one.
+
+    Returns {"ok", "max_sim", "reason"}. Never raises: a validation
+    failure must degrade to a loud warning, not take the server down.
+    """
+    try:
+        q = _probe_directions(index, n_probes)
+        D, _ = index.search(q, 1)
+        max_sim = float(np.max(D)) if D.size else 0.0
+    except Exception as e:  # pragma: no cover - defensive
+        return {"ok": None, "max_sim": None, "reason": f"probe failed: {e}"}
+
+    # 1.01 not 1.0: PQ reconstruction error can nudge a near-duplicate
+    # fractionally over unity. The failure mode we're catching overshoots
+    # by 20x, so the exact threshold is not delicate.
+    if max_sim > 1.01:
+        return {
+            "ok": False,
+            "max_sim": max_sim,
+            "reason": (
+                f"top inner-product {max_sim:.3f} exceeds 1.0 for a unit "
+                f"query — the index does not contain L2-normalized "
+                f"vectors. Its neighbours are unreliable; rebuild it."
+            ),
+        }
+    return {"ok": True, "max_sim": max_sim, "reason": ""}
 
 
 def _read_version(index_dir: Path) -> dict:
@@ -385,9 +904,113 @@ def _load_index(
             f"rebuild the index."
         )
     index = faiss.read_index(str(index_path))
-    # mmap the labels parquet so we don't pay the full RAM cost upfront.
-    labels = pq.read_table(str(labels_path), memory_map=True)
+    # Load the labels parquet LAZILY: read only the schema + row count,
+    # NOT the actual row data (which is 3 GB for 91M rows and would OOM
+    # the 29 GB host alongside the 2 GB faiss index + uvicorn base).
+    # classify_via_knn uses `labels.take(pa.array(I.flat))` to fetch
+    # only the matched neighbor rows — pyarrow's row-group statistics
+    # + Parquet's column projection make this O(matched) memory, not
+    # O(table). We implement take() by opening the file with
+    # ParquetFile + reading only the row groups containing matched
+    # indices via the row-group index. This way we never read all 91M
+    # rows into RAM.
     meta = _read_version(index_dir)
+    _labels_md = pq.read_metadata(labels_path)
+
+    class _LazyLabelsTable:
+        """Proxy over a parquet file that materializes the underlying
+        table only on full-table access. `take(indices)` is the hot
+        path for KNN queries — it reads only the row groups whose
+        index range intersects the matched indices, then assembles a
+        small Table with just those rows.
+
+        For a k=10 query against 91M rows, take() touches at most
+        ceil(10 / rows_per_row_group) row groups. With 25K rows per
+        group (default Parquet) that's 1 row group → a few hundred KB
+        of data. Compared to the naive `pq.read_table(memory_map=True)`
+        which materializes the full 3 GB table at first .take(), this
+        proxy keeps RSS bounded.
+        """
+        def __init__(self, path, metadata):
+            self._path = path
+            self._metadata = metadata
+            self._cache: pa.Table | None = None
+            # How many rows per row group (default 64K-1M for Parquet;
+            # ours is ~43K based on row_groups=2171 for 91M rows).
+            self._rows_per_rg = max(
+                1,
+                metadata.num_rows // max(1, metadata.num_row_groups),
+            )
+
+        def _materialize(self) -> pa.Table:
+            if self._cache is None:
+                self._cache = pq.read_table(self._path, memory_map=True)
+            return self._cache
+
+        def take(self, indices):
+            # Convert pa.Array of int64 → numpy int64 array.
+            if isinstance(indices, list):
+                idx_np = np.asarray(indices, dtype="int64")
+            elif hasattr(indices, "to_numpy"):
+                idx_np = indices.to_numpy()
+            else:
+                idx_np = np.asarray(indices, dtype="int64")
+            idx_np = idx_np.astype("int64", copy=False)
+            if len(idx_np) == 0:
+                return pa.table({c.name: [] for c in self._metadata.schema})
+            # Compute which row groups are needed. For each index, the
+            # containing row group is idx // rows_per_rg. Gather the
+            # unique set of row groups, read them, then concat the
+            # matching slices.
+            rg_idx = (idx_np // self._rows_per_rg).tolist()
+            unique_rgs = sorted(set(rg_idx))
+            pf = pq.ParquetFile(self._path)
+            pieces: list[pa.Table] = []
+            for rg in unique_rgs:
+                rg_table = pf.read_row_group(rg)
+                # The row group's rows are [rg * RPR, (rg+1) * RPR).
+                rg_lo = rg * self._rows_per_rg
+                rg_hi = rg_lo + rg_table.num_rows
+                # Filter indices that fall in this row group.
+                rg_idx_local = [int(i) - rg_lo for i in idx_np if rg_lo <= int(i) < rg_hi]
+                if rg_idx_local:
+                    pieces.append(rg_table.take(pa.array(rg_idx_local)))
+            if not pieces:
+                return pa.table({c.name: [] for c in self._metadata.schema})
+            return pa.concat_tables(pieces)
+
+        def column(self, name):
+            return self._materialize().column(name)
+
+        @property
+        def num_rows(self):
+            return self._metadata.num_rows
+
+        @property
+        def schema(self):
+            return self._metadata.schema
+
+        def slice(self, *args, **kwargs):
+            return self._materialize().slice(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._materialize(), name)
+
+    labels = _LazyLabelsTable(labels_path, _labels_md)
+    # Health check on every load. Cheap (3 single-NN probes) relative to
+    # reading a multi-GB index off disk, and it runs exactly where a
+    # corrupt index would otherwise start silently returning nonsense.
+    health = validate_index(index)
+    meta["health"] = health
+    if health["ok"] is False:
+        _log.error("[knn] INDEX FAILED VALIDATION: %s", health["reason"])
+    elif health["ok"] is None:
+        _log.warning("[knn] index validation inconclusive: %s", health["reason"])
+    else:
+        _log.info(
+            "[knn] index validation ok (max unit-query sim %.4f)",
+            health["max_sim"],
+        )
     return index, labels, meta
 
 
@@ -438,8 +1061,12 @@ def classify_via_knn(
         "kingdom":        str,
         "family":         str,
         "genus":          str,
-        "neighbors":      [{"uuid", "species", "common_name", "sim"}, ...]  # length k
+        "neighbors":      [{"uuid", "species", "common_name", "sim",
+                            "identifier", "source_dataset"}, ...]  # length k
       }
+
+    `identifier` is the source image URL of the reference photo (gbif /
+    eol media URL); None for rows that have none (bioscan).
     """
     index, labels, meta = _load_index(index_dir)
     if query_embeddings.ndim != 2 or query_embeddings.shape[1] != EMB_DIM:
@@ -508,6 +1135,12 @@ def classify_via_knn(
                     "species": sp,
                     "common_name": col_idx["common_name"][ref_idx] or "",
                     "sim": sim,
+                    # Source image URL for the reference photo. Non-null
+                    # for gbif + eol rows (~99.9% of the index); null for
+                    # bioscan. The UI renders it as a thumbnail through
+                    # /api/knn/ref-thumb rather than hotlinking.
+                    "identifier": col_idx["identifier"][ref_idx] or None,
+                    "source_dataset": col_idx["source_dataset"][ref_idx] or "",
                 }
             )
 
@@ -588,10 +1221,43 @@ def main() -> int:
     ap.add_argument(
         "--ivf-train-size",
         type=int,
-        default=1_000_000,
-        help="Vectors to use for IVF k-means training (default 1M).",
+        default=200_000,
+        help="Vectors to use for IVF k-means training (default 200K — "
+             "600MB training buffer; the 1M default exceeds the 12GB "
+             "RLIMIT_DATA cap on this host).",
+    )
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="If an index already exists at <index-dir>/tol200m_bioclip2.faiss, "
+             "load it and continue adding instead of starting from scratch. "
+             "Used for multi-pass builds that exceed RLIMIT_DATA: run build #1 "
+             "fresh, then build #2 #3 with --resume on the same dir.",
+    )
+    ap.add_argument(
+        "--max-segment-rows",
+        type=int,
+        default=None,
+        help="Stop after adding roughly this many source rows and record "
+             "the cursor in <index-dir>/state.json, so the next --resume "
+             "run continues from there instead of re-adding from row 0. "
+             "Use for multi-pass builds that exceed the memory budget.",
     )
     args = ap.parse_args()
+
+    # Surface the actual rlimit in the log so an OOM in the field is
+    # easy to diagnose — `RLIMIT_DATA` (12 GB on this host) is what the
+    # `app.py` start_knn_build sets via preexec_fn. If you're running
+    # the CLI standalone, this just prints whatever your shell set.
+    import resource
+    try:
+        data_limit = resource.getrlimit(resource.RLIMIT_DATA)
+        _log.info(
+            f"[knn.build] RLIMIT_DATA = {data_limit[0] / 1024**3:.1f} GB "
+            f"(hard={data_limit[1] / 1024**3:.1f} GB) — OOM-kill at the soft cap"
+        )
+    except (ValueError, OSError):
+        _log.warning("[knn.build] could not read RLIMIT_DATA")
 
     kingdoms = (
         [k.strip() for k in args.kingdoms.split(",") if k.strip()]
@@ -607,6 +1273,8 @@ def main() -> int:
         index_type=args.index_type,
         ivf_nlist=args.ivf_nlist,
         ivf_train_size=args.ivf_train_size,
+        resume=args.resume,
+        max_segment_rows=args.max_segment_rows,
     )
     print(json.dumps(stats, indent=2, default=str))
     return 0

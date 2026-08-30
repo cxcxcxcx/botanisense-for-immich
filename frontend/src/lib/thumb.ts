@@ -20,3 +20,11 @@ export function thumbUrl(aid: string, size?: ThumbSize): string {
   const enc = encodeURIComponent(aid);
   return size ? `/thumb/${enc}?size=${size}` : `/thumb/${enc}`;
 }
+
+// Build a /api/knn/ref-thumb URL for a KNN neighbor's reference photo.
+// The backend proxies + caches the external gbif/eol image and refuses
+// any URL that isn't a stored neighbor identifier, so this is the only
+// supported way to render one.
+export function refThumbUrl(identifier: string): string {
+  return `/api/knn/ref-thumb?url=${encodeURIComponent(identifier)}`;
+}

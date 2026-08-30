@@ -5,6 +5,7 @@ import type { AssetDetail as AssetDetailType } from '../api/types';
 import { thumbUrl } from '../lib/thumb';
 import { Predictions } from './Predictions';
 import { LibraryNeighbors } from './LibraryNeighbors';
+import { KnnRefNeighbors } from './KnnRefNeighbors';
 import { DetectionBlock } from './DetectionBlock';
 import { BboxImage } from './BboxImage';
 import { useToasts } from './ToastProvider';
@@ -135,6 +136,10 @@ export function AssetDetail({ assetId }: Props) {
   // KNN isn't configured (the index build is hours-long; a button
   // that always 503s is worse than no button).
   const [knnStatus, setKnnStatus] = useState<KnnStatus | null>(null);
+  // Disables the re-run button while a reclassify is in flight. The
+  // call is synchronous server-side (FAISS search + parquet take), so
+  // without this a double-click queues two identical searches.
+  const [knnBusy, setKnnBusy] = useState(false);
   const push = useToasts();
 
   useEffect(() => {
@@ -166,11 +171,28 @@ export function AssetDetail({ assetId }: Props) {
   }, []);
 
   const handleReclassifyAll = async () => {
+    if (knnBusy) return;
+    setKnnBusy(true);
     try {
-      await reclassify([assetId]);
-      push({ kind: 'success', message: 'KNN reclassify queued for this asset' }, 2000);
+      // force: an explicit click must always recompute. Without it the
+      // backend skips any asset that already has a row for
+      // (index_version, k) and the click is a silent no-op.
+      const r = await reclassify([assetId], undefined, true);
+      // Use the row the endpoint already returned instead of refetching
+      // the whole asset — /api/reclassify hands back the fresh
+      // knn_predictions rows keyed by asset_id for exactly this.
+      const row = r.results?.[assetId] ?? null;
+      setData(d => (d ? { ...d, knn: row } : d));
+      push({
+        kind: 'success',
+        message: row?.top_species
+          ? `KNN → ${row.top_species}`
+          : 'KNN found no match for this asset',
+      }, 3000);
     } catch (e) {
       push({ kind: 'error', message: e instanceof Error ? e.message : String(e) }, 4000);
+    } finally {
+      setKnnBusy(false);
     }
   };
 
@@ -409,20 +431,55 @@ export function AssetDetail({ assetId }: Props) {
           enough visual separation. */}
       <LibraryNeighbors items={data.library_neighbors} />
 
-      {/* Per-asset KNN reclassification (UX-15-ish workflow). Only
-          rendered when the reference index is built — fetching
-          /api/knn-status once on mount tells us. Users who want to
-          try KNN on a single asset can click this; for the whole
-          grid there's 'Reclassify with KNN' on the Run page. */}
+      {/* Per-asset KNN. Only rendered when the reference index is built
+          — fetching /api/knn-status once on mount tells us. Shows the
+          consensus species plus the reference photos the vote came
+          from, so the user can judge the match rather than take the
+          species string on faith. For the whole grid there's
+          'Reclassify with KNN' on the Run page. */}
       {knnStatus?.index_built && (
-        <button
-          type="button"
-          className="self-start text-[11px] text-fg-1 underline hover:text-fg"
-          onClick={handleReclassifyAll}
-          title="Queue a KNN reclassification for this single asset"
-        >
-          Re-run KNN on this asset
-        </button>
+        <section className="flex flex-col gap-2">
+          <div className="flex items-baseline justify-between gap-2">
+            <h3 className="text-[12px] uppercase tracking-wide text-fg-1">
+              KNN match
+            </h3>
+            <button
+              type="button"
+              className="text-[11px] text-fg-1 underline hover:text-fg disabled:opacity-50 disabled:no-underline"
+              onClick={handleReclassifyAll}
+              disabled={knnBusy}
+              title="Recompute the KNN match for this asset against the reference index"
+            >
+              {knnBusy ? 'Running…' : 'Re-run KNN on this asset'}
+            </button>
+          </div>
+
+          {data.knn?.top_species ? (
+            <>
+              <div className="text-[13px]">
+                {data.knn.top_species}
+                {data.knn.common_name ? ` (${data.knn.common_name})` : ''}
+                <span className="text-fg-1">
+                  {' · '}vote {formatPct(data.knn.score)}
+                </span>
+              </div>
+              {(data.knn.kingdom || data.knn.family) && (
+                <div className="text-[11px] text-fg-1">
+                  {data.knn.kingdom}
+                  {data.knn.family ? ` · ${data.knn.family}` : ''}
+                  {data.knn.genus ? ` · ${data.knn.genus}` : ''}
+                </div>
+              )}
+              <KnnRefNeighbors neighbors={data.knn.neighbors ?? []} />
+            </>
+          ) : (
+            <p className="text-[12px] text-fg-1">
+              {data.knn
+                ? 'KNN ran but found no confident match.'
+                : 'No KNN result for this asset yet.'}
+            </p>
+          )}
+        </section>
       )}
 
       {/* Debug panels — collapsed by default; users who want the raw

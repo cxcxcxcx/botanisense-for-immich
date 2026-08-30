@@ -642,6 +642,58 @@ def set_cluster_ids(
     )
 
 
+def plantae_asset_ids(
+    conn: sqlite3.Connection, *, min_score: float = 0.0
+) -> set[str]:
+    """Asset IDs whose Plantae kingdom score is >= `min_score`. Driven by
+    the `taxon_scores(rank='kingdom', taxon_name='Plantae')` rows the
+    pipeline writes for every embedded asset. Returns an empty set when
+    `taxon_scores` is empty (fresh DB) — callers must treat that as "no
+    plant assets at all" and skip cluster work entirely.
+
+    Used by `clusters.refit_with_remap` and the incremental-assign path
+    to scope HDBSCAN to plant images only (non-plants would otherwise
+    land in random plant clusters via the BioCLIP embedding similarity
+    and pollute the cluster cards).
+    """
+    rows = conn.execute(
+        "SELECT asset_id FROM taxon_scores "
+        "WHERE rank='kingdom' AND taxon_name='Plantae' AND score >= ?",
+        (float(min_score),),
+    ).fetchall()
+    return {r["asset_id"] for r in rows}
+
+
+def clear_cluster_ids_for_non_plants(
+    conn: sqlite3.Connection, *, keep_asset_ids: set[str]
+) -> int:
+    """Set cluster_id = NULL for every asset NOT in `keep_asset_ids`.
+
+    Called by `clusters.refit_with_remap` after each refit so the cluster
+    view only shows plant assets. `keep_asset_ids` is the post-fit
+    mapping's keys (every plant asset that ended up in `final_mapping`).
+    When `keep_asset_ids` is empty, every cluster_id row is cleared —
+    this handles the "no plants fit the criteria" edge case cleanly.
+
+    Returns the rowcount so the caller can log how many legacy cluster
+    assignments were dropped (typically: every non-plant asset that was
+    clustered by a previous botani run).
+    """
+    if not keep_asset_ids:
+        cur = conn.execute(
+            "UPDATE assets SET cluster_id = NULL WHERE cluster_id IS NOT NULL"
+        )
+    else:
+        placeholders = ",".join("?" for _ in keep_asset_ids)
+        cur = conn.execute(
+            f"UPDATE assets SET cluster_id = NULL "
+            f"WHERE cluster_id IS NOT NULL "
+            f"AND asset_id NOT IN ({placeholders})",
+            list(keep_asset_ids),
+        )
+    return cur.rowcount
+
+
 def cluster_summary(
     conn: sqlite3.Connection,
     *,
@@ -661,6 +713,12 @@ def cluster_summary(
 
     `plantae` narrows both the count and the representative so card
     counts reconcile with the grid breadcrumb for the same facet.
+
+    Ordering: `n DESC, cluster_id ASC`. Largest clusters at the top of
+    the cards grid (the user almost always wants to start with their
+    biggest plant groupings); cluster_id breaks ties stably across
+    refits. Users can still re-sort by capture time / alphabet on the
+    frontend (the cluster_id tiebreaker is the project-wide default).
     """
     # The query has 1 outer tier predicate + 3 inner tier predicates (one
     # per sample subquery). Each `?` placeholder needs its own bind,
@@ -745,7 +803,12 @@ def cluster_summary(
         FROM assets a
         WHERE a.cluster_id IS NOT NULL AND {outer_pred}
         GROUP BY a.cluster_id
-        ORDER BY a.cluster_id ASC
+        -- Top-level ordering: largest clusters first so the user sees
+        -- their biggest plant groupings at the top of the cards grid.
+        -- cluster_id is the tiebreaker so the order is stable across
+        -- refits (HDBSCAN reshuffles membership but cluster IDs are
+        -- persisted via the Hungarian remap).
+        ORDER BY n DESC, a.cluster_id ASC
         """,
         params,
     ).fetchall()
@@ -2658,6 +2721,11 @@ def fetch_knn_predictions(
             "family": r["family"] or "",
             "genus": r["genus"] or "",
             "neighbors": neighbors,
+            # Echo the cache key back so callers can hand the row
+            # straight to the frontend (which types them as required
+            # fields on KnnRow) without re-threading their own args.
+            "index_version": index_version,
+            "k": k,
             "computed_at": r["computed_at"],
         }
     return out
@@ -2679,6 +2747,36 @@ def knn_predictions_have_asset(
         (asset_id, index_version, k),
     ).fetchone()
     return row is not None
+
+
+def knn_reference_url_known(conn: sqlite3.Connection, url: str) -> bool:
+    """Is `url` the `identifier` of a neighbor we actually stored?
+
+    Backs the /api/knn/ref-thumb proxy's allowlist. The proxy fetches
+    arbitrary external hosts, so it must not accept a caller-supplied
+    URL on trust — otherwise it's an open SSRF relay into whatever the
+    server can reach (the Immich instance, the router, link-local
+    metadata endpoints). Requiring the URL to already appear in a
+    neighbors blob closes it to URLs that came out of our own index.
+
+    Substring-matched against the neighbors JSON in both KNN caches.
+    The quotes around `url` in the pattern anchor it to a complete JSON
+    string value, so a prefix like "https://evil.test/" can't match by
+    being a prefix of a legitimate entry. Both tables hold one row per
+    asset/detection, so the scan is small.
+    """
+    # LIKE wildcards in the URL itself would widen the match, so escape
+    # them and declare the escape character.
+    escaped = url.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f'%"{escaped}"%'
+    for table in ("knn_predictions", "bbox_knn_predictions"):
+        row = conn.execute(
+            f"SELECT 1 FROM {table} WHERE neighbors LIKE ? ESCAPE '\\' LIMIT 1",
+            (pattern,),
+        ).fetchone()
+        if row is not None:
+            return True
+    return False
 
 
 def list_knn_versions(conn: sqlite3.Connection) -> list[dict]:
@@ -3290,6 +3388,7 @@ def get_all_results(
     plantae: str | None = None,
     plantae_green: float = 0.60,
     plantae_yellow: float = 0.35,
+    include_non_plants: bool = False,
 ) -> tuple[list[dict], int, int]:
     """Return (page_of_buckets, total_reps, total_assets).
 
@@ -3323,6 +3422,17 @@ def get_all_results(
     - plantae: "plant" (≥plantae_green), "uncertain" (≥plantae_yellow
       and <plantae_green), "non_plant" (<plantae_yellow). Cached on
       every asset via taxon_scores(rank='kingdom', taxon_name='Plantae').
+      When the user explicitly picks a tier (anything other than None),
+      the explicit filter wins regardless of `include_non_plants` —
+      e.g. asking for `plantae="non_plant"` always returns non-plants.
+    - include_non_plants: opt-in toggle for the unfiltered "all" view.
+      When False (default), the all-view is scoped to plant assets
+      (Plantae score ≥ plantae_yellow, i.e. the yellow-floor
+      boundary). This is the project-wide "counts don't include
+      non-plant photos" policy applied to the grid; see also
+      `clusters.CLUSTER_PLANTAE_MIN` for the cluster-side enforcement.
+      Set True to restore the legacy behavior of including every
+      photo. Has no effect when `plantae` is given explicitly.
     """
     # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
     # need an INNER JOIN on predictions (position=0); the cluster_id
@@ -3357,7 +3467,17 @@ def get_all_results(
         params.append(plantae_yellow)
         params.append(plantae_green)
     elif plantae == "non_plant":
+        # Explicit selection always wins — even with include_non_plants
+        # off, asking for non_plant returns non_plant rows.
         where.append(f"{_PLANTAE_SCORE} < ?")
+        params.append(plantae_yellow)
+    elif not include_non_plants:
+        # No explicit plantae filter + include_non_plants is off → the
+        # all-view scopes to plant photos (same yellow-floor boundary
+        # as clusters.CLUSTER_PLANTAE_MIN). When the user does opt in
+        # via include_non_plants=True, no Plantae WHERE is added and
+        # the all-view returns every photo as before.
+        where.append(f"{_PLANTAE_SCORE} >= ?")
         params.append(plantae_yellow)
 
     where_sql = " AND ".join(where)

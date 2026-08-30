@@ -226,6 +226,23 @@ _THUMB_CACHE_MAX = 500
 _thumb_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
 _thumb_cache_lock = asyncio.Lock()  # all cache mutations
 
+# Reference-photo cache for /api/knn/ref-thumb. Separate LRU from the
+# Immich thumb cache: these are external gbif/eol images fetched over
+# the public internet, so they're slower to miss and worth keeping, but
+# they shouldn't evict Immich thumbnails (which the grid hammers).
+_REF_THUMB_CACHE_MAX = 400
+_ref_thumb_cache: OrderedDict[str, tuple[bytes, str]] = OrderedDict()
+_ref_thumb_cache_lock = asyncio.Lock()
+# Cap on a single reference image. gbif/eol media are typically
+# 50-500 KB; anything past this is a misconfigured source (or a hostile
+# one trying to fill our RAM) and gets rejected rather than cached.
+_REF_THUMB_MAX_BYTES = 8 * 1024 * 1024
+# Reference images are rendered as ~100px squares in a 3-col grid, but
+# the sources serve originals (a typical iNaturalist photo is 1536×2048
+# / ~1 MB). Downscale before caching: 6 neighbours × 1 MB is 6 MB over
+# the wire for thumbnails, and the LRU would hold ~400 MB at its cap.
+_REF_THUMB_EDGE = 320
+
 
 def _results_cache_get(key: str) -> dict | None:
     """Return the cached payload for `key`, or None. Promotes the key
@@ -427,6 +444,12 @@ def _knn_status_dict() -> dict:
         "by_kingdom": {},
         "k_default": KNN_K,
         "cached_assets": 0,
+        # Index health, from knn.validate_index() at load time. None when
+        # the index isn't loaded. `healthy: False` means the stored
+        # vectors aren't L2-normalized and the neighbours are unreliable
+        # — the UI warns rather than silently presenting bad species.
+        "healthy": None,
+        "health_reason": "",
     }
     loaded = _get_knn_index()
     if loaded is None:
@@ -436,6 +459,9 @@ def _knn_status_dict() -> dict:
     out["version"] = meta.get("version")
     out["n_rows"] = int(idx.ntotal)
     out["dim"] = int(idx.d)
+    health = (meta or {}).get("health") or {}
+    out["healthy"] = health.get("ok")
+    out["health_reason"] = health.get("reason", "")
     # Let DB errors bubble — a misleading `cached_assets: 0` is worse
     # than a 500 here, since the UI uses this to decide whether the
     # index has usable data.
@@ -587,8 +613,12 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
     # new photos) and any per-run entry (kept for backwards compat with
     # the old /api/results?run=... path). Also invalidate the cluster
     # names cache — HDBSCAN may reassign cluster_ids.
+    #
+    # _invalidate_results_cache takes _results_lock itself, so it must
+    # NOT be called with the lock already held — threading.Lock is not
+    # reentrant and doing so deadlocks the event loop permanently.
+    _invalidate_results_cache("all:")
     with _results_lock:
-        _invalidate_results_cache("all:")
         _results_cache.pop(str(out.run_id), None)
     _invalidate_clusters_cache()
     # Precompute the near-dup map so the user's first /api/results after
@@ -618,7 +648,8 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
 
 
 async def _start_run(query: str, n_samples: int, top_k: int,
-                     batch_size: int) -> dict:
+                     batch_size: int,
+                     stop_criteria_pct: float | None = None) -> dict:
     """Kick off a pipeline run in a child process. Returns immediately
     with the new job_id once the child is forked.
 
@@ -650,6 +681,7 @@ async def _start_run(query: str, n_samples: int, top_k: int,
     proc = _mp.Process(
         target=_pipeline_child_entry,
         args=(query, n_samples, top_k, batch_size,
+              stop_criteria_pct,
               str(status_path), str(log_path), stop_event),
         daemon=True,
         name=f"pipeline-{job_id}",
@@ -677,7 +709,9 @@ async def _start_run(query: str, n_samples: int, top_k: int,
 
 
 def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
-                          batch_size: int, status_path: str,
+                          batch_size: int,
+                          stop_criteria_pct: float | None,
+                          status_path: str,
                           log_path: str, stop_event) -> None:
     """Body of the child process. Mirrors the pipeline state to a JSON
     file the parent polls, runs `run_pipeline` (which can hit ~5.85 GB
@@ -713,6 +747,7 @@ def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
             db_path=DB_PATH,
             classifier=None,
             batch_size=batch_size,
+            stop_criteria_pct=stop_criteria_pct,
             stop_event=stop_event,
         )
         # Cluster names may have changed (HDBSCAN re-assigns cluster_ids
@@ -971,6 +1006,12 @@ class RunParams(BaseModel):
     n_samples: int | None = None
     top_k: int | None = None
     batch_size: int | None = None
+    # Stop-criteria threshold expressed as a percent (0-100) of a
+    # batch that must score above the Plantae/Fungi confidence floor
+    # for the search to keep going. Lower = the pipeline stops sooner
+    # (stricter — only batches with mostly plants continue). None
+    # falls back to the module default in pipeline.py (30%).
+    stop_criteria_pct: float | None = None
 
 
 @app.get("/api/runs")
@@ -1400,7 +1441,14 @@ async def get_results(
     family: str | None = Query(default=None),
     has_person: int | None = Query(default=None, ge=0, le=1),
     plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
-    sort: str = Query(default="rank", pattern="^(rank|time|added)$"),
+    include_non_plants: bool = Query(default=False),
+    # Default is 'time' (capture date DESC) — matches the frontend
+    # DEFAULT_FILTERS.sort and the "Newest first" pill in Grid.tsx.
+    # Clients passing plantae/score instead send sort='rank' (no-op
+    # server order) and resort the page slice client-side via
+    # Grid.sortRows. 'rank' remains in the pattern for users who
+    # explicitly ask for Immich's search rank.
+    sort: str = Query(default="time", pattern="^(rank|time|added)$"),
 ) -> dict:
     """Return a paginated slice of every indexed asset. The `run` param
     was dropped — the view is now global so the cluster / taxonomy pills
@@ -1415,11 +1463,20 @@ async def get_results(
     - plantae: "plant" (≥PLANTAE_GREEN), "uncertain" (≥PLANTAE_YELLOW
       and <PLANTAE_GREEN), or "non_plant" (<PLANTAE_YELLOW). Uses the
       kingdom score stored in taxon_scores (already on every asset).
-    - sort: 'rank' (default, server-defined order — Immich rank then
-      cluster_id tiebreak), 'time' (newest captured_at first, NULLs
-      last), or 'added' (newest first_seen_at first, NULLs last).
-      Time/added sort happens server-side so the page slice is the
-      actual most-recent N photos, not the top-N by rank re-sorted.
+      An explicit tier always wins regardless of `include_non_plants`.
+    - include_non_plants: opt-in toggle (default False). When False,
+      the unfiltered "all" view hides non-plant photos entirely — grid
+      and `pagination.total` only count assets with Plantae score ≥
+      PLANTAE_YELLOW. This is the project-wide "no non-plant counts"
+      policy applied to results. Set True to restore legacy behavior
+      and include every photo in the all-view. Has no effect when an
+      explicit `plantae` tier is given.
+    - sort: 'time' (default — newest captured_at first, NULLs last),
+      'added' (newest first_seen_at first, NULLs last), or 'rank'
+      (Immich search-rank from the most recent run, then cluster_id
+      tiebreak). Time/added sort happens server-side so the page slice
+      is the actual most-recent N photos, not the top-N by rank
+      re-sorted.
 
     `pagination.total` is the raw file count (every photo, pre-dedup)
     so the breadcrumb and "all" tile match. `pagination.total_pages`
@@ -1427,12 +1484,14 @@ async def get_results(
     what's actually browsable.
     """
     # Cache key includes every filter + sort param so different filter
-    # combinations can't poison each other. has_person and plantae are
-    # included so each value gets its own cached slice.
+    # combinations can't poison each other. has_person, plantae, and
+    # include_non_plants are included so each value gets its own cached
+    # slice — flipping the toggle on the same filter combination MUST
+    # bust the cache, otherwise stale results leak across toggles.
     has_filter = any(v is not None for v in (cluster_id, species, genus, family, has_person, plantae))
     cache_key = (
-        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:sort={sort}"
-        if has_filter else f"all:hp={has_person}:pl={plantae}:sort={sort}"
+        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
+        if has_filter else f"all:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
     )
 
     cached = _results_cache_get(cache_key)
@@ -1471,6 +1530,7 @@ async def get_results(
                 plantae=plantae,
                 plantae_green=PLANTAE_GREEN,
                 plantae_yellow=PLANTAE_YELLOW,
+                include_non_plants=include_non_plants,
             )
             taxonomy = storage.get_global_taxonomy_summary(
                 conn,
@@ -1946,6 +2006,7 @@ async def run_endpoint(params: RunParams) -> dict:
         n_samples=params.n_samples if params.n_samples is not None else N_SAMPLES,
         top_k=params.top_k if params.top_k is not None else TOP_K,
         batch_size=params.batch_size if params.batch_size is not None else BATCH_SIZE,
+        stop_criteria_pct=params.stop_criteria_pct,
     )
 
 
@@ -1991,6 +2052,10 @@ async def stop_run() -> dict:
 class ReclassifyParams(BaseModel):
     asset_ids: list[str]
     k: int | None = None  # default: server KNN_K
+    # Recompute even when a row already exists for (index_version, k).
+    # The per-asset "Re-run KNN" button sets this — without it a second
+    # click is a silent no-op.
+    force: bool = False
 
 
 @app.get("/api/knn-status")
@@ -2288,7 +2353,7 @@ async def reclassify(params: ReclassifyParams) -> dict:
     # take a few seconds for large batches. We share the DB so we don't
     # need an additional lock — sqlite is in WAL mode and single-writer.
     stats = await asyncio.to_thread(
-        run_knn_reclassify_sync, params.asset_ids, k
+        run_knn_reclassify_sync, params.asset_ids, k, params.force
     )
     # Pull the freshly-written rows for the response so the UI can
     # render them without another fetch.
@@ -2300,20 +2365,21 @@ async def reclassify(params: ReclassifyParams) -> dict:
             k=k,
         )
     # Invalidate the per-page cache so the next /api/results reflects
-    # the new KNN rows.
-    with _results_lock:
-        _invalidate_results_cache("all:")
+    # the new KNN rows. _invalidate_results_cache acquires
+    # _results_lock internally — calling it under the lock deadlocks.
+    _invalidate_results_cache("all:")
     _invalidate_clusters_cache()
     return {"stats": stats, "results": fresh}
 
 
-def run_knn_reclassify_sync(asset_ids: list[str], k: int) -> dict:
+def run_knn_reclassify_sync(asset_ids: list[str], k: int, force: bool = False) -> dict:
     """Synchronous wrapper used by the /api/reclassify endpoint so it
     can be offloaded to a worker thread via asyncio.to_thread()."""
     from pipeline import run_knn_reclassify
     with storage.connect(DB_PATH) as conn:
         return run_knn_reclassify(
             conn, asset_ids=asset_ids, index_dir=KNN_INVENTORY_DIR, k=k,
+            force=force,
         )
 
 
@@ -3681,6 +3747,124 @@ async def thumb(asset_id: str, size: str = "preview") -> Response:
     )
 
 
+# ---- KNN reference-photo proxy ------------------------------------------
+# The KNN neighbor list carries an `identifier` — the source image URL
+# of the reference photo the match came from (gbif / eol media). The UI
+# renders those as thumbnails so a user can eyeball "does my photo
+# actually look like this?" instead of trusting a species string.
+#
+# We proxy rather than hotlink for three reasons: the browser would
+# otherwise leak the user's IP to a few hundred herbarium hosts; many
+# of those hosts set no CORS headers and some block hotlinking; and a
+# proxy lets us cache (the same reference photo recurs across assets).
+#
+# The proxy is CLOSED, not open: `url` must already appear as a
+# neighbor identifier in one of the KNN caches. See
+# storage.knn_reference_url_known for why.
+
+
+def _shrink_ref_image(body: bytes, media_type: str) -> tuple[bytes, str]:
+    """Downscale a reference photo to _REF_THUMB_EDGE on its long side
+    and re-encode as JPEG. Returns (body, media_type) unchanged if the
+    image is already small or can't be decoded."""
+    import io
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(body))
+        if max(img.size) <= _REF_THUMB_EDGE:
+            return body, media_type
+        img = img.convert("RGB")
+        img.thumbnail((_REF_THUMB_EDGE, _REF_THUMB_EDGE), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=82, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception as e:
+        _log.warning("ref-thumb: could not shrink image (%s); serving as-is", e)
+        return body, media_type
+
+
+@app.get("/api/knn/ref-thumb")
+async def knn_ref_thumb(url: str = Query(..., description="reference image URL")) -> Response:
+    if not url.startswith("https://"):
+        # http:// would send the request in the clear and is not used by
+        # any source dataset in the index.
+        raise HTTPException(status_code=400, detail="url must be https://")
+
+    async with _ref_thumb_cache_lock:
+        hit = _ref_thumb_cache.get(url)
+        if hit is not None:
+            _ref_thumb_cache.move_to_end(url)
+            body, media_type = hit
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "public, max-age=604800",
+                    "Content-Length": str(len(body)),
+                    "X-Ref-Thumb-Cache": "HIT",
+                },
+            )
+
+    def _known() -> bool:
+        with storage.connect(DB_PATH) as conn:
+            return storage.knn_reference_url_known(conn, url)
+
+    if not await asyncio.to_thread(_known):
+        raise HTTPException(
+            status_code=403,
+            detail="url is not a known KNN reference image",
+        )
+
+    # follow_redirects: gbif identifiers frequently 302 to a CDN. The
+    # allowlist above means we only ever start from a URL that came out
+    # of the reference index, so the redirect chain is as trustworthy as
+    # the index itself.
+    try:
+        async with httpx.AsyncClient(
+            timeout=20.0, follow_redirects=True, max_redirects=5,
+        ) as client:
+            r = await client.get(url, headers={"User-Agent": "BotaniSense/1.0"})
+    except httpx.HTTPError as e:
+        raise HTTPException(status_code=502, detail=f"reference fetch failed: {e}")
+
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=f"reference image {url}: HTTP {r.status_code}",
+        )
+    body = r.content
+    if len(body) > _REF_THUMB_MAX_BYTES:
+        raise HTTPException(status_code=502, detail="reference image too large")
+    media_type = r.headers.get("content-type", "image/jpeg")
+    if not media_type.startswith("image/"):
+        raise HTTPException(
+            status_code=502, detail=f"reference is not an image ({media_type})",
+        )
+
+    # Downscale to thumbnail size before caching. Pillow decode + encode
+    # is CPU-bound, so it goes to a worker thread rather than blocking
+    # the event loop. A source we can't decode is served through
+    # unchanged — better a big image than none.
+    body, media_type = await asyncio.to_thread(
+        _shrink_ref_image, body, media_type
+    )
+
+    async with _ref_thumb_cache_lock:
+        _ref_thumb_cache[url] = (body, media_type)
+        while len(_ref_thumb_cache) > _REF_THUMB_CACHE_MAX:
+            _ref_thumb_cache.popitem(last=False)
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=604800",
+            "Content-Length": str(len(body)),
+            "X-Ref-Thumb-Cache": "MISS",
+        },
+    )
+
+
 # ---- bbox-index reclassify (YOLO per-crop) -------------------------------
 # The AssetDetail "Reclassify crop" button (one per YOLO detection,
 # inside the debug disclosure) posts {asset_id, detection_id}.
@@ -4273,9 +4457,10 @@ async def poll_person_backfill_job(job_id: str) -> dict:
                         job["finished_at"] = datetime.now(timezone.utc).isoformat()
                     # Once the child reports done, invalidate the
                     # results cache so the grid reflects new has_person.
+                    # No _results_lock here — _invalidate_results_cache
+                    # takes it itself and the lock is not reentrant.
                     if not job.get("_cache_invalidated"):
-                        with _results_lock:
-                            _invalidate_results_cache("all:")
+                        _invalidate_results_cache("all:")
                         _invalidate_clusters_cache()
                         job["_cache_invalidated"] = True
         except FileNotFoundError:

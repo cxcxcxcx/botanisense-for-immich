@@ -636,6 +636,7 @@ def discover_plantae_assets(
     api_key: str,
     thumb_dir: Path,
     decision_batch_size: int = PLANT_BATCH_SIZE,
+    stop_criterion: float | None = None,
     stop_event=None,
 ) -> list[ImmichAsset]:
     """Stream-search Immich and return assets up to the plant/fungi boundary.
@@ -875,9 +876,16 @@ def discover_plantae_assets(
 
             n_plant = sum(1 for _, s in scored if s > PLANT_MIN_PROB)
             majority = n_plant / len(scored) if scored else 0.0
-            threshold_pct = int(PLANT_BATCH_MAJORITY * 100)
+            # Use the caller-provided stop_criterion override when given
+            # (so a per-run UI value flows through); otherwise fall back
+            # to the module default PLANT_BATCH_MAJORITY (30%).
+            stop_crit = (
+                stop_criterion if stop_criterion is not None
+                else PLANT_BATCH_MAJORITY
+            )
+            threshold_pct = int(stop_crit * 100)
 
-            if majority >= PLANT_BATCH_MAJORITY:
+            if majority >= stop_crit:
                 # Continue: include plants-or-fungi in this batch.
                 n_added = 0
                 for asset, s in scored:
@@ -1124,12 +1132,16 @@ def run_knn_reclassify(
     asset_ids: list[str],
     index_dir: Path,
     k: int = 10,
+    force: bool = False,
 ) -> dict:
     """KNN reclassify a list of assets using a pre-built FAISS index.
 
     Reuses the cached BioCLIP image embeddings stored in the
     `embeddings` table — does NOT re-embed photos. Skips any asset that
-    already has a `knn_predictions` row for (version, k).
+    already has a `knn_predictions` row for (version, k), unless
+    `force` is set — the per-asset "Re-run KNN" button passes force so
+    an explicit user click always recomputes (and so rows written by an
+    older code version get refreshed with any new neighbor fields).
 
     Returns a stats dict {"requested", "cached", "scanned", "index_version"}.
     Logs to stderr and to the file log via the existing `_log` so the
@@ -1160,22 +1172,34 @@ def run_knn_reclassify(
 
     # Filter: only assets that have an embedding AND don't already have
     # a KNN row for this (version, k). The DB-side check keeps the
-    # "already classified" count accurate per call.
+    # "already classified" count accurate per call. With `force`, we
+    # drop the NOT EXISTS clause and recompute every asset that has an
+    # embedding.
     placeholders = ",".join("?" for _ in asset_ids)
-    rows = conn.execute(
-        f"""
-        SELECT e.asset_id, e.vector
-        FROM embeddings e
-        WHERE e.asset_id IN ({placeholders})
-          AND NOT EXISTS (
-            SELECT 1 FROM knn_predictions kp
-            WHERE kp.asset_id = e.asset_id
-              AND kp.index_version = ?
-              AND kp.k = ?
-          )
-        """,
-        [*asset_ids, version_tag, k],
-    ).fetchall()
+    if force:
+        rows = conn.execute(
+            f"""
+            SELECT e.asset_id, e.vector
+            FROM embeddings e
+            WHERE e.asset_id IN ({placeholders})
+            """,
+            list(asset_ids),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT e.asset_id, e.vector
+            FROM embeddings e
+            WHERE e.asset_id IN ({placeholders})
+              AND NOT EXISTS (
+                SELECT 1 FROM knn_predictions kp
+                WHERE kp.asset_id = e.asset_id
+                  AND kp.index_version = ?
+                  AND kp.k = ?
+              )
+            """,
+            [*asset_ids, version_tag, k],
+        ).fetchall()
 
     if not rows:
         return {
@@ -1225,6 +1249,12 @@ def run_pipeline(
     yolo_conf: float = 0.05,
     batch_size: int = DEFAULT_BATCH_SIZE,
     stop_event=None,
+    # Per-run override for PLANT_BATCH_MAJORITY, the "stop criteria
+    # threshold" exposed in the Run-page UI. Expressed as a percent
+    # (0-100) of the batch that must score above PLANT_MIN_PROB for
+    # the search to keep going. None falls back to the module default
+    # (PLANT_BATCH_MAJORITY = 30%).
+    stop_criteria_pct: float | None = None,
 ) -> RunResult:
     """Run a smart-search on Immich for `query`, embed + predict any assets
     not yet cached, recompute clusters, run YOLO-World on uncached images,
@@ -1262,9 +1292,18 @@ def run_pipeline(
 
     reset_state()
     set_state(query=query, n_requested=n_samples)
+    # Resolve the per-run stop-criteria override (None → module default
+    # PLANT_BATCH_MAJORITY). Stored as a fraction internally so the
+    # boundary check stays a straight comparison against `majority`.
+    _stop_criteria = (
+        float(stop_criteria_pct) / 100.0
+        if stop_criteria_pct is not None
+        else PLANT_BATCH_MAJORITY
+    )
     _log.info(
         f"[run] starting  query={query!r}  n_requested={n_samples}  "
-        f"rank={rank_name}  top_k={top_k}  batch_size={batch_size}"
+        f"rank={rank_name}  top_k={top_k}  batch_size={batch_size}  "
+        f"stop_criteria={_stop_criteria * 100:.0f}%"
     )
     # Search's "chunk_total" is the photo target, not a batch count
     # — the search loop calls set_chunk_progress(len(accepted),
@@ -1321,6 +1360,7 @@ def run_pipeline(
                 api_key=api_key,
                 thumb_dir=thumb_dir,
                 decision_batch_size=decision_batch_size,
+                stop_criterion=_stop_criteria,
                 stop_event=stop_event,
             )
             _stage_end("search")

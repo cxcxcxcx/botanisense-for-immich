@@ -16,6 +16,7 @@ import type {
   KnnBuildArgs,
   KnnBuildJobSnapshot,
   KnnBuildLogsResponse,
+  KnnRow,
   KnnStatus,
   PipelineStatus,
   PlantsAlbumStatus,
@@ -91,10 +92,10 @@ export const refreshPipeline = () =>
 
 // ---- KNN reclassify ------------------------------------------------------
 
-export const reclassify = (asset_ids: string[], k?: number) =>
-  fetchJson<{ stats: Record<string, unknown>; results: unknown[] }>(
+export const reclassify = (asset_ids: string[], k?: number, force?: boolean) =>
+  fetchJson<{ stats: Record<string, unknown>; results: Record<string, KnnRow> }>(
     '/api/reclassify',
-    { method: 'POST', body: { asset_ids, k } },
+    { method: 'POST', body: { asset_ids, k, force } },
   );
 
 export const reclassifyVisible = (asset_ids?: string[]) =>

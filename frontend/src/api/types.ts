@@ -57,6 +57,14 @@ export interface KnnNeighbor {
   species: string;
   common_name: string | null;
   sim: number;
+  // TreeOfLife-200M record id for this reference occurrence.
+  uuid?: string | null;
+  // Source image URL of the reference photo. Present for gbif + eol
+  // rows (~99.9% of the index), null for bioscan. Render it through
+  // refThumbUrl() — never hotlink (leaks the user's IP, and many
+  // hosts send no CORS headers).
+  identifier?: string | null;
+  source_dataset?: string | null;
 }
 
 export interface KnnRow {
@@ -216,6 +224,11 @@ export interface KnnStatus {
   k_default: number;
   cached_assets: number;
   cached_versions?: { index_version: string; k: number; n: number }[];
+  // Result of knn.validate_index() at load time. false = the stored
+  // vectors aren't L2-normalized, so neighbours are unreliable and the
+  // index needs rebuilding. null = not loaded / probe inconclusive.
+  healthy?: boolean | null;
+  health_reason?: string;
 }
 
 // Build-KNN flow. POST /api/knn/build spawns a thread that imports
@@ -387,7 +400,13 @@ export interface ResultsQuery {
   family?: string | undefined;
   has_person?: 0 | 1 | undefined;
   plantae?: 'plant' | 'non_plant' | 'uncertain' | undefined;
-  [k: string]: string | number | undefined;
+  // Manual opt-in to surface non-plant photos in the unfiltered
+  // all-photo view. Default false (server-side). When true the grid
+  // returns every photo regardless of Plantae score; when false the
+  // grid scopes to Plantae >= plantae_yellow (same boundary as the
+  // HDBSCAN cluster policy).
+  include_non_plants?: boolean | undefined;
+  [k: string]: string | number | boolean | undefined;
 }
 
 export interface RunParams {
@@ -395,6 +414,11 @@ export interface RunParams {
   n_samples?: number | null;
   top_k?: number | null;
   batch_size?: number | null;
+  // Stop-criteria threshold expressed as a percent (0-100) of a batch
+  // that must look like plants-or-fungi for the search to keep going.
+  // Lower = stricter (the search stops sooner, gathering fewer photos).
+  // null/missing → server default (currently 30%).
+  stop_criteria_pct?: number | null;
 }
 
 // Sync-to-IMMICH defaults — persisted on the server (album_meta
