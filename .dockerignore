@@ -1,0 +1,49 @@
+# Keep the build context small and secrets out of the image. The
+# runtime stage only COPYs specific .py files + frontend/dist, but the
+# context itself is shipped to the daemon — data/ (thumbs + SQLite) and
+# weights/ can be many GB.
+
+# VCS / tooling
+.git
+.gitignore
+.claude
+.github
+.pytest_cache
+.ruff_cache
+.vscode
+.idea
+
+# Runtime data — never bake the developer's DB/thumbnails into an image
+data/
+weights/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Secrets / machine-specific config — env vars only, via compose
+.env
+.env.*
+config.toml
+
+# Python env / caches
+.venv
+**/__pycache__
+**/*.pyc
+
+# Frontend build inputs are rebuilt in-stage from source
+frontend/node_modules
+frontend/dist
+frontend/tsconfig.tsbuildinfo
+frontend/coverage
+
+# Not part of the runtime image
+docs/
+scripts/
+static/
+tests/
+Dockerfile
+compose.yml
+.dockerignore
+uv.lock
+yolov8s-world.pt
