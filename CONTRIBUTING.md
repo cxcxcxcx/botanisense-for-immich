@@ -30,9 +30,10 @@ uv run pytest tests/ -x
 cd frontend && npm run typecheck && npm run build
 ```
 
-Tests live in `tests/`; the four existing files cover the search-loop
-bulk-read boundary, the sync-all junk-cluster filter, and bulk-remove
-behaviour. New features should ship with at least one regression test.
+Tests live in `tests/` (FastAPI `TestClient` + storage-level
+regression tests). `uv run pytest tests/ -x` is what CI runs; the dev
+dependency group provides pytest. New features should ship with at
+least one regression test.
 
 ## Commit messages
 
