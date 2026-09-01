@@ -45,6 +45,7 @@ Public surface (used by pipeline.py / app.py):
 from __future__ import annotations
 
 import logging
+import os
 import pickle
 import sqlite3
 from typing import Iterable
@@ -64,17 +65,29 @@ if not _log.handlers:
     _log.setLevel(logging.INFO)
     _log.propagate = False
 
+# Plantae kingdom score floor for cluster inclusion. Assets with
+# Plantae score < CLUSTER_PLANTAE_MIN are excluded from the HDBSCAN fit
+# (the "cluster computation" itself) AND any existing cluster_id on
+# them is cleared on each refit, so the cluster view only shows plant
+# images. Matches the existing `plantae_yellow` floor (the boundary
+# between the "uncertain" and "non_plant" tiers in the UI), so the
+# cutoff aligns with what the rest of the app treats as a plant.
+# Override via CLUSTER_PLANTAE_MIN_SCORE env var without code changes.
+CLUSTER_PLANTAE_MIN = float(os.environ.get("CLUSTER_PLANTAE_MIN_SCORE", "0.35"))
+
 
 def get_min_cluster_size(n: int) -> int:
     """Pick min_cluster_size as a small fraction of N, with sensible bounds.
 
-    For small N (< 10) we fall back to k-means style behaviour (each point
-    its own cluster) by forcing min_cluster_size = 2 — HDBSCAN still gives
-    meaningful groupings, but if it can't, returns all-noise which we
-    surface as a single cluster_id = 0 group via the caller's fallback.
+    For small N (1–9) we force min_cluster_size = 2 — HDBSCAN requires
+    min_cluster_size >= 2 (it would otherwise raise on the `> 1` check
+    inside HDBSCAN itself), and a small floor still lets the algorithm
+    collapse to all-noise which the caller's remap surface catches. For
+    larger N, `n // 6` clamped to [2, 5] gives a small fraction that
+    scales without exploding on corpus growth.
     """
     if n <= 1:
-        return 1
+        return 2
     return max(2, min(5, max(2, n // 6)))
 
 
@@ -153,6 +166,11 @@ def should_refit(
     """Return True when the corpus has grown enough since the last fit
     to warrant a full refit (default: 10%). Always True on a fresh DB
     (no clusterer_state row) so the first refit happens unconditionally.
+
+    Counts are scoped to plant assets (Plantae score >= CLUSTER_PLANTAE_MIN)
+    because that's the population HDBSCAN actually fits — counting
+    every embedding would over-trigger refits as new non-plant photos
+    flow in without affecting the cluster topology.
     """
     state = storage.get_clusterer_state(conn)
     if state is None:
@@ -160,10 +178,22 @@ def should_refit(
     n_at_fit = state["n_assets_at_fit"]
     if n_at_fit <= 0:
         return True
-    # "Current N" = number of distinct embedded assets. We don't want to
-    # force a refit just because someone re-uploaded the same image.
+    # "Current N" = number of plant assets with an embedding right now.
+    # We don't want to force a refit just because someone re-uploaded the
+    # same image, OR because non-plant photos were added since the last
+    # fit (they don't change the cluster topology).
+    plant_ids = storage.plantae_asset_ids(conn, min_score=CLUSTER_PLANTAE_MIN)
+    if not plant_ids:
+        # No plant assets at all — the clusterer has nothing to do, no
+        # point refitting. Caller will short-circuit anyway.
+        return False
+    plant_params = list(plant_ids)
+    placeholders = ",".join("?" for _ in plant_params)
     row = conn.execute(
-        "SELECT COUNT(DISTINCT asset_id) AS n FROM embeddings"
+        f"SELECT COUNT(DISTINCT e.asset_id) AS n "
+        f"FROM embeddings e "
+        f"WHERE e.asset_id IN ({placeholders})",
+        plant_params,
     ).fetchone()
     n_current = int(row["n"]) if row else 0
     growth = (n_current - n_at_fit) / n_at_fit
@@ -182,11 +212,13 @@ def assign_new_points(
     """Assign cluster labels to new points using the persisted clusterer.
 
     Returns None when no clusterer is persisted yet (caller should refit
-    first). Otherwise returns {asset_id: stable_cluster_id} for every
-    new_asset_id. New clusters are NOT discovered here — approximate_predict
-    only emits labels from the training set, so a genuinely-novel group of
-    new photos will be marked noise (-1) until the next full refit
-    promotes them.
+    first). Otherwise returns {asset_id: stable_cluster_id} for the
+    PLANT subset of new_asset_ids — assets with Plantae score <
+    CLUSTER_PLANTAE_MIN are silently dropped (they keep cluster_id =
+    NULL so they don't pollute the cluster view). New clusters are NOT
+    discovered here — approximate_predict only emits labels from the
+    training set, so a genuinely-novel group of new photos will be
+    marked noise (-1) until the next full refit promotes them.
 
     `new_vectors` must be (N, EMB_DIM) float32, L2-normalized, aligned
     with `new_asset_ids`. Caller is responsible for normalization
@@ -210,9 +242,33 @@ def assign_new_points(
         )
         return None
 
-    raw_labels, _strengths = approximate_predict(clusterer, new_vectors)
+    # Plant-only filter: load every plant asset_id once, then slice
+    # `new_asset_ids` and `new_vectors` together so approximate_predict
+    # sees only embeddings that were part of the (plant-only) training
+    # population. Doing the filter here keeps the caller's contract
+    # unchanged — they still hand us every newly-embedded asset — but
+    # ensures non-plants never appear in the returned mapping.
+    plant_ids = storage.plantae_asset_ids(conn, min_score=CLUSTER_PLANTAE_MIN)
+    if not plant_ids:
+        # No plant assets in the DB at all — the persisted clusterer
+        # was fit against plants so it has no useful mapping for the
+        # incoming points either. Bail with an empty mapping; callers
+        # typically treat empty as "nothing to persist".
+        return {}
+    keep_idx = [i for i, aid in enumerate(new_asset_ids) if aid in plant_ids]
+    if not keep_idx:
+        return {}
+    if len(keep_idx) == len(new_asset_ids):
+        # Fast path: every new asset is a plant, no filtering needed.
+        ids_for_predict = new_asset_ids
+        vecs_for_predict = new_vectors
+    else:
+        ids_for_predict = [new_asset_ids[i] for i in keep_idx]
+        vecs_for_predict = new_vectors[keep_idx]
+
+    raw_labels, _strengths = approximate_predict(clusterer, vecs_for_predict)
     out: dict[str, int] = {}
-    for aid, raw in zip(new_asset_ids, raw_labels):
+    for aid, raw in zip(ids_for_predict, raw_labels):
         raw_int = int(raw)
         # If approximate_predict emits a raw label we don't recognize
         # (shouldn't happen — it's bounded by the training set), fall
@@ -234,9 +290,18 @@ def refit_with_remap(
       (final_asset_to_cluster, n_real_clusters, remap_new_to_stable)
       where `remap_new_to_stable[raw_hdbscan_label] = stable_cluster_id`.
 
+    Plant-only scoping: every embedding, the Hungarian snapshot, and
+    the final cluster_id write are restricted to assets with Plantae
+    score >= CLUSTER_PLANTAE_MIN. Non-plant assets that previously had
+    a cluster_id have it cleared at the end of each refit so the
+    cluster view only shows plant images.
+
     Steps:
-      1. Snapshot the current asset->cluster mapping from the DB.
-      2. Load every embedding and run HDBSCAN.
+      0. Load the set of plant asset_ids (Plantae score >=
+         CLUSTER_PLANTAE_MIN).
+      1. Snapshot the current asset->cluster mapping from the DB,
+         restricted to plants.
+      2. Load every embedding, filter to plants, and run HDBSCAN.
       3. Build a membership-overlap matrix between OLD clusters (rows)
          and NEW clusters (columns); -1 is included in both if present.
       4. `scipy.optimize.linear_sum_assignment(-M)` to maximize overlap.
@@ -245,9 +310,11 @@ def refit_with_remap(
          new clusters get fresh dense IDs starting at max(old) + 1.
          Noise is forced to the highest ID (existing convention).
       6. Persist the new mapping via storage.set_cluster_ids.
-      7. Save the clusterer + label_map via save_clusterer.
-      8. Append audit rows to cluster_remap.
-      9. Invalidate cluster_names so the next /api/clusters call
+      7. Clear cluster_id on every asset NOT in final_mapping — drops
+         any stale cluster_id that was lingering on non-plant assets.
+      8. Save the clusterer + label_map via save_clusterer.
+      9. Append audit rows to cluster_remap.
+     10. Invalidate cluster_names so the next /api/clusters call
          recomputes labels for any newly-renumbered clusters.
 
     `growth_threshold_pct` is currently unused inside this function but
@@ -256,20 +323,37 @@ def refit_with_remap(
     """
     del growth_threshold_pct  # API symmetry; see docstring.
 
-    ids, matrix = storage.all_embeddings(conn)
-    if matrix.size == 0:
+    # Step 0: load plant asset_ids once. Empty set → no plants fit the
+    # criteria, nothing to cluster; clear state + cluster_ids and bail.
+    plant_ids = storage.plantae_asset_ids(conn, min_score=CLUSTER_PLANTAE_MIN)
+
+    ids_all, matrix_all = storage.all_embeddings(conn)
+    if matrix_all.size == 0 or not plant_ids:
+        # No embeddings, OR no plant assets at all. Wipe clusterer state
+        # and any lingering cluster_ids so the cluster view starts
+        # clean, then return empty.
         storage.clear_clusterer_state(conn)
+        storage.clear_cluster_ids_for_non_plants(conn, keep_asset_ids=set())
         return {}, 0, {}
 
+    # Filter to plant embeddings only (vectorized boolean mask; set
+    # lookup is O(1) per row).
+    keep_mask = np.array(
+        [aid in plant_ids for aid in ids_all], dtype=bool
+    )
+    ids = [aid for aid, k in zip(ids_all, keep_mask) if k]
+    matrix = matrix_all[keep_mask]
     n = len(ids)
     mcs = get_min_cluster_size(n)
 
-    # Step 1: snapshot old mapping.
+    # Step 1: snapshot old mapping (plants only — non-plants should
+    # never have carried a cluster_id under the new policy, but we
+    # filter defensively in case a stale row slipped through).
     old_assets = storage.all_assets(conn)
     old_mapping: dict[str, int] = {
         r["asset_id"]: int(r["cluster_id"])
         for r in old_assets
-        if r["cluster_id"] is not None
+        if r["cluster_id"] is not None and r["asset_id"] in plant_ids
     }
     old_clusters: dict[int, set[str]] = {}
     for aid, cid in old_mapping.items():
@@ -442,10 +526,21 @@ def refit_with_remap(
         {v for v in final_mapping.values() if v != remap.get(-1, -1)}
     )
 
-    # Persist mapping.
+    # Persist mapping (plants only — every asset in final_mapping IS a
+    # plant, so the set_cluster_ids UPSERT leaves non-plant assets
+    # untouched at this point).
     storage.set_cluster_ids(conn, asset_to_cluster=final_mapping)
 
-    # Step 7: save clusterer + label_map.
+    # Step 7: clear cluster_id on every asset NOT in final_mapping.
+    # This drops cluster_id on any non-plant asset (and on any plant
+    # asset that HDBSCAN emitted as "noise" / unassigned — keep_asset_ids
+    # excludes those, so the assignment also gets wiped for noise-only
+    # plant assets). Cheap (one indexed UPDATE).
+    cleared = storage.clear_cluster_ids_for_non_plants(
+        conn, keep_asset_ids=set(final_mapping.keys()),
+    )
+
+    # Step 8: save clusterer + label_map.
     save_clusterer(
         conn,
         clusterer,
@@ -455,18 +550,20 @@ def refit_with_remap(
         label_map=remap,
     )
 
-    # Step 8: audit trail.
+    # Step 9: audit trail.
     storage.insert_cluster_remap(conn, audit_rows)
 
-    # Step 9: invalidate cached cluster names — the asset->cluster
+    # Step 10: invalidate cached cluster names — the asset->cluster
     # mapping shifted (even if some IDs survived, the membership inside
     # any cluster may have changed).
     storage.invalidate_cluster_names(conn)
 
     _log.info(
-        f"[clusters] refit  n={n}  n_clusters={n_real_clusters}  "
-        f"matched={len(matched_new_ids)}  new={n_new - len(matched_new_ids)}  "
-        f"gone={len(old_clusters) - len(matched_old_ids)}"
+        f"[clusters] refit  n_plants={n}/{len(ids_all)}  "
+        f"n_clusters={n_real_clusters}  matched={len(matched_new_ids)}  "
+        f"new={n_new - len(matched_new_ids)}  "
+        f"gone={len(old_clusters) - len(matched_old_ids)}  "
+        f"cleared={cleared}"
     )
 
     return final_mapping, n_real_clusters, remap
