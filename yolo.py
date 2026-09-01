@@ -63,7 +63,7 @@ _MODEL = None
 
 
 def get_model():
-    """Lazy singleton. First call downloads yolov8s-world.pt (~338 MB)."""
+    """Lazy singleton. First call downloads yolov8s-world.pt (~27 MB)."""
     global _MODEL
     if _MODEL is None:
         with _LOCK:

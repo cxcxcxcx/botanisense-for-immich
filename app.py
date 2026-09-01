@@ -1870,9 +1870,9 @@ async def knn_status() -> dict:
 # ---- Build KNN index (FAISS) -------------------------------------------
 # Wraps `python -m knn --parquet-glob ... --tag ...` as a long-running
 # background job with a tail-the-log endpoint so the UI can show
-# progress without spawning a subprocess. Importing knn.build_faiss_index
-# directly (instead of subprocess'ing `python -m knn`) saves ~1s of
-# interpreter startup and lets us reuse the in-process FAISS installation.
+# progress. The build runs in a real subprocess (see start_knn_build):
+# a runaway build must not take uvicorn down with it, and the same CLI
+# entry path is what the terminal workflow has always exercised.
 
 class KnnBuildArgs(BaseModel):
     parquet_glob: str

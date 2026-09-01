@@ -45,6 +45,20 @@ Out of scope:
 Only the latest commit on `main` receives security fixes. Until v1.0,
 there are no backports.
 
+## Deployment posture (read before exposing this app)
+
+- **There is no authentication.** Anyone who can reach the port can
+  trigger pipeline runs, KNN builds, and Immich album writes/deletes.
+  This is designed for a trusted LAN; put auth in front (reverse-proxy
+  basic-auth at minimum) before any wider exposure. See README →
+  "Known limits".
+- **YOLO-World checkpoint loading disables torch's `weights_only`
+  safe-load** (`yolo.py` sets `TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1`),
+  because the ultralytics checkpoint needs full unpickling. This is an
+  accepted risk: it widens what a tampered checkpoint file could do.
+  The weights come from the official ultralytics release over HTTPS,
+  and `yolov8s-world.pt` is never committed to this repo.
+
 ## Configuration
 
 The app loads `config.toml` (gitignored) for non-secret settings and

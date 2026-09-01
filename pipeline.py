@@ -1,8 +1,10 @@
 """Shared pipeline: Immich smart-search → BioCLIP embed+predict →
 DB → k-means cluster → YOLO-World detect.
 
-Memory note: BioCLIP-2 (~340 MB weights) and YOLOv8s-world (~340 MB weights)
-are both resident during the first run on uncached assets. To keep peak RAM
+Memory note: BioCLIP-2 (~4.3 GB of artifacts: weights + species label
+table) and YOLOv8s-world (~27 MB) are both resident during the first run
+on uncached assets; peak RSS ~6 GB in the pipeline child — see
+docs/BIOCLIP_MEMORY.md. To keep peak RAM
 manageable on small machines, all heavy passes happen in chunks of
 `batch_size` images. PIL decodes, embeddings, predictions, and detections
 are flushed back to SQLite between chunks so we never hold the full

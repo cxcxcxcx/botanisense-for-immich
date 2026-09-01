@@ -13,8 +13,6 @@ losing accuracy.
 
 ## 1. The layered cost (measured, fresh subprocess)
 
-Reproduction: `./.venv/bin/python /tmp/bench_memory_breakdown.py`
-
 | Step                                            | Δ RSS   | Cumulative |
 | ----------------------------------------------- | ------: | ---------: |
 | `python` start                                  |          |     14 MB  |
@@ -76,8 +74,6 @@ on for production.
 ---
 
 ## 3. Unload is real and almost free
-
-Reproduction: `./.venv/bin/python /tmp/bench_unload.py`
 
 | Step                                  | RSS after  | Δ         |
 | ------------------------------------- | ---------: | --------: |
@@ -227,17 +223,12 @@ everything).
 
 ## 6. Repro scripts
 
-All three are checked into `/tmp/` (not the repo) for one-off use:
-
-- `/tmp/bench_memory_breakdown.py` — layered RSS measurement, prints a
-  table at the end.
-- `/tmp/bench_compile.py` — plain vs `torch.compile` comparison; showed
-  compile is a no-op on CPU for this workload (~1% diff, within noise).
-- `/tmp/bench_unload.py` — unload + reload probe, confirms 4.5 GB freeable
-  in one line and ~14 s reload cost.
-
-If we decide to keep these, move them to `scripts/bench_bioclip_memory.py`
-et al. so they live with the rest of the bench scripts.
+The measurements above were taken with one-off benchmark scripts
+(layered RSS breakdown, `torch.compile` A/B, unload/reload probe) that
+lived in `/tmp` and were never committed — don't chase them. The
+numbers to remember: peak RSS ~5.85 GB for species-rank predict,
+`torch.compile` is a no-op on CPU for this workload, and unloading the
+classifier frees ~4.5 GB at ~14 s reload cost.
 
 ---
 

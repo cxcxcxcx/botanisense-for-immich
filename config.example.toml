@@ -23,9 +23,15 @@ base_url = "http://192.168.1.10:2283"
 # a tracked-file format is intentional.
 
 [knn]
-# Optional. Directory containing tol200m_bioclip2.faiss + labels.parquet
-# + INDEX_VERSION.txt. Leave empty to disable the KNN reclassification
-# feature entirely.
+# Optional. Directory holding a FAISS index over BioCLIP-2 embeddings.
+# Easiest: download the official imageomics index (~20 GB) with
+#   uv run scripts/download_knn_index.py --out knn-index
+# which creates knn-index/faiss/index.index + knn-index/duckdb/metadata.duckdb.
+# Or build your own (`python -m knn --help`) producing
+#   tol200m_bioclip2.faiss + labels.parquet + INDEX_VERSION.txt.
+# Use an ABSOLUTE path (relative paths resolve against the server's
+# working directory — inside Docker that's /app). Leave empty to
+# disable KNN reclassification entirely.
 inventory_dir = ""
 
 [cors]
