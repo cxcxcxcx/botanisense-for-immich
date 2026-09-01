@@ -1004,10 +1004,20 @@ app = FastAPI(title="BotaniSense for Immich", lifespan=lifespan)
 # Default: allow any origin. This is fine for a single-user LAN app
 # (the server isn't reachable from the public internet by default),
 # but it's the wrong default for a hardened deployment. To narrow,
-# set `[cors].origins` in config.toml — the env-var override still
-# wins. Allow_credentials stays False, so we can safely use "*"
+# set CORS_ORIGINS (comma-separated, e.g. "https://a.example.com,
+# https://b.example.com") or `[cors].origins` in config.toml; the env
+# var wins, matching the precedence used everywhere else. An empty
+# value means same-origin only — stricter, and distinct from leaving
+# both unset. Allow_credentials stays False, so we can safely use "*"
 # (browsers reject wildcard + credentials; we don't use cookies).
-_cors_origins = _cfg.get("cors", {}).get("origins", None)
+_cors_origins = None
+_cors_env = os.environ.get("CORS_ORIGINS")
+if _cors_env is not None:
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_toml = _cfg.get("cors", {}).get("origins", None)
+    if _cors_toml is not None:
+        _cors_origins = list(_cors_toml)
 if _cors_origins is None:
     _cors_origins = ["*"]
 app.add_middleware(
@@ -1279,13 +1289,16 @@ async def health() -> dict:
 async def public_config() -> dict:
     """Non-secret runtime config surfaced to the SPA.
 
-    Used by AssetDetail to render the "Open in Immich" button — we
-    assume the Immich web UI is on the same host as the API (default
-    deployment). If a user runs the SPA against an Immich instance
-    proxied at a different URL, this endpoint can be expanded to
-    accept an `IMMICH_PUBLIC_URL` override.
+    Used by AssetDetail to render the "Open in Immich" button. The
+    URL is IMMICH_PUBLIC_URL when set, else IMMICH_BASE_URL — the
+    override matters when the server reaches Immich over a hostname
+    the browser can't resolve (e.g. both in one docker-compose
+    network: the server says http://immich:2283, the browser needs
+    http://<lan-host>:2283).
     """
-    return {"immich_public_url": BASE_URL}
+    return {
+        "immich_public_url": os.environ.get("IMMICH_PUBLIC_URL") or BASE_URL
+    }
 
 
 @app.get("/api/logs")
@@ -2253,8 +2266,10 @@ async def start_knn_build(args: KnnBuildArgs) -> dict:
     # Use `python -m knn` rather than importing the module — same as
     # the CLI entry path that has been smoke-tested many times. Avoids
     # the import-after-fork gotchas that multiprocessing.Process hit.
+    # sys.executable (not a hardcoded ./.venv path) so this works from
+    # any install layout, including the Docker image.
     cmd = [
-        "./.venv/bin/python", "-u", "-m", "knn",
+        sys.executable, "-u", "-m", "knn",
         "--parquet-glob", args.parquet_glob,
         "--index-dir", str(Path(args.index_dir or KNN_INVENTORY_DIR())),
         "--tag", args.tag,
@@ -4460,7 +4475,7 @@ async def start_person_backfill() -> dict:
     return {"job_id": job_id, "n_to_scan": n_to_scan, "noop": False, "already_running": False}
 
 
-@app.post("/api/person/backfill/stop")
+@app.post("/api/person/backfill/stop/{job_id}")
 async def stop_person_backfill(job_id: str) -> dict:
     """Ask a running backfill to unwind at the next batch boundary.
     The child process checks the stop Event we share with it; the

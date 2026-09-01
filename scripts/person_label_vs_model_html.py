@@ -1,7 +1,8 @@
 """Generate an HTML page of model-vs-label disagreements for review.
 
-Renders to static/disagreements.html, served at
-  http://<host>:<port>/static/disagreements.html
+Renders to frontend/dist/disagreements.html. Open the file directly,
+or serve frontend/dist/ (the built SPA dir) and open
+  http://<host>:<port>/disagreements.html
 
 Shows every labeled photo as a card with:
   - thumb image
