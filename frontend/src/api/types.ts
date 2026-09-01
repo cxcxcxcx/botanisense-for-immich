@@ -376,7 +376,7 @@ export interface PurgeMissingResult {
   sample?: PurgeMissingSample[];
 }
 
-export interface PlantsAlbumStatus {
+export interface KingdomAlbumStatus {
   exists: boolean;
   kingdom?: string;
   album_id?: string;
@@ -467,7 +467,6 @@ export interface BulkClusterRemoveResponse {
 // 1Hz, BackfillExifModal 1Hz).
 export interface EventSnapshot {
   pipeline: PipelineStatus;
-  plants_jobs: Record<string, JobSnapshot>;
   cluster_album_jobs: Record<string, JobSnapshot>;
   kingdom_jobs: Record<string, JobSnapshot>;
   clustering_jobs: Record<string, JobSnapshot>;

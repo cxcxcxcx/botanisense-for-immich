@@ -18,8 +18,8 @@ import type {
   KnnBuildLogsResponse,
   KnnRow,
   KnnStatus,
+  KingdomAlbumStatus,
   PipelineStatus,
-  PlantsAlbumStatus,
   PurgeMissingPreview,
   PurgeMissingResult,
   ResultsQuery,
@@ -58,11 +58,8 @@ export const getLogs      = (tail = 200) =>
 export const listClusterAlbums = () =>
   fetchJson<{ albums: ClusterAlbumMapping[] }>('/api/album/cluster');
 
-export const getPlantsAlbumStatus  = () =>
-  fetchJson<PlantsAlbumStatus>('/api/plants-album-status');
-
 export const getKingdomAlbumStatus = (kingdom: string) =>
-  fetchJson<PlantsAlbumStatus>('/api/kingdom-album-status', { query: { kingdom } });
+  fetchJson<KingdomAlbumStatus>('/api/kingdom-album-status', { query: { kingdom } });
 
 export const getClusteringStatus   = () =>
   fetchJson<{
@@ -125,17 +122,10 @@ export const reclassifyBbox = (params: { asset_id: string; detection_id: number 
     { method: 'POST', body: params },
   );
 
-// ---- Plants / Kingdom album jobs ----------------------------------------
-
-export const previewPlantsAlbum = (min_score?: number, people_filter?: 0 | 1 | null) =>
-  fetchJson<JobPreview>('/api/album/plants/preview', {
-    query: { min_score, people_filter: people_filter ?? undefined },
-  });
-
-export const startPlantsAlbum = (
-  p: { min_score?: number; force_recreate?: boolean; people_filter?: 0 | 1 | null },
-) =>
-  fetchJson<JobStart>('/api/album/plants', { method: 'POST', body: p });
+// ---- Kingdom album jobs --------------------------------------------------
+// One parameterized surface for "tag a kingdom as an album" (Plantae,
+// Fungi, ...). The old /api/album/plants endpoints were the
+// kingdom="Plantae" special case and were removed server-side.
 
 export const previewKingdomAlbum = (
   kingdom: string,

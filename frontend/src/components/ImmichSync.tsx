@@ -19,11 +19,9 @@ import {
   getSyncDefaults,
   putSyncDefaults,
   previewKingdomAlbum,
-  previewPlantsAlbum,
   listClusterAlbums,
   startSyncAllClusterAlbums,
   startKingdomAlbum,
-  startPlantsAlbum,
   removeClusterAlbums,
 } from '../api/endpoints';
 import type { SyncDefaults } from '../api/types';
@@ -125,10 +123,11 @@ function emptySlot(): ActionSlot {
 // poll loop.
 type ActionKey = 'sync-all' | 'plantae' | 'fungi' | 'remove';
 
-function registryFor(action: ActionKey): 'cluster_album_jobs' | 'kingdom_jobs' | 'plants_jobs' | null {
+function registryFor(action: ActionKey): 'cluster_album_jobs' | 'kingdom_jobs' | null {
   if (action === 'sync-all') return 'cluster_album_jobs';
-  if (action === 'fungi') return 'kingdom_jobs';
-  if (action === 'plantae') return 'plants_jobs';
+  // Plantae and Fungi both run through the kingdom job registry; the
+  // old dedicated plants registry was removed in the merge.
+  if (action === 'plantae' || action === 'fungi') return 'kingdom_jobs';
   return null; // remove is synchronous, no stream
 }
 
@@ -372,7 +371,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         const r = await previewSyncAllClusters(pf);
         n = r.n_assets;
       } else if (action === 'plantae') {
-        const r = await previewPlantsAlbum(score, pf);
+        const r = await previewKingdomAlbum('Plantae', score, pf);
         n = r.n_assets;
       } else if (action === 'fungi') {
         const r = await previewKingdomAlbum('Fungi', score, pf);
@@ -423,7 +422,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         }}));
         push({ kind: 'info', message: `Syncing all clusters (${(r.n_assets ?? 0).toLocaleString()} photos)` }, 2500);
       } else if (action === 'plantae') {
-        const r = await startPlantsAlbum({
+        const r = await startKingdomAlbum('Plantae', {
           min_score: overrideScore,
           force_recreate: overrideForce,
           people_filter: overridePeople,

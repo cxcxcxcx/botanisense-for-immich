@@ -1,14 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import {
   pollPersonBackfillJob,
-  previewPlantsAlbum,
   previewKingdomAlbum,
   previewClusterAlbum,
   previewPersonBackfill,
   previewPurgeMissing,
   purgeMissing,
   startPersonBackfill,
-  startPlantsAlbum,
   startKingdomAlbum,
   startClusterAlbumSync,
   startSyncAllClusterAlbums,
@@ -72,9 +70,9 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       doneSubject: () => 'photos added to Plantae album',
       hasPreview: true,
       hasAlbumLink: true,
-      registryKey: 'plants_jobs',
-      preview: () => previewPlantsAlbum(),
-      start: () => startPlantsAlbum({}),
+      registryKey: 'kingdom_jobs',
+      preview: () => previewKingdomAlbum('Plantae'),
+      start: () => startKingdomAlbum('Plantae', {}),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
     },
     fungi: {
@@ -218,10 +216,10 @@ export function JobPanel() {
     sseRegistryKey && job.kind !== 'idle' && job.jobId ? job.jobId : null;
   // useJobStream always opens the EventSource (it's a hook, can't be
   // conditional), but returns null until both key + jobId are set.
-  // We pass 'plants_jobs' as a dummy fallback that will never match
+  // We pass 'kingdom_jobs' as a dummy fallback that will never match
   // since jobId is null in that case.
   const { job: streamJob } = useJobStream<JobSnapshot>(
-    sseRegistryKey ?? 'plants_jobs',
+    sseRegistryKey ?? 'kingdom_jobs',
     sseJobId,
   );
 

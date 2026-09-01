@@ -1319,7 +1319,6 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
 # Payload shape (one JSON object per `data:` line):
 #   {
 #     "pipeline":           {status, stage, chunk_idx, ...},   # pipeline.get_state()
-#     "plants_jobs":        {job_id: {...}, ...},
 #     "cluster_album_jobs": {job_id: {...}, ...},
 #     "kingdom_jobs":       {job_id: {...}, ...},
 #     "clustering_jobs":    {job_id: {...}, ...},
@@ -1380,7 +1379,6 @@ def _build_event_snapshot() -> dict:
         pipeline_state = last if last is not None else get_state()
     return {
         "pipeline": pipeline_state,
-        "plants_jobs": _snapshot_jobs(_plants_jobs, _plants_jobs_lock),
         "cluster_album_jobs": _snapshot_jobs(
             _cluster_album_jobs, _cluster_album_jobs_lock
         ),
@@ -1787,301 +1785,13 @@ async def asset_detail(asset_id: str) -> dict:
     return body
 
 
-# ---- Plants album management --------------------------------------------
-# One-click "tag all my Plantae-classified photos" — finds every asset
-# with a Plantae kingdom score ≥ the user-requested threshold (default:
-# the green-leg threshold from the UI), then bulk-adds them to an Immich
-# album. The album id is persisted in `album_meta` so re-clicks reuse
-# the existing album instead of creating a duplicate.
-#
-# The bulk-add can take 10s-60s for large libraries, so the work runs in
-# a background thread and the UI polls /api/album/plants/job/{id} to
-# show a live progress bar. This is the same pattern the main pipeline
-# uses (see pipeline._state + /api/status), just lighter-weight.
-
-class PlantsAlbumParams(BaseModel):
-    min_score: float | None = None     # default → PLANTAE_GREEN at call site
-    force_recreate: bool = False       # set True to drop the saved id and create
-    # Membership filter for the Sync-to-IMMICH UX. None = any (default),
-    # 0 = without people (also matches unscanned), 1 = with people.
-    people_filter: int | None = None
-
-
-# In-memory job registry. Keyed by job_id (uuid4). The state dict is
-# mutated under _plants_jobs_lock; readers (the status endpoint) take
-# a copy so the response is consistent. Finished jobs are kept around
-# for _PLANTS_JOB_TTL_S so the UI can fetch a final "done" payload
-# after polling stops, then pruned on the next write.
-_plants_jobs_lock = threading.Lock()
-_plants_jobs: dict[str, dict] = {}
-_PLANTS_JOB_TTL_S = 300.0
-
-
-def _plants_job_prune_locked() -> None:
-    """Drop finished jobs older than _PLANTS_JOB_TTL_S. Caller holds lock."""
-    now = time.monotonic()
-    stale = [
-        jid for jid, j in _plants_jobs.items()
-        if j.get("finished_at") and (now - j["finished_at"]) > _PLANTS_JOB_TTL_S
-    ]
-    for jid in stale:
-        _plants_jobs.pop(jid, None)
-
-
+# NOTE: the old "/api/album/plants" endpoints were folded into the
+# kingdom surface below ("/api/album/kingdom*" with kingdom="Plantae")
+# — the plants worker was a strict subset of the kingdom worker. The
+# one-click Plantae button in the UI now calls the kingdom endpoints.
 def _immich_client() -> ImmichClient:
     return ImmichClient(base_url=BASE_URL, api_key=API_KEY, timeout=60.0)
 
-
-def _plants_album_worker(
-    job_id: str,
-    min_score: float,
-    force_recreate: bool,
-    people_filter: int | None = None,
-) -> None:
-    """Body of the background job. Reads asset_ids, opens the album (or
-    creates one), and chunked-PUTs the assets while updating `job`
-    progress in-place. Owns the ImmichClient lifecycle and persists the
-    final `album_meta` row at the end.
-
-    `people_filter` narrows the asset set BEFORE bulk-add (any /
-    without people / with people). Same semantics as the kingdom picker;
-    threaded through so the Sync-to-IMMICH section can scope Plantae
-    albums by membership without duplicating the album-create flow.
-    """
-    import time as _time
-    chunk_size = 1000
-    PLANTS_ALBUM_NAME = "Plantae (BioCLIP)"
-    try:
-        with storage.connect(DB_PATH) as conn:
-            asset_ids = storage.find_plantae_assets(
-                conn, min_score=min_score, people_filter=people_filter
-            )
-            saved = storage.get_album_meta(conn, "plants_album_id") or {}
-            saved_album_id = (
-                saved.get("album_id") if not force_recreate else None
-            )
-
-        with _plants_jobs_lock:
-            _plants_jobs[job_id]["n_assets"] = len(asset_ids)
-            _plants_jobs[job_id]["n_chunks"] = max(1, (len(asset_ids) + chunk_size - 1) // chunk_size)
-            _plants_jobs[job_id]["min_score"] = min_score
-            _plants_jobs[job_id]["people_filter"] = people_filter
-
-        client = _immich_client()
-        try:
-            reused = False
-            album_id = saved_album_id
-            if album_id:
-                try:
-                    client.get_album(album_id)
-                    reused = True
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code != 404:
-                        raise
-                    album_id = None  # saved id was stale, fall through to create
-
-            if not album_id:
-                # Try to find an existing album with our name before
-                # creating a new one. This handles the case where
-                # `album_meta` was deleted or never written (e.g. fresh
-                # DB on an Immich instance that already has the album)
-                # so we don't end up with two "Plantae (BioCLIP)" albums.
-                if not force_recreate:
-                    existing = client.find_album_by_name(PLANTS_ALBUM_NAME)
-                    if existing:
-                        album_id = existing["id"]
-                        reused = True
-                if not album_id:
-                    album = client.create_album(
-                        name=PLANTS_ALBUM_NAME,
-                        description=(
-                            f"Photos classified as Plantae by BioCLIP-2 "
-                            f"kingdom-rank (threshold ≥ {min_score:.2f})."
-                        ),
-                    )
-                    album_id = album["id"]
-                    reused = False
-
-            with _plants_jobs_lock:
-                _plants_jobs[job_id]["album_id"] = album_id
-                _plants_jobs[job_id]["reused_existing"] = reused
-                _plants_jobs[job_id]["album_url"] = f"{BASE_URL}/albums/{album_id}"
-
-            # Chunked bulk-add. PUT each chunk and bump chunks_done so
-            # the UI progress bar advances in real time. We sleep a
-            # hair (10ms) between chunks so the UI can paint a
-            # mid-tick update; without it, two chunks sometimes land
-            # in the same render frame on a fast link.
-            added_total = 0
-            t0 = _time.monotonic()
-            for start in range(0, len(asset_ids), chunk_size):
-                chunk = asset_ids[start:start + chunk_size]
-                client.add_assets_to_album(album_id=album_id, asset_ids=chunk)
-                added_total += len(chunk)
-                with _plants_jobs_lock:
-                    _plants_jobs[job_id]["n_added"] = added_total
-                    _plants_jobs[job_id]["chunks_done"] += 1
-                    _plants_jobs[job_id]["last_chunk_secs"] = _time.monotonic() - t0
-                _time.sleep(0.01)
-        finally:
-            client.close()
-
-        # Persist for idempotency. Use the existing created_at if
-        # we're reusing the same album, so a "Refresh" doesn't bump
-        # the timestamp the UI displays.
-        with storage.connect(DB_PATH) as conn:
-            storage.set_album_meta(
-                conn,
-                "plants_album_id",
-                {
-                    "album_id": album_id,
-                    "n_assets": len(asset_ids),
-                    "min_score": min_score,
-                    "created_at": (
-                        saved.get("created_at")
-                        if reused and saved.get("created_at")
-                        else None
-                    ) or datetime.now(timezone.utc).isoformat(),
-                },
-            )
-
-        with _plants_jobs_lock:
-            j = _plants_jobs[job_id]
-            j["status"] = "done"
-            j["finished_at"] = _time.monotonic()
-            j["n_added"] = added_total
-    except Exception as e:
-        with _plants_jobs_lock:
-            j = _plants_jobs.get(job_id)
-            if j is not None:
-                j["status"] = "error"
-                j["error"] = f"{type(e).__name__}: {e}"
-                j["finished_at"] = time.monotonic()
-
-
-@app.post("/api/album/plants")
-async def start_plants_album(params: PlantsAlbumParams) -> dict:
-    """Kick off a Plants-album job in a background thread and return
-    immediately with a `job_id`. The UI polls /api/album/plants/job/{id}
-    for live progress. Returns the asset count up front so the UI can
-    show a confirm dialog with the actual number of photos to tag.
-    """
-    min_score = params.min_score if params.min_score is not None else PLANTAE_GREEN
-    people_filter = params.people_filter
-    # Pre-count so the confirm dialog knows the size. Cheap (one SQL
-    # query); the worker re-runs it but we want a stable preview.
-    with storage.connect(DB_PATH) as conn:
-        preview_ids = storage.find_plantae_assets(
-            conn, min_score=min_score, people_filter=people_filter
-        )
-        saved = storage.get_album_meta(conn, "plants_album_id") or {}
-
-    job_id = uuid.uuid4().hex
-    with _plants_jobs_lock:
-        _plants_job_prune_locked()
-        _plants_jobs[job_id] = {
-            "status": "running",
-            "min_score": min_score,
-            "force_recreate": params.force_recreate,
-            "people_filter": people_filter,
-            "n_assets": len(preview_ids),
-            "n_chunks": max(1, (len(preview_ids) + 999) // 1000),
-            "chunks_done": 0,
-            "n_added": 0,
-            "album_id": saved.get("album_id") if not params.force_recreate else None,
-            "reused_existing": None,  # worker resolves
-            "album_url": None,
-            "started_at": time.monotonic(),
-            "finished_at": None,
-            "error": None,
-        }
-
-    t = threading.Thread(
-        target=_plants_album_worker,
-        args=(job_id, min_score, params.force_recreate, people_filter),
-        daemon=True,
-        name=f"plants-album-{job_id[:8]}",
-    )
-    t.start()
-
-    return {
-        "job_id": job_id,
-        "min_score": min_score,
-        "people_filter": people_filter,
-        "n_assets": len(preview_ids),
-        "n_chunks": max(1, (len(preview_ids) + 999) // 1000),
-        "reused_existing": None,  # resolved by worker
-        "saved_album_id": saved.get("album_id"),
-    }
-
-
-@app.get("/api/album/plants/preview")
-async def plants_album_preview(
-    min_score: float | None = None,
-    people_filter: int | None = None,
-) -> dict:
-    """Count-only preview for the Plants-album button. Lets the UI show
-    'Tag N photos' in its confirmation panel WITHOUT actually starting a
-    job (so the user can cancel without spawning a background thread).
-
-    `people_filter` (None / 0 / 1) narrows the count to the chosen
-    membership scope so the per-action confirm modal shows the real
-    number that the click will produce.
-    """
-    ms = min_score if min_score is not None else PLANTAE_GREEN
-    with storage.connect(DB_PATH) as conn:
-        ids = storage.find_plantae_assets(
-            conn, min_score=ms, people_filter=people_filter
-        )
-        saved = storage.get_album_meta(conn, "plants_album_id") or {}
-    chunk_size = 1000
-    return {
-        "min_score": ms,
-        "people_filter": people_filter,
-        "n_assets": len(ids),
-        "n_chunks": max(1, (len(ids) + chunk_size - 1) // chunk_size),
-        "saved_album_id": saved.get("album_id"),
-    }
-
-
-@app.get("/api/album/plants/job/{job_id}")
-async def plants_album_job_status(job_id: str) -> dict:
-    """Live progress for a Plants-album job. Returns the worker's
-    current snapshot; the UI polls this every ~400ms while running.
-    404 if the job id is unknown (or has aged out — TTL 5 min).
-    """
-    with _plants_jobs_lock:
-        j = _plants_jobs.get(job_id)
-        if j is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"plants album job {job_id} not found (or expired)",
-            )
-        # Snapshot so the response is consistent even if the worker
-        # mutates fields mid-serialize.
-        snap = dict(j)
-    snap.pop("finished_at", None)  # monotonic clock; not meaningful to clients
-    return snap
-
-
-@app.get("/api/plants-album-status")
-async def plants_album_status() -> dict:
-    """Returns the saved Plants-album id (if any), so the UI can paint a
-    "Last Plants album: <link> (N photos)" indicator on page load without
-    the user having to click the button first.
-    """
-    with storage.connect(DB_PATH) as conn:
-        saved = storage.get_album_meta(conn, "plants_album_id")
-    if not saved or not saved.get("album_id"):
-        return {"exists": False}
-    album_id = saved["album_id"]
-    return {
-        "exists": True,
-        "album_id": album_id,
-        "album_url": f"{BASE_URL}/albums/{album_id}",
-        "n_assets": int(saved.get("n_assets", 0)),
-        "min_score": float(saved.get("min_score", PLANTAE_GREEN)),
-    }
 
 
 @app.get("/api/refresh")
@@ -2473,14 +2183,15 @@ def run_knn_reclassify_sync(asset_ids: list[str], k: int, force: bool = False) -
 #    HDBSCAN refit + Hungarian remap in a background thread, so the UI
 #    doesn't block. Status endpoint reports last-refit time + growth %.
 #
-# 3. **Kingdom generalization.** The Plants-album feature is a special
-#    case of "tag a kingdom as an album" — we generalize it to any
-#    kingdom (Plantae, Fungi, Animalia, ...). /api/album/plants/* still
-#    works as a backward-compat alias for kingdom="Plantae".
+# 3. **Kingdom generalization.** "Tag a kingdom as an album" works for
+#    any kingdom (Plantae, Fungi, Animalia, ...). This used to be a
+#    separate /api/album/plants endpoint pair; the plants worker was a
+#    strict subset of the kingdom worker, so the two were merged and
+#    the Plantae button now calls the kingdom endpoints.
 #
 # Pattern: same `job_id` (uuid4 hex) + `_jobs_lock` + TTL prune machinery
-# as the existing Plants job. Different dict keys because the payloads
-# are different (cluster_id vs. kingdom vs. min_score).
+# across the job registries in this file. Different dict keys because
+# the payloads are different (cluster_id vs. kingdom vs. min_score).
 
 class ClusterAlbumSyncParams(BaseModel):
     force_recreate: bool = False
@@ -2502,7 +2213,7 @@ class ClusteringRefitParams(BaseModel):
     threshold_pct: float | None = None  # override env default for this run
 
 
-# In-memory job registries. Same TTL + prune contract as _plants_jobs.
+# In-memory job registries. Same TTL + prune contract throughout.
 _cluster_album_jobs_lock = threading.Lock()
 _cluster_album_jobs: dict[str, dict] = {}
 _CLUSTER_ALBUM_JOB_TTL_S = 300.0
@@ -2685,8 +2396,8 @@ async def start_cluster_album_sync(
     cluster_id: int, params: ClusterAlbumSyncParams
 ) -> dict:
     """Start a background job to create/reuse the Immich album for a
-    cluster and bulk-add its assets. Mirrors /api/album/plants but keyed
-    by cluster_id. Returns immediately with a `job_id`; the UI polls
+    cluster and bulk-add its assets. Same album reuse + chunked-add
+    flow as the kingdom worker, keyed by cluster_id. Returns immediately with a `job_id`; the UI polls
     /api/album/cluster/job/{job_id} for progress."""
     with storage.connect(DB_PATH) as conn:
         n = storage.count_assets_in_cluster(
@@ -3211,6 +2922,21 @@ async def list_cluster_albums() -> dict:
 # ---------- kingdom album worker + endpoints ----------------------------
 
 
+def _kingdom_album_meta(conn, kingdom: str) -> dict:
+    """Saved album meta for a kingdom, adopting the pre-merge legacy row.
+
+    Albums synced before the plants/kingdom merge were persisted under
+    album_meta key "plants_album_id"; the merged code stores under the
+    kingdom name ("Plantae"). On first read after upgrading, fall back
+    to the legacy row so an existing Plantae album is reused rather
+    than duplicated. Writes always go to the new key.
+    """
+    saved = storage.get_kingdom_album_meta(conn, kingdom)
+    if saved is None and kingdom == "Plantae":
+        saved = storage.get_album_meta(conn, "plants_album_id")
+    return saved or {}
+
+
 def _kingdom_album_worker(
     job_id: str,
     kingdom: str,
@@ -3237,7 +2963,7 @@ def _kingdom_album_worker(
                 min_score=min_score,
                 people_filter=people_filter,
             )
-            saved = storage.get_kingdom_album_meta(conn, kingdom) or {}
+            saved = _kingdom_album_meta(conn, kingdom)
             saved_album_id = (
                 saved.get("album_id") if not force_recreate else None
             )
@@ -3360,7 +3086,7 @@ async def kingdom_album_preview(
         n = storage.count_kingdom_assets(
             conn, kingdom=kingdom, min_score=ms, people_filter=people_filter
         )
-        saved = storage.get_kingdom_album_meta(conn, kingdom) or {}
+        saved = _kingdom_album_meta(conn, kingdom)
     return {
         "kingdom": kingdom,
         "min_score": ms,
@@ -3373,9 +3099,9 @@ async def kingdom_album_preview(
 
 @app.post("/api/album/kingdom")
 async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
-    """Start a kingdom-album job. Mirrors /api/album/plants but takes
-    kingdom + min_score as parameters so it works for Plantae, Fungi,
-    Animalia, etc. Returns a `job_id`; the UI polls
+    """Start a kingdom-album job. Takes kingdom + min_score as
+    parameters so it works for Plantae, Fungi, Animalia, etc. Returns
+    a `job_id`; the UI polls
     /api/album/kingdom/job/{job_id} for progress.
 
     Kingdom-specific default threshold mirrors the preview endpoint so
@@ -3395,7 +3121,7 @@ async def start_kingdom_album(params: KingdomAlbumParams) -> dict:
             min_score=min_score,
             people_filter=params.people_filter,
         )
-        saved = storage.get_kingdom_album_meta(conn, params.kingdom) or {}
+        saved = _kingdom_album_meta(conn, params.kingdom)
 
     job_id = uuid.uuid4().hex
     with _kingdom_jobs_lock:
@@ -3463,7 +3189,7 @@ async def kingdom_album_status(kingdom: str = Query(default="Plantae")) -> dict:
     but parameterized by kingdom so the same endpoint serves Plantae,
     Fungi, etc."""
     with storage.connect(DB_PATH) as conn:
-        saved = storage.get_kingdom_album_meta(conn, kingdom)
+        saved = _kingdom_album_meta(conn, kingdom)
     if not saved or not saved.get("album_id"):
         return {"exists": False, "kingdom": kingdom}
     return {
