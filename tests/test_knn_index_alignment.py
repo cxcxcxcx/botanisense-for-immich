@@ -32,7 +32,7 @@ DIM = 64
 def _write_index_and_labels(d: Path, n_index: int, n_labels: int):
     """Write a normalized flat index with n_index rows and a labels
     parquet with n_labels rows."""
-    import knn
+    import knn_io as knn
     rng = np.random.default_rng(1)
     m = rng.standard_normal((n_index, knn.EMB_DIM)).astype(np.float32)
     m /= np.linalg.norm(m, axis=1, keepdims=True)
@@ -46,7 +46,7 @@ def _write_index_and_labels(d: Path, n_index: int, n_labels: int):
 
 
 def test_aligned_index_passes(tmp_path):
-    import knn
+    import knn_io as knn
     _write_index_and_labels(tmp_path, 50, 50)
     _idx, _lbl, meta = knn._load_index(tmp_path)
     assert meta["health"]["ok"] is True, meta["health"]
@@ -55,7 +55,7 @@ def test_aligned_index_passes(tmp_path):
 
 def test_index_longer_than_labels_is_flagged(tmp_path):
     """The exact v1 failure: extra rows at the tail of the index."""
-    import knn
+    import knn_io as knn
     _write_index_and_labels(tmp_path, 60, 50)
     _idx, _lbl, meta = knn._load_index(tmp_path)
     assert meta["health"]["ok"] is False
@@ -67,7 +67,7 @@ def test_index_longer_than_labels_is_flagged(tmp_path):
 def test_labels_longer_than_index_is_flagged(tmp_path):
     """The other direction is equally wrong — it means rows were added to
     labels that never made it into the index."""
-    import knn
+    import knn_io as knn
     _write_index_and_labels(tmp_path, 50, 60)
     _idx, _lbl, meta = knn._load_index(tmp_path)
     assert meta["health"]["ok"] is False
@@ -76,7 +76,7 @@ def test_labels_longer_than_index_is_flagged(tmp_path):
 def test_alignment_failure_outranks_a_passing_norm_check(tmp_path):
     """A normalized index with misaligned labels must still fail. The
     norm probe alone would have said 'ok'."""
-    import knn
+    import knn_io as knn
     _write_index_and_labels(tmp_path, 60, 50)
     idx = faiss.read_index(str(tmp_path / "tol200m_bioclip2.faiss"))
     assert knn.validate_index(idx)["ok"] is True, "norms are fine here"

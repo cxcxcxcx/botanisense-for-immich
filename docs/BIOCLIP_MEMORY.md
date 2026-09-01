@@ -260,7 +260,8 @@ flips:
 | ----------------------------- | ----------------------: | --------------------: | ------------------ | ------------------------- | ----------------- |
 | Same-process (pre-refactor)   | 5.85 GB                 | 5.85 GB               | nothing            | 0                         | replaced          |
 | Same-process + unload timer   | 5.85 GB                 | 1.27 GB               | reaper + UI badge  | 0 + 14 s reload next call | not implemented   |
-| **Subprocess, exits on done** | **222 MB**              | **222 MB**            | reaper thread      | 2-3 s spawn + 14 s load   | **shipped (b711040)** |
+| Subprocess + reaper thread    | 222 MB                  | 222 MB                | reaper thread      | 2-3 s spawn + 14 s load   | replaced (c2f068b) |
+| **Subprocess, no reaper**     | **222 MB**              | **222 MB**            | `_get_active_job`  | 2-3 s spawn + 14 s load   | **shipped (c2f068b)** |
 | Persistent worker (RPC)       | 222 MB                  | 222 MB                | large (RPC layer)  | 0 (worker stays warm)     | not needed        |
 
 The 14 s model load is paid **once per child lifetime**, in both

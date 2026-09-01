@@ -63,7 +63,7 @@ def __getattr__(name: str):  # PEP 562
         globals()["yolo"] = _yolo
         return _yolo
     if name == "knn":
-        import knn as _knn
+        import knn_io as _knn
         globals()["knn"] = _knn
         return _knn
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
@@ -1006,15 +1006,17 @@ def run_knn_reclassify_bbox(
 
     index_dir = Path(index_dir)
     version_path = index_dir / "INDEX_VERSION.txt"
-    if not version_path.exists():
-        raise FileNotFoundError(
-            f"INDEX_VERSION.txt missing in {index_dir} — build the "
-            f"index with knn.build_faiss_index(...) first"
+    if version_path.exists():
+        version_tag = next(
+            (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
+            "unknown",
         )
-    version_tag = next(
-        (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
-        "unknown",
-    )
+    elif (index_dir / "faiss" / "index.index").exists():
+        version_tag = "imageomics-official"
+    else:
+        raise FileNotFoundError(
+            f"No KNN index found in {index_dir} — need either INDEX_VERSION.txt (custom) or faiss/index.index (imageomics official)"
+        )
 
     # Look up the detection + the asset's image URL.
     with storage.connect(DB_PATH) as conn_ro:
@@ -1153,16 +1155,18 @@ def run_knn_reclassify(
 
     index_dir = Path(index_dir)
     version_path = index_dir / "INDEX_VERSION.txt"
-    if not version_path.exists():
-        raise FileNotFoundError(
-            f"INDEX_VERSION.txt missing in {index_dir} — did you build "
-            f"the index with knn.build_faiss_index(...) first?"
+    if version_path.exists():
+        # Read the version tag (first non-empty line).
+        version_tag = next(
+            (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
+            "unknown",
         )
-    # Read the version tag (first non-empty line).
-    version_tag = next(
-        (line.strip() for line in version_path.read_text().splitlines() if line.strip()),
-        "unknown",
-    )
+    elif (index_dir / "faiss" / "index.index").exists():
+        version_tag = "imageomics-official"
+    else:
+        raise FileNotFoundError(
+            f"No KNN index found in {index_dir} — need either INDEX_VERSION.txt (custom) or faiss/index.index (imageomics official)"
+        )
 
     if not asset_ids:
         return {

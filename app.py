@@ -69,6 +69,19 @@ else:
         )
 
 
+def _config_path() -> Path | None:
+    """Where to read config.toml from, honoring BOTANISENSE_CONFIG override."""
+    explicit = os.environ.get("BOTANISENSE_CONFIG")
+    if explicit:
+        if not Path(explicit).exists():
+            raise SystemExit(
+                f"BOTANISENSE_CONFIG={explicit!r} but that file does not exist."
+            )
+        return Path(explicit)
+    candidate = Path("config.toml")
+    return candidate if candidate.exists() else None
+
+
 def _load_config() -> dict:
     """Load user config from TOML.
 
@@ -79,24 +92,36 @@ def _load_config() -> dict:
     Returns an empty dict when no config file exists. The constants
     below use `cfg.get(...) or os.environ.get(...)` so env vars still
     win for any value the user prefers to set in `.env`.
+
+    Cached by file mtime so a config.toml edit is picked up on the next
+    request — no worker restart needed. (uvicorn --reload only watches
+    .py, not .toml.)
     """
-    explicit = os.environ.get("BOTANISENSE_CONFIG")
-    if explicit:
-        if not Path(explicit).exists():
-            raise SystemExit(
-                f"BOTANISENSE_CONFIG={explicit!r} but that file does not exist."
-            )
-        path = explicit
-    else:
-        path = "config.toml"
-    if not Path(path).exists():
+    global _cfg, _cfg_mtime
+    path = _config_path()
+    if path is None:
+        # No config file at all. Return whatever _cfg is (possibly {})
+        # but invalidate mtime so a config that appears later triggers a
+        # fresh load on the next call.
+        _cfg_mtime = None
+        return _cfg if _cfg is not None else {}
+    try:
+        mtime = path.stat().st_mtime_ns
+    except FileNotFoundError:
+        _cfg_mtime = None
         return {}
-    with Path(path).open("rb") as f:
-        return tomllib.load(f)
+    if _cfg is not None and _cfg_mtime == mtime:
+        return _cfg
+    with path.open("rb") as f:
+        _cfg = tomllib.load(f)
+    _cfg_mtime = mtime
+    return _cfg
 
 
 load_dotenv()
-_cfg = _load_config()
+_cfg: dict = {}  # populated below via _load_config()
+_cfg_mtime: int | None = None
+_cfg = _load_config()  # initial load; subsequent calls go through _load_config()
 
 # Non-secret settings come from config.toml with env-var override. The
 # previously-hardcoded LAN defaults were a leak of the developer's home
@@ -155,10 +180,25 @@ _next_run_at_iso: str | None = None
 # holding tol200m_bioclip2.faiss + labels.parquet + INDEX_VERSION.txt.
 # Leave it unset / pointing at a non-existent dir to disable the KNN UI
 # gracefully.
-KNN_INVENTORY_DIR = Path(
-    _cfg.get("knn", {}).get("inventory_dir")
-    or os.environ.get("KNN_INVENTORY_DIR", "")
-)
+#
+# Resolution is a callable (not a captured Path) so config.toml edits
+# take effect on the next request WITHOUT a uvicorn restart — and the
+# /api/knn/health banner always reports what's actually live. The
+# function re-reads _cfg (module-level cache of config.toml parsed at
+# import) which means a `touch config.toml` to invalidate will be wired
+# below; for now, edits land on the next worker restart or
+# /api/knn/health rebuild (re-imports _cfg).
+def KNN_INVENTORY_DIR() -> Path:
+    """Resolve KNN inventory dir fresh on every call.
+
+    Reads `_load_config()` (which mtime-caches config.toml) so a
+    config.toml edit takes effect on the next request without a worker
+    restart. Env var `KNN_INVENTORY_DIR` overrides config.toml.
+    """
+    return Path(
+        _load_config().get("knn", {}).get("inventory_dir")
+        or os.environ.get("KNN_INVENTORY_DIR", "")
+    )
 KNN_K = int(os.environ.get("KNN_K", "10"))
 
 if not API_KEY:
@@ -401,23 +441,37 @@ def _get_classifier():
 _knn_index = None
 _knn_labels = None
 _knn_meta: dict | None = None
+# Path the cached index was loaded FROM. When KNN_INVENTORY_DIR() resolves
+# to a different path, we invalidate _knn_index/_knn_labels/_knn_meta so a
+# config.toml edit picks up a fresh index without a worker restart.
+_knn_loaded_dir: Path | None = None
 
 
 def _get_knn_index():
     """Return (faiss_index, labels_table, meta) or None if the inventory
-    isn't built yet. Cached for the lifetime of the process."""
-    global _knn_index, _knn_labels, _knn_meta
-    if _knn_index is not None:
-        return _knn_index, _knn_labels, _knn_meta
-    if not (KNN_INVENTORY_DIR / "tol200m_bioclip2.faiss").exists():
+    isn't built yet. Cached for the lifetime of the process; invalidated
+    if KNN_INVENTORY_DIR() resolves to a different path (config.toml
+    edit)."""
+    global _knn_index, _knn_labels, _knn_meta, _knn_loaded_dir
+    # Re-resolve every call: config.toml edits take effect on the next
+    # request, no restart needed. Also: if the inventory_dir was edited
+    # to a different path, invalidate the cached index — the file might
+    # not even exist there.
+    inventory = KNN_INVENTORY_DIR()
+    # Detect which layout is on disk (knn_io._load_index does the same).
+    custom_index = inventory / "tol200m_bioclip2.faiss"
+    official_index = inventory / "faiss" / "index.index"
+    if not (custom_index.exists() or official_index.exists()):
         return None
+    if _knn_index is not None and _knn_loaded_dir == inventory:
+        return _knn_index, _knn_labels, _knn_meta
     with _lock:
-        if _knn_index is None:
-            import knn  # local module
-            from knn import _load_index as _knn_load
-            _knn_index, _knn_labels, _knn_meta = _knn_load(KNN_INVENTORY_DIR)
+        if _knn_index is None or _knn_loaded_dir != inventory:
+            import knn_io as _knn_io
+            _knn_index, _knn_labels, _knn_meta = _knn_io._load_index(inventory)
+            _knn_loaded_dir = inventory
             _log.info(
-                f"[knn.load] loaded {_knn_index.ntotal:,} vectors from {KNN_INVENTORY_DIR}"
+                f"[knn.load] loaded {_knn_index.ntotal:,} vectors from {inventory}"
             )
     return _knn_index, _knn_labels, _knn_meta
 
@@ -433,7 +487,7 @@ def _knn_status_dict() -> dict:
     shows progress, and showing "missing" alongside an active build is
     confusing — looks like the build did nothing)."""
     out: dict = {
-        "inventory_dir": str(KNN_INVENTORY_DIR),
+        "inventory_dir": str(KNN_INVENTORY_DIR()),
         "index_built": False,
         "building": any(
             j.get("status") == "running" for j in _knn_build_jobs.values()
@@ -1163,18 +1217,26 @@ async def health() -> dict:
         api_key_err = f"{type(e).__name__}: {e}"
 
     # --- KNN index ---
-    knn_path = str(KNN_INVENTORY_DIR) if KNN_INVENTORY_DIR else ""
+    knn_path = str(KNN_INVENTORY_DIR()) if KNN_INVENTORY_DIR() else ""
     knn_built = False
     knn_version: str | None = None
     if knn_path:
-        idx_version = Path(knn_path) / "INDEX_VERSION.txt"
-        faiss_file = Path(knn_path) / "tol200m_bioclip2.faiss"
-        knn_built = idx_version.exists() and faiss_file.exists()
-        if knn_built:
+        # Two layouts supported: custom (BotaniSense-built) and official
+        # (imageomics/bioclip-image-search-lite preloaded).
+        custom_index = Path(knn_path) / "tol200m_bioclip2.faiss"
+        custom_version = Path(knn_path) / "INDEX_VERSION.txt"
+        official_index = Path(knn_path) / "faiss" / "index.index"
+        if custom_index.exists() and custom_version.exists():
+            knn_built = True
             try:
-                knn_version = idx_version.read_text().strip()
+                knn_version = custom_version.read_text().strip()
             except OSError:
                 knn_version = None
+        elif official_index.exists():
+            knn_built = True
+            knn_version = "imageomics-official"
+        else:
+            knn_built = False
 
     # --- BioCLIP-2 weights ---
     # HuggingFace stores snapshots under
@@ -1641,13 +1703,30 @@ async def asset_detail(asset_id: str) -> dict:
             # Naive brute-force is fast enough at our scale (~12k assets × 512 dim
             # = ~10-20ms with numpy). Returns [] if the asset has no embedding.
             library_neighbors = storage.find_library_neighbors(conn, asset_id=asset_id, k=12)
-            # 5. KNN: pick the most-populated (index_version, k) and read the row.
+            # 5. KNN: prefer (index_version, k) that has a row for THIS asset
+            # (a freshly-computed Re-run KNN row may live in a less-populated
+            # version than the global max — e.g. just-cached imageomics-official
+            # while v2 is still the dominant global key). Fall back to the
+            # most-populated pair if no version has a row for this asset.
             versions = storage.list_knn_versions(conn)
             knn_payload = None
             if versions:
-                top_version = max(versions, key=lambda v: v.get("n", 0))
-                index_version = top_version["index_version"]
-                k = top_version["k"]
+                # Asset-first: any version with a row for this asset wins.
+                # Order: list_knn_versions is already last_at DESC, so the
+                # most-recently-used matching version comes first.
+                for v in versions:
+                    if storage.knn_predictions_have_asset(
+                        conn,
+                        asset_id=asset_id,
+                        index_version=v["index_version"],
+                        k=v["k"],
+                    ):
+                        index_version, k = v["index_version"], v["k"]
+                        break
+                else:
+                    top_version = max(versions, key=lambda v: v.get("n", 0))
+                    index_version = top_version["index_version"]
+                    k = top_version["k"]
                 knn_map = storage.fetch_knn_predictions(
                     conn, asset_ids=[asset_id], index_version=index_version, k=k
                 )
@@ -2075,16 +2154,10 @@ async def knn_status() -> dict:
 class KnnBuildArgs(BaseModel):
     parquet_glob: str
     tag: str
-    index_dir: str | None = None        # default: KNN_INVENTORY_DIR
+    index_dir: str | None = None        # default: KNN_INVENTORY_DIR() (re-read each call)
     kingdoms: str | None = None        # comma-separated, e.g. "Plantae,Fungi"
-    index_type: str | None = None      # "ivf" (default) or "flat"
     ivf_nlist: int | None = None       # override IVF cluster count (default: sqrt(train_size))
     ivf_train_size: int | None = None  # #vectors held in RAM for k-means training (default: 200K, lower=less RAM)
-    # If True, load existing index at index_dir (if any) and continue
-    # adding instead of training from scratch. Used for multi-pass
-    # builds that exceed RLIMIT_DATA — split 130M into 3 sequential
-    # ~45M-row passes, the 2nd/3rd with resume=True.
-    resume: bool = False
 
 # In-memory job registry. Jobs are short-lived (~minutes-to-hours);
 # the log file outlives the process so users can grep later.
@@ -2142,7 +2215,7 @@ async def start_knn_build(args: KnnBuildArgs) -> dict:
     # FileNotFoundError traceback in the child (which would also flood
     # the log file with stack traces). The child re-runs mkdir with
     # exist_ok=True; this is the canary.
-    target_dir = Path(args.index_dir or KNN_INVENTORY_DIR)
+    target_dir = Path(args.index_dir or KNN_INVENTORY_DIR())
     try:
         target_dir.mkdir(parents=True, exist_ok=True)
     except (PermissionError, OSError) as e:
@@ -2166,49 +2239,36 @@ async def start_knn_build(args: KnnBuildArgs) -> dict:
         "args": args.model_dump(),
         "error": None,
     }
-    # CRITICAL: spawn the build in a real subprocess with RLIMIT_DATA
-    # applied BEFORE Python starts in the child (via preexec_fn).
-    # `multiprocessing.Process` with fork context was failing to actually
-    # fork on this setup — observed behavior was the build running
-    # inside the uvicorn worker, with rlimit silently not applied. That
-    # would OOM-kill the entire web server on a runaway build.
-    #
-    # subprocess.Popen with preexec_fn is the canonical Linux pattern:
-    # the OS calls our preexec_fn in the freshly-forked child before
-    # exec, so resource.setrlimit() runs while we're still single-
-    # threaded and pid-stable. The kernel then enforces the cap on
-    # every subsequent mmap/malloc in this process tree.
-    import resource, subprocess
-    def _set_rlimit():
-        if _KNN_BUILD_MEM_LIMIT_BYTES is not None:
-            resource.setrlimit(
-                resource.RLIMIT_DATA,
-                (_KNN_BUILD_MEM_LIMIT_BYTES, _KNN_BUILD_MEM_LIMIT_BYTES),
-            )
+    # Spawn the build in a real subprocess (not a forked mp worker), so
+    # a runaway build can't take down the uvicorn worker. Physical
+    # memory is bounded by the parent-side RSS watchdog below
+    # (_watch_subprocess_build SIGKILLs if RSS exceeds the cap). We do
+    # NOT set RLIMIT_DATA in the child: on this kernel it counts
+    # anonymous mmap as well as brk, and faiss reserves ~2.7 GB of
+    # virtual address space at import and grows ~174 B/vector — so an
+    # RLIMIT_DATA cap trips on VIRTUAL reservation while RSS is only
+    # ~2-3 GB, killing healthy builds around 35-60M vectors. RSS is the
+    # real pressure; watch that instead.
+    import subprocess
     # Use `python -m knn` rather than importing the module — same as
     # the CLI entry path that has been smoke-tested many times. Avoids
     # the import-after-fork gotchas that multiprocessing.Process hit.
     cmd = [
         "./.venv/bin/python", "-u", "-m", "knn",
         "--parquet-glob", args.parquet_glob,
-        "--index-dir", str(Path(args.index_dir or KNN_INVENTORY_DIR)),
+        "--index-dir", str(Path(args.index_dir or KNN_INVENTORY_DIR())),
         "--tag", args.tag,
     ]
     if args.kingdoms:
         cmd += ["--kingdoms", args.kingdoms]
-    if args.index_type:
-        cmd += ["--index-type", args.index_type]
     if args.ivf_nlist is not None:
         cmd += ["--ivf-nlist", str(args.ivf_nlist)]
     if args.ivf_train_size is not None:
         cmd += ["--ivf-train-size", str(args.ivf_train_size)]
-    if args.resume:
-        cmd += ["--resume"]
     proc = subprocess.Popen(
         cmd,
         stdout=open(log_path, "w"),
         stderr=subprocess.STDOUT,
-        preexec_fn=_set_rlimit,
         start_new_session=True,  # child becomes process group leader
     )
     _knn_build_jobs[job_id]["proc"] = proc
@@ -2287,14 +2347,13 @@ def _watch_subprocess_build(job_id: str, proc: subprocess.Popen) -> None:
         msg = (
             f"KNN build worker exceeded its {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB "
             f"RSS soft cap and was killed. Try a smaller "
-            f"ivf_train_size (e.g. 100000) or split into multiple "
-            f"passes with --resume."
+            f"ivf_train_size (e.g. 100000)."
         )
         job["error"] = f"MemoryError: {msg}"
         try:
             with open(job["log_path"], "a") as f:
-                f.write(f"\n[knn.build] KILLED by OS (exitcode {proc.returncode} / SIGKILL).\n")
-                f.write(f"[knn.build] Likely cause: {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB RLIMIT_DATA exceeded.\n")
+                f.write(f"\n[knn.build] KILLED by parent watchdog (exitcode {proc.returncode} / SIGKILL).\n")
+                f.write(f"[knn.build] Cause: RSS exceeded the {_KNN_BUILD_MEM_LIMIT_BYTES // (1024**3)} GB soft cap (physical memory).\n")
                 f.write(f"[knn.build] Hint: re-run with ivf_train_size <= 100000.\n")
         except Exception:
             pass
@@ -2343,7 +2402,7 @@ async def reclassify(params: ReclassifyParams) -> dict:
         raise HTTPException(
             status_code=503,
             detail=(
-                f"KNN index not built — missing {KNN_INVENTORY_DIR}/"
+                f"KNN index not built — missing {KNN_INVENTORY_DIR()}/"
                 f"tol200m_bioclip2.faiss. Build it with `python -m knn "
                 f"--parquet-glob ... --index-dir ... --tag ...`."
             ),
@@ -2378,7 +2437,7 @@ def run_knn_reclassify_sync(asset_ids: list[str], k: int, force: bool = False) -
     from pipeline import run_knn_reclassify
     with storage.connect(DB_PATH) as conn:
         return run_knn_reclassify(
-            conn, asset_ids=asset_ids, index_dir=KNN_INVENTORY_DIR, k=k,
+            conn, asset_ids=asset_ids, index_dir=KNN_INVENTORY_DIR(), k=k,
             force=force,
         )
 
@@ -3885,22 +3944,25 @@ async def reclassify_bbox(params: ReclassifyBboxParams) -> dict:
     """KNN-reclassify a single cropped bbox. See
     pipeline.run_knn_reclassify_bbox for the full flow (download
     image, crop, BioCLIP embed, FAISS query, cache)."""
-    if not str(KNN_INVENTORY_DIR):
+    if not str(KNN_INVENTORY_DIR()):
         raise HTTPException(
             status_code=503,
             detail="KNN not configured — set KNN_INVENTORY_DIR and build an index first",
         )
-    if not (Path(KNN_INVENTORY_DIR) / "INDEX_VERSION.txt").exists():
+    inv = Path(KNN_INVENTORY_DIR())
+    has_custom = (inv / "tol200m_bioclip2.faiss").exists() and (inv / "INDEX_VERSION.txt").exists()
+    has_official = (inv / "faiss" / "index.index").exists() and (inv / "duckdb" / "metadata.duckdb").exists()
+    if not (has_custom or has_official):
         raise HTTPException(
             status_code=503,
-            detail=f"INDEX_VERSION.txt missing in {KNN_INVENTORY_DIR} — build the index first",
+            detail=f"No KNN index found in {KNN_INVENTORY_DIR()} — set inventory_dir to a directory with either tol200m_bioclip2.faiss + INDEX_VERSION.txt (custom) or faiss/index.index + duckdb/metadata.duckdb (imageomics official)",
         )
     try:
         return await asyncio.to_thread(
             pipeline.run_knn_reclassify_bbox,
             None,
             detection_id=params.detection_id,
-            index_dir=Path(KNN_INVENTORY_DIR),
+            index_dir=Path(KNN_INVENTORY_DIR()),
             k=KNN_K,
         )
     except FileNotFoundError as e:
