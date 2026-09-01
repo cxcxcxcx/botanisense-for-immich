@@ -47,6 +47,12 @@ export interface Filters {
   // filter cards and the photo grid to the same population so counts
   // reconcile. undefined = all tiers.
   plantae?: 'plant' | 'non_plant' | 'uncertain' | undefined;
+  // Manual opt-in to surface non-plant photos in the unfiltered
+  // all-photo view. Default false — the project-wide "no non-plant
+  // counts" policy scopes the grid to Plantae >= 0.35 unless the user
+  // flips this on. Has no effect when an explicit `plantae` tier is
+  // given; `/api/results?include_non_plants=true` mirrors this flag.
+  include_non_plants?: boolean | undefined;
 }
 
 export interface ModalState {
@@ -133,7 +139,13 @@ export type Action =
 
 export const DEFAULT_FILTERS: Filters = {
   group_by: 'cluster',
-  sort: 'rank',
+  // Browse-list default is "Newest first" (capture date DESC). Photos
+  // without EXIF captured_at fall to the end of the page, but they
+  // still appear. Reason: on a personal photo library the user almost
+  // always wants to start with their most-recent shot — Immich's
+  // "search rank" was a confusing default for that. Stay in lock-step
+  // with the SORT_OPTIONS pill order (Grid.tsx).
+  sort: 'time',
   q: '',
   page: 0,
   page_size: 60,

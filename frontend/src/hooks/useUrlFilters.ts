@@ -43,7 +43,10 @@ function num(v: string | null): number | undefined {
 export function parseUrlFilters(search: string = window.location.search): Filters {
   const sp = new URLSearchParams(search);
   const group_by = (sp.get('group_by') ?? 'cluster') as GroupBy;
-  const sort = (sp.get('sort') ?? 'rank') as SortMode;
+  // Default sort lives on DEFAULT_FILTERS so a single source of truth
+  // governs both URL parsing and localStorage seeding. Falling back
+  // hard-coded here would silently diverge from the default pill.
+  const sort = (sp.get('sort') ?? DEFAULT_FILTERS.sort) as SortMode;
   const q = sp.get('q') ?? '';
   const page = num(sp.get('page')) ?? 0;
   const f: Filters = {
@@ -63,13 +66,21 @@ export function parseUrlFilters(search: string = window.location.search): Filter
   if (pl && (PLANTAE_VALUES as readonly string[]).includes(pl)) {
     f.plantae = pl as PlantaeValue;
   }
+  // Manual opt-in toggle for the project-wide plant-only default. Absent
+  // means false (default) — only emit when explicitly enabled so a
+  // bookmarked link with the flag off still serializes compactly.
+  if (sp.get('include_non_plants') === '1' || sp.get('include_non_plants') === 'true') {
+    f.include_non_plants = true;
+  }
   return f;
 }
 
 export function buildUrl(f: Filters): string {
   const sp = new URLSearchParams();
   sp.set('group_by', f.group_by);
-  if (f.sort !== 'rank') sp.set('sort', f.sort);
+  // Only emit `sort` when it differs from the project default — keeps
+  // bookmarked URLs of the default view short (no `?sort=time` noise).
+  if (f.sort !== DEFAULT_FILTERS.sort) sp.set('sort', f.sort);
   if (f.q) sp.set('q', f.q);
   if (f.group_by === 'cluster' && f.cluster_id != null) sp.set('cluster_id', String(f.cluster_id));
   if (f.group_by === 'species' && f.species) sp.set('species', f.species);
@@ -77,6 +88,9 @@ export function buildUrl(f: Filters): string {
   if (f.group_by === 'family'  && f.family)  sp.set('family',  f.family);
   if (f.has_person != null) sp.set('has_person', String(f.has_person));
   if (f.plantae) sp.set('plantae', f.plantae);
+  // Only emit when true — the default-off policy shouldn't pollute the
+  // URL with a redundant `include_non_plants=0`.
+  if (f.include_non_plants) sp.set('include_non_plants', '1');
   if (f.page) sp.set('page', String(f.page));
   return `?${sp.toString()}`;
 }
@@ -85,12 +99,17 @@ export function buildUrl(f: Filters): string {
 export function initialFilters(): Filters {
   const fromUrl = parseUrlFilters();
   // If URL had nothing useful, try localStorage. The "nothing useful"
-  // check must include EVERY top-level facet — including plantae — or
-  // a bare `?plantae=non_plant` URL would be silently discarded in
-  // favor of localStorage.
-  if (fromUrl.group_by === 'cluster' && fromUrl.sort === 'rank' && !fromUrl.q && fromUrl.page === 0
+  // check must include EVERY top-level facet — including plantae, the
+  // include_non_plants opt-in, AND the new default sort ('time') —
+  // otherwise a URL like `?sort=rank` on a stale bookmark would be
+  // silently upgraded to 'time' (the new default) when the user
+  // expected their explicit choice to win.
+  if (fromUrl.group_by === 'cluster'
+      && fromUrl.sort === DEFAULT_FILTERS.sort
+      && !fromUrl.q && fromUrl.page === 0
       && fromUrl.cluster_id == null && !fromUrl.species && !fromUrl.genus && !fromUrl.family
-      && fromUrl.has_person == null && fromUrl.plantae == null) {
+      && fromUrl.has_person == null && fromUrl.plantae == null
+      && !fromUrl.include_non_plants) {
     return readPersisted(DEFAULT_FILTERS);
   }
   return fromUrl;
@@ -117,6 +136,12 @@ export function useUrlFilters() {
       next.page = 0;
     }
     if (Object.prototype.hasOwnProperty.call(patch, 'plantae')) {
+      next.page = 0;
+    }
+    // Toggling the non-plants opt-in changes the result-set size by a
+    // large margin — re-paginate to 0 so the user lands on page 1 of
+    // the new (larger or smaller) set rather than a now-empty page.
+    if (Object.prototype.hasOwnProperty.call(patch, 'include_non_plants')) {
       next.page = 0;
     }
     writePersisted(next);

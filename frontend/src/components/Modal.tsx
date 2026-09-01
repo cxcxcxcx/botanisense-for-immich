@@ -20,7 +20,7 @@ export function Modal({ open, onClose, title, children }: Props) {
   return (
     <dialog
       ref={ref}
-      className="max-w-[min(92vw,900px)] max-h-[92vh] bg-[#161616] text-fg border border-[#333] rounded-lg p-0"
+      className="max-w-[min(92vw,900px)] max-h-[92vh] bg-bg-1 text-fg border border-line2 rounded-lg p-0"
       onClose={onClose}
       onClick={e => {
         if (e.target === ref.current) onClose();
@@ -31,7 +31,7 @@ export function Modal({ open, onClose, title, children }: Props) {
             so it visually matches the body's `px-6 py-4`. Subtle but
             gives the title bar breathing room next to the dense
             asset-detail content below. */}
-        <header className="flex items-center justify-between mb-4 border-b border-[#222] py-4 px-6">
+        <header className="flex items-center justify-between mb-4 border-b border-line py-4 px-6">
           <h3 className="m-0 flex-1">{title || 'Asset detail'}</h3>
           <button
             className="text-fg-1 hover:text-fg text-lg leading-none px-2"

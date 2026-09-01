@@ -141,11 +141,46 @@
   /* Taxonomy hierarchy ranks in the asset-detail modal. Each rank
      gets a distinct chip color so users can scan kingdom → species
      without parsing text. */
-  .rank-kingdom { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-[#2a2342] text-[#c9b6ff] border border-[#3d2f5e] font-semibold lowercase; }
-  .rank-family  { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-[#1a2a3a] text-[#9ec9ff] border border-[#2a4561]; }
-  .rank-genus   { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-[#1a3a2a] text-[#8fd4a4] border border-[#2c5e44] italic; }
-  .rank-species { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-[#2a2a1a] text-[#d4cf8f] border border-[#4a4a30] italic; }
-  .rank-sep     { @apply text-[#555] font-mono text-xs select-none; }
+  /* Rank chips — deeper tints + brighter text on dark, pastel tints
+     + deeper text on light. Otherwise the bright pastel text
+     (e.g. #c9b6ff) disappears on the light tint. */
+  .rank-kingdom { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 font-semibold lowercase; }
+  .rank-family  { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-sky-500/15 text-sky-300 border border-sky-500/30; }
+  .rank-genus   { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 italic; }
+  .rank-species { @apply font-mono px-2 rounded whitespace-nowrap tracking-wide bg-amber-500/15 text-amber-200 border border-amber-500/30 italic; }
+  .rank-sep     { @apply text-fg-2 font-mono text-xs select-none; }
+  [data-theme='light'] .rank-kingdom { @apply text-indigo-700; }
+  [data-theme='light'] .rank-family  { @apply text-sky-700; }
+  [data-theme='light'] .rank-genus   { @apply text-emerald-700; }
+  [data-theme='light'] .rank-species { @apply text-amber-700; }
+
+  /* Asset-detail taxonomy breadcrumb chips (TaxChip). The tinted
+     background reads fine in both themes; only the text shade flips —
+     pastel on dark, deep tone on light — otherwise e.g. text-indigo-300
+     is invisible on the pale light-mode tint. */
+  .tax-chip-kingdom { @apply bg-indigo-500/10 text-indigo-300; }
+  .tax-chip-family  { @apply bg-blue-500/10 text-blue-300; }
+  .tax-chip-genus   { @apply bg-green-500/10 text-green-400; }
+  [data-theme='light'] .tax-chip-kingdom { @apply text-indigo-700; }
+  [data-theme='light'] .tax-chip-family  { @apply text-blue-700; }
+  [data-theme='light'] .tax-chip-genus   { @apply text-green-700; }
+
+  /* "Plants in this image" card + its green text. Dark theme: deep
+     green surface, pastel green text. Light theme: pale green wash,
+     deep green text. */
+  .plants-card  { @apply bg-green-500/10 border border-green-600/25 rounded-xl; }
+  .plants-title { @apply text-green-300; }
+  .plants-count { @apply text-green-300/60; }
+  .plants-score { @apply text-green-400; }
+  [data-theme='light'] .plants-title { @apply text-green-800; }
+  [data-theme='light'] .plants-count { @apply text-green-700/70; }
+  [data-theme='light'] .plants-score { @apply text-green-700; }
+
+  /* Confidence figure / section-heading green used across the asset
+     modal (the old hard-coded #ad9). Pastel on dark, deep green on
+     light so it stays legible on the light modal surface. */
+  .text-leaf { @apply text-[#aadd99]; }
+  [data-theme='light'] .text-leaf { @apply text-green-700; }
 
   /* KNN inventory pill. Green when built, red when missing, gray
      while loading. Inline so the header row can show it without a
@@ -283,11 +318,15 @@
      gradient overlay. Bottom-left label + count. */
   .cluster-card      { @apply relative aspect-square rounded-xl overflow-hidden cursor-pointer border border-line2 bg-bg-2 transition-colors hover:border-accent; }
   .cluster-card-all  { @apply border-accent/30 bg-accent/10; }
-  .cluster-card-overlay { @apply absolute inset-0 bg-gradient-to-t from-bg/95 via-bg/40 to-transparent pointer-events-none; }
+  /* The scrim sits OVER a photograph, so it is always a dark gradient
+     with light text — in BOTH themes. Using the theme `bg` token here
+     made it flip to a white wash in light mode (looked bad over photos
+     and gave dark-on-light text that vanished against the image). */
+  .cluster-card-overlay { @apply absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent pointer-events-none; }
   .cluster-card-label  { @apply font-medium text-sm leading-tight truncate; }
-  .cluster-card-name   { @apply text-fg italic; }
-  .cluster-card-name-all { @apply text-accent not-italic; }
-  .cluster-card-count  { @apply text-[10px] text-fg-1 mt-0.5; }
+  .cluster-card-name   { @apply text-white italic; }
+  .cluster-card-name-all { @apply text-emerald-300 not-italic; }
+  .cluster-card-count  { @apply text-[10px] text-white/70 mt-0.5; }
 
   /* Back-bar — sticky top bar on Level 2 (photo grid). Back button
      left, cluster/taxon name + count centered, sort dropdown right. */
@@ -302,7 +341,10 @@
      swatch, no top badges. */
   .photo-card          { @apply relative aspect-square bg-bg-2 sm:rounded-lg overflow-hidden cursor-pointer; }
   .photo-card-image    { @apply w-full h-full object-cover; }
-  .photo-card-overlay  { @apply absolute bottom-0 inset-x-0 p-2 bg-gradient-to-t from-black/90 to-transparent flex justify-end pointer-events-none; }
+  /* Photo scrim over a thumbnail — always dark gradient + light text
+     in BOTH themes. The species name inherits text colour, so without
+     text-white it went dark-on-dark and was unreadable in light mode. */
+  .photo-card-overlay  { @apply absolute bottom-0 inset-x-0 p-2 bg-gradient-to-t from-black/90 to-transparent flex justify-end pointer-events-none text-white; }
 
   /* Skeleton placeholder for lazy-loaded <img> content. The Card and
      FilterCardOverlay render a div.shimmer under the real image until

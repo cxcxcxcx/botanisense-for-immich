@@ -12,7 +12,7 @@ export function LibraryNeighbors({ items }: Props) {
   if (!items || items.length === 0) return null;
   return (
     <>
-      <h5 className="m-4 mb-1 text-[0.95rem] text-[#ad9]">Library neighbors</h5>
+      <h5 className="m-4 mb-1 text-[0.95rem] text-leaf">Library neighbors</h5>
       <div className="grid gap-1.5 grid-cols-[repeat(auto-fill,minmax(100px,1fr))]">
         {items.map(n => (
           <div

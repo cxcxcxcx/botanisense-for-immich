@@ -29,8 +29,6 @@ export function KnnBuildModal({ open, onClose }: Props) {
     tag: 'v1',
     index_dir: 'data/knn-index',
     kingdoms: '',
-    index_type: 'ivf',
-    resume: false,
   });
   const [job, setJob] = useState<KnnBuildJobSnapshot | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
@@ -103,7 +101,6 @@ export function KnnBuildModal({ open, onClose }: Props) {
         ...args,
         kingdoms: args.kingdoms?.trim() || null,
         index_dir: args.index_dir?.trim() || null,
-        index_type: args.index_type?.trim() || null,
       });
       setJob({ job_id, status: 'running', started_at: new Date().toISOString(), finished_at: null, error: null });
       setPhase('running');
@@ -163,28 +160,6 @@ export function KnnBuildModal({ open, onClose }: Props) {
               onChange={e => setArgs({ ...args, kingdoms: e.target.value })}
               placeholder="Plantae,Fungi"
             />
-          </label>
-          <label className={FIELD_CLS}>
-            Index type
-            <select
-              className={INPUT_CLS}
-              value={args.index_type ?? 'ivf'}
-              onChange={e => setArgs({ ...args, index_type: e.target.value })}
-            >
-              <option value="ivf">ivf (default — fast for large libraries)</option>
-              <option value="flat">flat (slow but exact — small libraries only)</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-2 text-fg-1 text-[0.8rem] cursor-pointer">
-            <input
-              type="checkbox"
-              checked={args.resume ?? false}
-              onChange={e => setArgs({ ...args, resume: e.target.checked })}
-              className="accent-accent"
-            />
-            <span>
-              Resume existing index (load &amp; continue adding instead of training fresh) — for multi-pass builds that exceed RLIMIT_DATA
-            </span>
           </label>
           <div className="flex gap-2 justify-end pt-1">
             <button type="button" className="px-2.5 py-1 rounded border border-[#456] bg-transparent text-fg text-sm hover:bg-[#345]" onClick={onClose}>Cancel</button>

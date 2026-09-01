@@ -14,7 +14,7 @@ interface Props {
 }
 
 const PLANTAE_OPTS: Array<{ v: Filters['plantae']; label: string; dotClass: string; title: string }> = [
-  { v: undefined,    label: 'all',        dotClass: 'bg-fg-2',       title: 'Show every photo (plants + uncertain + non-plants)' },
+  { v: undefined,    label: 'all',        dotClass: 'bg-fg-2',       title: 'Show plants + uncertain (Plantae ≥ 0.35). Flip "Show non-plants" below to include non-plants.' },
   { v: 'plant',      label: 'plants',     dotClass: 'tier-dot tier-dot-green',  title: 'Plantae ≥ 0.60' },
   { v: 'uncertain',  label: 'uncertain',  dotClass: 'tier-dot tier-dot-yellow', title: 'Plantae 0.35–0.60' },
   { v: 'non_plant',  label: 'non-plants', dotClass: 'tier-dot tier-dot-red',    title: 'Plantae < 0.35 (or unknown)' },
@@ -35,6 +35,9 @@ export function FilterModal({ open, onClose }: Props) {
   // "Clear all" trivially revertible.
   const [plantae, setPlantae] = useState<Filters['plantae']>(filters.plantae);
   const [hasPerson, setHasPerson] = useState<Filters['has_person']>(filters.has_person);
+  const [includeNonPlants, setIncludeNonPlants] = useState<boolean>(
+    Boolean(filters.include_non_plants),
+  );
 
   // Sync from outside whenever the modal opens (in case the URL
   // changed via back/forward or another component).
@@ -42,18 +45,25 @@ export function FilterModal({ open, onClose }: Props) {
     if (open) {
       setPlantae(filters.plantae);
       setHasPerson(filters.has_person);
+      setIncludeNonPlants(Boolean(filters.include_non_plants));
     }
-  }, [open, filters.plantae, filters.has_person]);
+  }, [open, filters.plantae, filters.has_person, filters.include_non_plants]);
 
   if (!open) return null;
 
   const handleClearAll = () => {
     setPlantae(undefined);
     setHasPerson(undefined);
+    setIncludeNonPlants(false);
   };
 
   const handleApply = () => {
-    setFilters({ plantae, has_person: hasPerson, page: 0 });
+    setFilters({
+      plantae,
+      has_person: hasPerson,
+      include_non_plants: includeNonPlants || undefined,
+      page: 0,
+    });
     onClose();
   };
 
@@ -114,6 +124,21 @@ export function FilterModal({ open, onClose }: Props) {
                 </button>
               ))}
             </div>
+          </div>
+
+          <div className="filter-modal-section">
+            <label className="filter-modal-section-label">Non-plant visibility</label>
+            <label className="modal-toggle-row" title={includeNonPlants ? 'Non-plants ARE included — grid & counts reflect every photo.' : 'Non-plants are hidden — grid & counts only show Plantae ≥ 0.35 (the project-wide policy). Flip on to include every photo in the all-view.'}>
+              <input
+                type="checkbox"
+                checked={includeNonPlants}
+                onChange={(e) => setIncludeNonPlants(e.target.checked)}
+                className="modal-toggle-checkbox"
+              />
+              <span className="modal-toggle-text">
+                Show non-plants in All view
+              </span>
+            </label>
           </div>
         </div>
 

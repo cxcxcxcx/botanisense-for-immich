@@ -351,7 +351,7 @@ function ClusterAllCard({ total, active, onClick }: { total: number; active: boo
       onClick={onClick}
       title={`Show all ${total.toLocaleString()} assets (clear filter)`}
     >
-      <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-[#1a2a1a] via-[#142420] to-[#1a1a3a]">
+      <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-emerald-900/40 via-teal-900/30 to-indigo-900/40 dark-gradient">
         <span className={`text-4xl text-accent font-light mt-2 ${active ? 'opacity-100' : 'opacity-50'}`} style={{ textShadow: '0 0 12px rgba(92,192,120,0.4)' }}>*</span>
       </div>
       <div className="cluster-card-overlay" aria-hidden="true" />

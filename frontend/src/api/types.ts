@@ -240,12 +240,6 @@ export interface KnnBuildArgs {
   tag: string;
   index_dir?: string | null;
   kingdoms?: string | null;
-  index_type?: string | null;
-  // If True, the build loads the existing index at index_dir and
-  // continues adding instead of training fresh. Used for multi-pass
-  // builds that exceed RLIMIT_DATA — split a 130M-row build into N
-  // sequential ~50M-row passes, the 2nd/3rd with resume=True.
-  resume?: boolean;
 }
 
 export interface KnnBuildJobSnapshot extends JobSnapshot {

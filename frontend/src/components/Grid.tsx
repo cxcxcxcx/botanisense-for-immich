@@ -15,11 +15,17 @@ import { useToasts } from './ToastProvider';
 // the back-bar so the user can re-sort without leaving the photo
 // view. Labels are self-explanatory at a glance.
 const SORT_OPTIONS: { value: SortMode; label: string }[] = [
-  { value: 'rank',    label: 'Default order' },
+  // 'time' (capture date DESC) is the default — keep it first so the
+  // pill mirrors DEFAULT_FILTERS.sort. Photo capture time is what most
+  // visitors care about on a personal-library browse; the "default"
+  // label here previously read "Default order" but that was misleading
+  // (it's Immich's search rank, not a project-default order). The
+  // rename makes the actual semantics explicit.
+  { value: 'time',    label: 'Newest first' },
   { value: 'plantae', label: 'Plantae confidence ↓' },
   { value: 'score',   label: 'ID confidence ↓' },
-  { value: 'time',    label: 'Capture date ↓' },
   { value: 'added',   label: 'Date added ↓' },
+  { value: 'rank',    label: 'Immich search rank' },
 ];
 
 function sortRows(
@@ -118,6 +124,10 @@ export function Grid() {
       // narrow the grid to plants / uncertain / non-plants without
       // picking a cluster or taxon.
       plantae: filters.plantae,
+      // Manual opt-in for the all-view: default false (plants only).
+      // Explicit `plantae` tiers always win server-side, so sending
+      // the flag alongside a tier is a no-op there.
+      include_non_plants: filters.include_non_plants,
       sort: serverSort,
     })
       .then(r => {
@@ -176,6 +186,7 @@ export function Grid() {
       family: filters.family,
       has_person: filters.has_person,
       plantae: filters.plantae,
+      include_non_plants: filters.include_non_plants,
       sort: serverSort,
     })
       .then(r => {
@@ -196,7 +207,7 @@ export function Grid() {
         setLoadingMore(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, filters.page, filters.page_size, filters.cluster_id, filters.species, filters.genus, filters.family, filters.has_person, filters.plantae, filters.sort]);
+  }, [data, filters.page, filters.page_size, filters.cluster_id, filters.species, filters.genus, filters.family, filters.has_person, filters.plantae, filters.include_non_plants, filters.sort]);
 
   useEffect(() => {
     runFetch();
@@ -402,6 +413,15 @@ function FilteredEmpty({
   if (filters.plantae === 'plant') reasons.push('Plantae only');
   if (filters.plantae === 'non_plant') reasons.push('non-plants only');
   if (filters.plantae === 'uncertain') reasons.push('uncertain plants only');
+  // Surface the all-view-only opt-in: when the user is on the bare
+  // "All" tier (no explicit plantae) and hasn't flipped the toggle
+  // on, the grid is scoped to plant-only and we should call that out
+  // so a "where did my non-plant photo go?" isn't a mystery.
+  if (filters.plantae == null && !filters.include_non_plants
+      && filters.cluster_id == null && !filters.species
+      && !filters.genus && !filters.family && !filters.q.trim()) {
+    reasons.push('non-plants hidden');
+  }
   if (filters.q.trim()) reasons.push(`search "${filters.q.trim()}"`);
 
   if (reasons.length === 0) {

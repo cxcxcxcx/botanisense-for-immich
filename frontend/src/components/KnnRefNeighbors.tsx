@@ -45,10 +45,10 @@ function RefThumb({ n }: { n: KnnNeighbor }) {
         {n.common_name ? (
           <div className="knn-ref-cn" title={n.common_name}>{n.common_name}</div>
         ) : null}
-        {/* Raw similarity, not a percentage. The index is inner-product
-            over unnormalized reference vectors, so `sim` is not bounded
-            to [0,1] and rendering it as a percent produces nonsense
-            like "2001.9%". */}
+        {/* Cosine similarity in [0,1]. The backend converts the index's
+            raw score per layout (IP is already cosine; the official L2
+            index uses cos = 1 − d/2). Two decimals, not a percent — the
+            vote score above is the aggregate; this is per-neighbour. */}
         <div className="knn-ref-sim">sim {n.sim.toFixed(2)}</div>
       </div>
     </div>

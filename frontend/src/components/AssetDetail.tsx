@@ -109,9 +109,9 @@ function TaxChip({
   label: string;
 }) {
   const cls = {
-    kingdom: 'bg-indigo-500/10 text-indigo-300',
-    family:  'bg-blue-500/10 text-blue-300',
-    genus:   'bg-green-500/10 text-green-400',
+    kingdom: 'tax-chip-kingdom',
+    family:  'tax-chip-family',
+    genus:   'tax-chip-genus',
   }[rank];
   return (
     <span className={`px-2 py-0.5 rounded ${cls} text-[12px] font-medium`}>
@@ -241,7 +241,7 @@ export function AssetDetail({ assetId }: Props) {
           before; the box geometry is unchanged, just the framing is
           narrower so it lines up with the rest of the compact layout. */}
       <div className="flex justify-center">
-        <figure className="m-0 inline-block bg-[#0a0a0a] rounded-xl overflow-hidden border border-[#222]">
+        <figure className="m-0 inline-block bg-bg-0 rounded-xl overflow-hidden border border-line">
           <BboxImage
             src={thumbUrl(data.asset_id, usePreview ? 'preview' : 'fullsize')}
             detections={data.detections}
@@ -290,8 +290,8 @@ export function AssetDetail({ assetId }: Props) {
         >
           {copied ? (
             <>
-              <span className="text-[#4ade80]"><IconCheck /></span>
-              <span className="text-[#4ade80]">Copied</span>
+              <span className="text-green-500"><IconCheck /></span>
+              <span className="text-green-500">Copied</span>
             </>
           ) : (
             <>
@@ -362,11 +362,11 @@ export function AssetDetail({ assetId }: Props) {
       {/* "Plants in this image" — green-tinted card matching the
           example. Species count + first row visible; the rest of the
           attribution rows live below as a compact list. */}
-      <section className="bg-[#13201a] border border-[#166534]/30 rounded-xl p-3 flex flex-col gap-2" aria-label="Plants in this image">
+      <section className="plants-card p-3 flex flex-col gap-2" aria-label="Plants in this image">
         <div className="flex items-center justify-between">
-          <h4 className="text-[13px] font-medium text-[#86efac]">Plants in this image</h4>
+          <h4 className="plants-title text-[13px] font-medium">Plants in this image</h4>
           {attribution && attribution.source !== 'none' && (
-            <span className="text-[11px] text-[#4ade80]/60">
+            <span className="plants-count text-[11px]">
               {attributionRows.length} species
             </span>
           )}
@@ -411,7 +411,7 @@ export function AssetDetail({ assetId }: Props) {
                       className="flex items-center justify-center w-3.5 h-3.5 rounded-full bg-white text-black text-[9px] font-bold shrink-0 hover:opacity-80 no-underline"
                     >G</a>
                   </div>
-                  <span className="text-[#4ade80] font-medium tabular-nums text-[13px] shrink-0">
+                  <span className="plants-score font-medium tabular-nums text-[13px] shrink-0">
                     {formatPct(r.score)}
                   </span>
                 </li>

@@ -1,18 +1,35 @@
-// Run-page "Pipeline" form. The four pipeline params (query,
-// n_samples, top_k, batch_size) are collapsed by default — most users
-// just want "run with server defaults". Unfolding the disclosure
-// reveals the fields; the Run button always works and uses server
-// defaults for any field left blank.
+// Run-page "Pipeline" form.
 //
-// The disclosure state lives in the parent (App.tsx Run section) so
-// the toggle button can sit in the outer Pipeline card header —
-// matching the mock's card layout where the "Edit params" button is
-// in the header next to the title.
+// Layout (when the outer "Edit params" toggle is open):
+//   • Run button — always visible.
+//   • Stop-criteria threshold — the main knob. Always visible when
+//     params are open. Lower % = the search stops sooner (stricter
+//     plant/fungi density requirement per batch), so the run gathers
+//     fewer photos; higher % = the search keeps going through more
+//     pages of mixed content.
+//   • Query disclosure — folded by default. Inside:
+//       - One-line suggestion chips ("intentional flower photos",
+//         "moss on rocks", "tree bark close-up"). Click to fill the
+//         query input; the chip vanishes from the row once that text
+//         is in the box.
+//       - Query text input.
+//       - "Photos to fetch" — the Immich candidate-pool cap. Default
+//         20k (UI placeholder; the server's env-configured default
+//         is unchanged unless the user types a value).
+//   • Advanced disclosure — only the two technical knobs most users
+//     never touch (top_k, batch_size).
+//
+// The Run button always works and uses server defaults for any field
+// left blank.
+//
+// The disclosure state (`paramsOpen`) lives in the parent (App.tsx
+// Run section) so the toggle button can sit in the outer Pipeline
+// card header.
 //
 // The Run button's visual state tracks the actual pipeline run via
 // the SSE stream — when /api/events reports status="running" the
 // button shows "Running…" and is disabled; when the run finishes
-// (status="done") it reverts to "Run pipeline". Tracking a local
+// (status="done") it reverts to "Run Pipeline". Tracking a local
 // `busy` boolean during the click was useless because /api/run
 // returns immediately (the child runs in the background).
 
@@ -29,18 +46,31 @@ interface FieldHelp {
   min?: number;
   max?: number;
   step?: number;
+  // UI suffix shown after the input (e.g. "%").
+  suffix?: string;
 }
 
 const FIELDS: Record<string, FieldHelp> = {
+  // Main knob — exposed at the top of the params panel, NOT inside a
+  // disclosure. Expressed as a percent (0-100).
+  stop_criteria_pct: {
+    label: 'stop-criteria threshold',
+    help: "Percent of each batch that must look like plants-or-fungi for the search to keep going. Lower = stricter (search stops sooner, fewer photos gathered). 30% is a sensible default — drop to 10-15% if your library is mostly non-plants and you want the run to terminate fast; raise to 50%+ to keep pulling even sparse batches.",
+    placeholder: '30',
+    min: 0,
+    max: 100,
+    step: 5,
+    suffix: '%',
+  },
   query: {
     label: 'query',
-    help: 'Free-text search phrase sent to Immich to pick the candidate photos. Leave blank to use the server default (the IMMICH_QUERY env var).',
+    help: "Free-text search phrase sent to Immich to pick the candidate photos. Leave blank to use the server default (the QUERY env var, typically 'intentional plant photos').",
     placeholder: 'intentional plant photos',
   },
   n_samples: {
     label: 'photos to fetch',
-    help: 'How many candidate photos to pull from Immich for this run. Higher = more to classify, longer runtime. No hard cap — the server processes whatever you give it (default 10000).',
-    placeholder: '10000',
+    help: 'How many candidate photos to pull from Immich for this run. Higher = more to classify, longer runtime. The search also stops earlier if it hits the stop-criteria boundary, so this is a soft cap rather than a hard target.',
+    placeholder: '20000',
     min: 1,
   },
   top_k: {
@@ -59,6 +89,16 @@ const FIELDS: Record<string, FieldHelp> = {
   },
 };
 
+// One-click query presets. Clicking a chip fills the query input
+// (overwriting whatever's there); once the input matches one of
+// the chips exactly, that chip is hidden so the row doesn't
+// duplicate. Keep these short — they're buttons, not paragraphs.
+const QUERY_SUGGESTIONS = [
+  'intentional flower photos',
+  'moss on rocks',
+  'tree bark close-up',
+];
+
 interface Props {
   /** When true, render the full set of param fields. When false, just
    *  show the Run button (uses server defaults). The parent owns the
@@ -71,9 +111,12 @@ export function ParamsForm({ paramsOpen }: Props) {
   const [n, setN] = useState('');
   const [topK, setTopK] = useState('');
   const [batch, setBatch] = useState('');
-  // The three "advanced" params are tucked behind a separate
-  // disclosure so the most-used knob (`query`) gets the visual
-  // weight. Session-only state — no need to persist.
+  // The new "main" knob lives at the top of the panel; the query +
+  // photos-to-fetch pair sits behind a folded disclosure so a
+  // single click on "Run Pipeline" with default everything still
+  // works.
+  const [stopCriteria, setStopCriteria] = useState('');
+  const [queryOpen, setQueryOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   // Subscribe to the SSE pipeline status so the button reflects the
   // actual run state, not just "click is being processed".
@@ -82,8 +125,9 @@ export function ParamsForm({ paramsOpen }: Props) {
   // `awaiting` covers the window from click → SSE confirms a terminal
   // state. It is NOT cleared when the POST returns, because there's a
   // brief gap between /api/run returning and the server's first SSE
-  // push. Without this, the button would flicker back to "Run pipeline"
-  // before the user sees "Running…". Cleared in three places:
+  // push. Without this, the button would flicker back to "Run
+  // Pipeline" before the user sees "Running…". Cleared in three
+  // places:
   //   1. handleRun's catch block — POST failed, let the user retry.
   //   2. The useEffect below — SSE reports done/error/stopped.
   //   3. (Implicit) when the SSE's `running` flag flips on, `busy` is
@@ -125,6 +169,7 @@ export function ParamsForm({ paramsOpen }: Props) {
         n_samples: n ? Number(n) : null,
         top_k: topK ? Number(topK) : null,
         batch_size: batch ? Number(batch) : null,
+        stop_criteria_pct: stopCriteria === '' ? null : Number(stopCriteria),
       });
       const jobId = (resp as { job_id?: string })?.job_id;
       push(
@@ -147,6 +192,13 @@ export function ParamsForm({ paramsOpen }: Props) {
   const inputCls =
     'bg-bg-2 text-fg border border-line2 px-2.5 py-[5px] rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent';
 
+  // Hide a suggestion chip once the user has the same text in the
+  // query box (case-insensitive, trimmed). Avoids the "I just
+  // clicked 'flower' and the chip is still there" feedback loop.
+  const visibleSuggestions = QUERY_SUGGESTIONS.filter(
+    s => s.toLowerCase().trim() !== query.toLowerCase().trim(),
+  );
+
   return (
     <form onSubmit={handleRun} className="flex flex-col gap-3 w-full">
       {/* Single Run button — uses server defaults unless the user has
@@ -167,38 +219,97 @@ export function ParamsForm({ paramsOpen }: Props) {
 
       {paramsOpen && (
         <fieldset role="group" className="flex flex-col gap-3 border-0 p-0 m-0">
-          {/* `query` is the most consequential knob — visible
-              whenever params is open, with a one-line helper to nudge
-              new users toward concrete examples. */}
+          {/* Stop-criteria threshold — the main knob. Always visible
+              when params are open (not inside any disclosure) so the
+              most consequential per-run decision sits at the top.
+              A 0-100 number input with a % suffix; placeholder shows
+              the server default (30%) so blank = "use default". */}
           <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px]">
-            {FIELDS.query?.label}
-            <input
-              type="text"
-              className={`${inputCls} min-w-[220px] w-full`}
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              placeholder={FIELDS.query?.placeholder}
-              title={FIELDS.query?.help}
-            />
+            <span className="flex items-center gap-1.5">
+              {FIELDS.stop_criteria_pct?.label}
+              <HintBadge text={FIELDS.stop_criteria_pct?.help ?? ''} />
+            </span>
+            <span className="flex items-center gap-1.5">
+              <input
+                type="number"
+                className={`${inputCls} w-[110px]`}
+                value={stopCriteria}
+                onChange={e => setStopCriteria(e.target.value)}
+                min={FIELDS.stop_criteria_pct?.min}
+                max={FIELDS.stop_criteria_pct?.max}
+                step={FIELDS.stop_criteria_pct?.step}
+                placeholder={FIELDS.stop_criteria_pct?.placeholder}
+                title={FIELDS.stop_criteria_pct?.help}
+              />
+              <span className="text-fg-2 text-[0.8rem] font-mono">
+                {FIELDS.stop_criteria_pct?.suffix}
+              </span>
+            </span>
             <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
-              What to ask Immich's smart-search. Try{' '}
-              <em>"red flowers"</em>, <em>"moss on rocks"</em>, or{' '}
-              <em>"tree bark close-up"</em>.
+              How strict the plant-density check is before the search
+              stops. Lower = the run terminates sooner with fewer
+              photos; higher = it keeps crawling through mixed batches.
             </small>
           </label>
 
-          {/* The other three knobs are tucked behind an Advanced
-              disclosure — most users just want "run with server
-              defaults". */}
+          {/* Query disclosure — folded by default. New users hit
+              "Run Pipeline" with everything blank and get sensible
+              server defaults; power users open this to set the
+              Immich search phrase and the candidate-pool cap
+              together. Photos-to-fetch moved INTO this block because
+              it pairs naturally with the query (both shape what
+              Immich returns). */}
           <details
-            open={advancedOpen}
-            onToggle={e => setAdvancedOpen((e.target as HTMLDetailsElement).open)}
+            open={queryOpen}
+            onToggle={e => setQueryOpen((e.target as HTMLDetailsElement).open)}
             className="text-fg-1 text-[0.8rem]"
           >
             <summary className="cursor-pointer text-fg-1 hover:text-fg text-[0.8rem] py-1">
-              Advanced (batch, top-K, sample count)
+              Query &amp; photos to fetch
             </summary>
-            <div className="flex flex-wrap items-start gap-x-5 gap-y-3 pt-2">
+            <div className="flex flex-col gap-3 pt-2">
+              {/* Suggestion chips — one click fills the query.
+                  Hide a chip once its text matches the current
+                  query. Empty list = no extra UI shown (don't render
+                  an empty row). */}
+              {visibleSuggestions.length > 0 && (
+                <div className="flex flex-col gap-[3px]">
+                  <span className="text-fg-1 text-[0.8rem]">
+                    query suggestions
+                  </span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {visibleSuggestions.map(s => (
+                      <button
+                        key={s}
+                        type="button"
+                        onClick={() => setQuery(s)}
+                        title={`Use "${s}" as the query`}
+                        className="text-fg-1 bg-bg-2 hover:bg-bg-3 border border-line2 hover:border-accent px-2 py-[3px] rounded-full text-[0.75rem] font-mono transition-colors"
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px]">
+                {FIELDS.query?.label}
+                <input
+                  type="text"
+                  className={`${inputCls} min-w-[220px] w-full`}
+                  value={query}
+                  onChange={e => setQuery(e.target.value)}
+                  placeholder={FIELDS.query?.placeholder}
+                  title={FIELDS.query?.help}
+                />
+                <small className="text-fg-2 mt-0.5 text-[0.72rem] leading-[1.4]">
+                  What to ask Immich's smart-search. Try{' '}
+                  <em>"red flowers"</em>, <em>"ferns in shade"</em>, or{' '}
+                  <em>"succulents on a windowsill"</em>.
+                </small>
+              </label>
+
               <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[180px] flex-[1_1_180px]">
                 {FIELDS.n_samples?.label}
                 <input
@@ -211,7 +322,20 @@ export function ParamsForm({ paramsOpen }: Props) {
                   title={FIELDS.n_samples?.help}
                 />
               </label>
+            </div>
+          </details>
 
+          {/* The truly technical knobs — tucked behind their own
+              disclosure so the panel doesn't scare off casual users. */}
+          <details
+            open={advancedOpen}
+            onToggle={e => setAdvancedOpen((e.target as HTMLDetailsElement).open)}
+            className="text-fg-1 text-[0.8rem]"
+          >
+            <summary className="cursor-pointer text-fg-1 hover:text-fg text-[0.8rem] py-1">
+              Advanced (batch, top-K)
+            </summary>
+            <div className="flex flex-wrap items-start gap-x-5 gap-y-3 pt-2">
               <label className="text-fg-1 text-[0.8rem] flex flex-col gap-[3px] min-w-[180px] flex-[1_1_180px]">
                 {FIELDS.top_k?.label}
                 <input
@@ -252,5 +376,25 @@ function PlayIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
       <polygon points="6 4 20 12 6 20" />
     </svg>
+  );
+}
+
+// Tiny "?" badge that opens the field's full help text on hover/focus
+// (title attribute). Used inline next to the stop-criteria label so
+// the long description stays one click away without bloating the
+// visible row. Re-using the browser-native tooltip keeps the UI
+// consistent with the rest of the form (every other field already
+// uses `title=` for the same help string).
+function HintBadge({ text }: { text: string }) {
+  return (
+    <span
+      role="img"
+      aria-label="help"
+      title={text}
+      className="inline-flex items-center justify-center w-[14px] h-[14px] rounded-full border border-line2 text-fg-2 text-[0.65rem] leading-none cursor-help"
+      style={{ fontFamily: 'inherit' }}
+    >
+      ?
+    </span>
   );
 }

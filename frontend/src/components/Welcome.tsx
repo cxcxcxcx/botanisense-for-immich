@@ -2,11 +2,20 @@ import { useEffect, useState } from 'react';
 import { getResults, getStatus } from '../api/endpoints';
 import { navigate } from '../hooks/useRoute';
 
-// Onboarding wizard shown on the browse-list view when the local DB is
-// empty. Three steps — Connect → Seed query → First run — with a
-// localStorage-persisted "I'm done with this step" state so the user
-// doesn't see the same hint twice. Disappears automatically once a
-// pipeline run has produced any assets.
+// Onboarding wizard shown on the browse-list view when the pipeline has
+// not yet produced any data. Three steps — Connect → Seed query → First
+// run — with a server-state-driven visibility rule:
+//
+//   - Loads invisible until both API calls (status + results) resolve
+//     (no flicker of wizard while data is still in flight).
+//   - Hides itself once the pipeline has produced at least one asset.
+//     Server-state-driven so it works the same way on every port,
+//     every browser, every device — no per-origin localStorage trap.
+//
+// localStorage is used ONLY for the seed-query text (a UX preference,
+// not a state). The wizard's step state is component-local — it
+// resets each session, which is fine because we're only using it for
+// the in-progress walk-through cursor.
 //
 // Steps:
 //   1. Connect Immich — show the exact lines to paste into
@@ -17,30 +26,21 @@ import { navigate } from '../hooks/useRoute';
 //   3. First run — a CTA that jumps to the Run page with the seed
 //      query pre-filled.
 
-type WizardStep = 'connect' | 'seed' | 'run' | 'done';
+type WizardStep = 'connect' | 'seed' | 'run';
 
-const STEP_ORDER: WizardStep[] = ['connect', 'seed', 'run', 'done'];
+const STEP_ORDER: WizardStep[] = ['connect', 'seed', 'run'];
 
-const STORAGE_KEY_STEP = 'botanisense:onboarded-step';
+// localStorage is only for the seed-query text — not for any
+// visibility state.
 const STORAGE_KEY_SEED = 'botanisense:seed-query';
-
-function readStep(): WizardStep {
-  if (typeof window === 'undefined') return 'connect';
-  const v = localStorage.getItem(STORAGE_KEY_STEP);
-  return v && (STEP_ORDER as string[]).includes(v) ? (v as WizardStep) : 'connect';
-}
 
 function readSeed(): string {
   if (typeof window === 'undefined') return 'intentional plant photos';
   return localStorage.getItem(STORAGE_KEY_SEED) || 'intentional plant photos';
 }
 
-function writeStep(s: WizardStep) {
-  localStorage.setItem(STORAGE_KEY_STEP, s);
-}
-
 export function Welcome() {
-  const [step, setStep] = useState<WizardStep>(readStep);
+  const [step, setStep] = useState<WizardStep>('connect');
   const [seedQuery, setSeedQuery] = useState<string>(readSeed);
   const [hasRuns, setHasRuns] = useState<boolean | null>(null);
   const [totalAssets, setTotalAssets] = useState<number | null>(null);
@@ -62,20 +62,17 @@ export function Welcome() {
     return () => { cancelled = true; };
   }, []);
 
-  // Once the DB has data, the wizard is done forever.
-  useEffect(() => {
-    if (hasRuns === true && totalAssets !== null && totalAssets > 0 && step !== 'done') {
-      setStep('done');
-      writeStep('done');
-    }
-  }, [hasRuns, totalAssets, step]);
+  // Loading state — keep the wizard hidden until both API calls resolve,
+  // so users don't see a one-frame flash of "Welcome to BotaniSense" on
+  // every page load.
+  if (hasRuns === null || totalAssets === null) return null;
 
-  if (step === 'done') return null;
+  // Once the pipeline has produced assets, the wizard is done forever —
+  // same on every port, browser, device, regardless of any localStorage
+  // whether they've "clicked through" the steps before.
+  if (hasRuns && totalAssets > 0) return null;
 
-  const advance = (next: WizardStep) => {
-    setStep(next);
-    writeStep(next);
-  };
+  const advance = (next: WizardStep) => setStep(next);
 
   return (
     <section
@@ -161,29 +158,13 @@ export function Welcome() {
             against the TreeOfLife-200M label set. After it finishes,
             you'll land back here on the Browse view.
           </p>
-          <div className="flex flex-wrap gap-2">
-            <button
-              type="button"
-              className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
-              onClick={() => {
-                writeStep('done');
-                setStep('done');
-                navigate('run');
-              }}
-            >
-              Open Run page →
-            </button>
-            <button
-              type="button"
-              className="px-3 py-1.5 rounded border border-line2 text-fg text-sm no-underline hover:border-accent"
-              onClick={() => {
-                writeStep('done');
-                setStep('done');
-              }}
-            >
-              Skip for now
-            </button>
-          </div>
+          <button
+            type="button"
+            className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
+            onClick={() => navigate('run')}
+          >
+            Open Run page →
+          </button>
         </Step>
       )}
     </section>
@@ -222,7 +203,7 @@ function StepActions({
       )}
       <button
         type="button"
-        className="px-2.5 py-1 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
+        className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
         onClick={onNext}
       >
         {nextLabel}
@@ -237,7 +218,6 @@ function Stepper({ current }: { current: WizardStep }) {
     connect: 'Connect',
     seed: 'Seed query',
     run: 'First run',
-    done: 'Done',
   };
   const order: WizardStep[] = ['connect', 'seed', 'run'];
   const activeIdx = order.indexOf(current);
