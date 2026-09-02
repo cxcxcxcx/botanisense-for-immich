@@ -115,6 +115,10 @@ $EDITOR compose.yml          # set IMMICH_BASE_URL
 docker compose up --build -d
 ```
 
+Don't want to build locally? Uncomment the `image:` line in
+`compose.yml` to pull the prebuilt image from GHCR instead
+(published by CI on every release).
+
 The image contains the backend and the built web UI (~2 GB; CPU-only
 torch). BioCLIP-2 downloads into `./data/` on the first pipeline run.
 To enable the optional KNN reclassification, see
@@ -250,6 +254,8 @@ status, logs) is fetched per-component, with one SSE connection
   itself stays at ~250 MB.
 - **Tested against Immich ≥ 1.111.** Earlier versions may lack
   `/api/search/smart` and the album endpoints this app depends on.
+- **No telemetry.** The app phones home to nobody — no update checks,
+  no analytics, no crash reporting.
 
 ---
 

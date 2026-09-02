@@ -58,6 +58,12 @@ there are no backports.
   accepted risk: it widens what a tampered checkpoint file could do.
   The weights come from the official ultralytics release over HTTPS,
   and `yolov8s-world.pt` is never committed to this repo.
+- **Two diagnostic endpoints are unauthenticated by design**:
+  `/api/mem` (tracemalloc heap snapshots) and `/api/perf` (per-route
+  latency stats). They expose details about the host's memory layout
+  and usage patterns to anyone who can reach the port. Acceptable on a
+  single-user LAN; consider a proxy rule to block them if you expose
+  the app more widely.
 
 ## Configuration
 

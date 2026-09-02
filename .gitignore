@@ -10,9 +10,12 @@ weights/
 yolov8s-world.pt
 lock_wal.db
 
-# But the hand-labeled photo batches are source-code-like data we want
-# to keep reproducible. Force-track just this directory.
-!data/label_sample/
+# Private: hand-labeled photo batches (personal filenames + asset UUIDs)
+# and the offline person-classifier experiment workflow. Kept locally,
+# not published — they're dev-only and not needed to run the app.
+data/label_sample/
+scripts/person_*
+scripts/PERSON_CLASSIFIER.md
 
 # Orphan SQLite files at the repo root (the `data/` directory is already
 # covered by the rule above). `data.state.db` is a real risk: a fresh
