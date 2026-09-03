@@ -70,7 +70,15 @@ COPY app.py pipeline.py storage.py clusters.py \
 RUN useradd --uid 1000 --create-home botanisense \
     && mkdir -p /app/data \
     && chown botanisense:botanisense /app/data
-USER botanisense
+
+# The image's default /app/data is uid-1000-owned (named volumes and
+# `--user 1000` runs inherit that), but the container STARTS as root:
+# the entrypoint fixes the ownership of a root-owned ./data bind mount
+# (Compose auto-creates it as root) and then re-execs this CMD via
+# setpriv as botanisense. uvicorn therefore never serves as root.
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 
 EXPOSE 8765
 # /api/health answers 200 once the app is up (it never loads models at
