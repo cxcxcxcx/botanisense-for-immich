@@ -41,11 +41,13 @@ services:
       # downloaded on first pipeline run).
       - ./data:/app/data
       # Host timezone → log timestamps (and `date` inside the container)
-      # match the host's local time instead of UTC. On Linux both paths
-      # always exist; Docker Desktop resolves them inside its VM.
+      # match the host's local time instead of UTC. Works on any Linux
+      # host; Docker Desktop resolves it inside its VM (= UTC there).
       # To pin a specific zone instead, set TZ: "Asia/Shanghai" in the
-      # environment block — the image ships tzdata.
+      # environment block — the image ships its own tzdata, so TZ needs
+      # no mount. (Don't bind-mount the host's zoneinfo dir here: the
+      # path varies by distro and a missing source auto-creates an
+      # empty dir that shadows the image's copy.)
       - /etc/localtime:/etc/localtime:ro
-      - /etc/zoneinfo:/usr/share/zoneinfo:ro
       # Optional: the KNN index, mounted read-only.
       # - ./knn-index:/app/knn-index:ro
