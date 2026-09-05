@@ -128,7 +128,19 @@ def _resolve_classifier() -> "object | None":
     with _clf_lock:
         if _clf_cache is None:
             _TreeOfLifeClassifier = globals()["TreeOfLifeClassifier"]
+            # The load (and on first use ever, the ~4.3 GB download)
+            # takes minutes with no callback of our own — say so, or the
+            # log tail looks hung mid-run. HF's own tqdm bar only goes
+            # to the child's stderr (docker logs), never this file.
+            _log.info(
+                "[model] loading BioCLIP-2 (first use downloads ~4.3 GB "
+                "of weights + label table; progress bar in docker logs)"
+            )
+            _t0 = time.monotonic()
             _clf_cache = _TreeOfLifeClassifier()
+            _log.info(
+                f"[model] BioCLIP-2 ready in {time.monotonic() - _t0:.0f}s"
+            )
     return _clf_cache
 
 
