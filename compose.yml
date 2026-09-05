@@ -1,7 +1,8 @@
 # BotaniSense for Immich — docker compose setup.
 #
 #   1. docker compose up --build -d
-#   2. open http://localhost:8765
+#   2. open http://<this-host>:8765  (the server binds 0.0.0.0, so any
+#      LAN device works; http://localhost:8765 only from the host itself)
 #   3. enter your Immich URL + API key in the form and click
 #      "Save & test connection"
 #

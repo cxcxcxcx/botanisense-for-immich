@@ -101,7 +101,9 @@ cd botanisense-for-immich
 # 1. Build + run
 docker compose up --build -d
 
-# 2. Open http://localhost:8765
+# 2. Open http://<this-host>:8765 — from any LAN device; the server
+#    binds 0.0.0.0. (http://localhost:8765 works only on the host
+#    itself.)
 #    → the Welcome screen asks for your Immich URL and API key.
 #      Click "Save & test connection" — it verifies immediately.
 ```
