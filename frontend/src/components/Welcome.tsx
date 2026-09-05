@@ -4,8 +4,8 @@ import { navigate } from '../hooks/useRoute';
 import { ConnectForm } from './ConnectForm';
 
 // Onboarding wizard shown on the browse-list view when the pipeline has
-// not yet produced any data. Three steps — Connect → Seed query → First
-// run — with a server-state-driven visibility rule:
+// not yet produced any data. Two steps — Connect → First run — with a
+// server-state-driven visibility rule:
 //
 //   - Loads invisible until both API calls (status + results) resolve
 //     (no flicker of wizard while data is still in flight).
@@ -13,35 +13,22 @@ import { ConnectForm } from './ConnectForm';
 //     Server-state-driven so it works the same way on every port,
 //     every browser, every device — no per-origin localStorage trap.
 //
-// localStorage is used ONLY for the seed-query text (a UX preference,
-// not a state). The wizard's step state is component-local — it
-// resets each session, which is fine because we're only using it for
-// the in-progress walk-through cursor.
+// The wizard's step state is component-local — it resets each session,
+// which is fine because we're only using it for the in-progress
+// walk-through cursor.
 //
 // Steps:
 //   1. Connect Immich — the connection form (URL + API key), saved via
 //      POST /api/settings/immich and live-checked. No config files.
-//   2. Seed query — text input; value persists to localStorage and
-//      is read by ParamsForm as the default.
-//   3. First run — a CTA that jumps to the Run page with the seed
-//      query pre-filled.
+//   2. First run — a CTA that jumps to the Run page. The seed query
+//      lives there (ParamsForm), so no separate step for it.
 
-type WizardStep = 'connect' | 'seed' | 'run';
+type WizardStep = 'connect' | 'run';
 
-const STEP_ORDER: WizardStep[] = ['connect', 'seed', 'run'];
-
-// localStorage is only for the seed-query text — not for any
-// visibility state.
-const STORAGE_KEY_SEED = 'botanisense:seed-query';
-
-function readSeed(): string {
-  if (typeof window === 'undefined') return 'intentional plant photos';
-  return localStorage.getItem(STORAGE_KEY_SEED) || 'intentional plant photos';
-}
+const STEP_ORDER: WizardStep[] = ['connect', 'run'];
 
 export function Welcome() {
   const [step, setStep] = useState<WizardStep>('connect');
-  const [seedQuery, setSeedQuery] = useState<string>(readSeed);
   const [hasRuns, setHasRuns] = useState<boolean | null>(null);
   const [totalAssets, setTotalAssets] = useState<number | null>(null);
   // null = still checking; true once /api/health reports the connection
@@ -89,7 +76,7 @@ export function Welcome() {
       <header className="flex items-baseline justify-between gap-3 mb-3">
         <h2 className="text-xl sm:text-2xl m-0">Welcome to BotaniSense</h2>
         <span className="text-[11px] text-fg-1 font-mono">
-          Step {STEP_ORDER.indexOf(step) + 1} / 3
+          Step {STEP_ORDER.indexOf(step) + 1} / {STEP_ORDER.length}
         </span>
       </header>
 
@@ -111,8 +98,8 @@ export function Welcome() {
             }
           />
           <StepActions
-            onNext={() => advance('seed')}
-            nextLabel="Next: pick a seed query"
+            onNext={() => advance('run')}
+            nextLabel="Next: start first run"
             nextDisabled={connected !== true}
             nextHint={
               connected === null
@@ -121,36 +108,6 @@ export function Welcome() {
                 ? 'Save a working connection to continue'
                 : undefined
             }
-          />
-        </Step>
-      )}
-
-      {step === 'seed' && (
-        <Step
-          title="Pick a seed query"
-          help="This is what the pipeline asks Immich's smart-search for. Try descriptive phrases — plants, scenes, or photo style."
-        >
-          <p className="text-fg-1 text-[13px] m-0 mb-3">
-            The default covers most libraries. Replace it with
-            something narrower if your photos need it.
-          </p>
-          <input
-            type="text"
-            value={seedQuery}
-            onChange={e => {
-              setSeedQuery(e.target.value);
-              localStorage.setItem(STORAGE_KEY_SEED, e.target.value);
-            }}
-            placeholder="intentional plant photos"
-            className="w-full bg-bg-2 text-fg border border-line2 px-2.5 py-2 rounded text-[0.9rem] font-mono focus:outline-none focus:border-accent"
-          />
-          <p className="text-fg-2 text-[11px] m-0 mt-2">
-            Examples: <em>red flowers</em>, <em>moss on rocks</em>, <em>tree bark close-up</em>, <em>succulents in pots</em>.
-          </p>
-          <StepActions
-            onBack={() => advance('connect')}
-            onNext={() => advance('run')}
-            nextLabel="Next: start first run"
           />
         </Step>
       )}
@@ -232,13 +189,12 @@ function StepActions({
 }
 
 function Stepper({ current }: { current: WizardStep }) {
-  // Three-dot indicator above the active step.
+  // Two-dot indicator above the active step.
   const labels: Record<WizardStep, string> = {
     connect: 'Connect',
-    seed: 'Seed query',
     run: 'First run',
   };
-  const order: WizardStep[] = ['connect', 'seed', 'run'];
+  const order: WizardStep[] = [...STEP_ORDER];
   const activeIdx = order.indexOf(current);
   return (
     <ol className="m-0 mb-4 p-0 list-none flex items-center gap-2 text-[11px] text-fg-1">
