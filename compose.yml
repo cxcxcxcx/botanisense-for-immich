@@ -42,12 +42,12 @@ services:
       - ./data:/app/data
       # Host timezone → log timestamps (and `date` inside the container)
       # match the host's local time instead of UTC. Works on any Linux
-      # host; Docker Desktop resolves it inside its VM (= UTC there).
-      # To pin a specific zone instead, set TZ: "Asia/Shanghai" in the
-      # environment block — the image ships its own tzdata, so TZ needs
-      # no mount. (Don't bind-mount the host's zoneinfo dir here: the
-      # path varies by distro and a missing source auto-creates an
-      # empty dir that shadows the image's copy.)
+      # host; Docker Desktop resolves it inside its VM (= UTC there) —
+      # put TZ=Asia/Shanghai in .env instead (cross-platform; the image
+      # ships its own tzdata so TZ needs no mount). Don't bind-mount
+      # the host's zoneinfo dir: the path varies by distro and a
+      # missing source auto-creates an empty dir that shadows the
+      # image's copy.
       - /etc/localtime:/etc/localtime:ro
       # Optional: the KNN index, mounted read-only.
       # - ./knn-index:/app/knn-index:ro

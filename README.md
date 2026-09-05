@@ -155,6 +155,7 @@ Two surfaces, both optional:
 | `HOST`, `PORT` | `0.0.0.0`, `8765` | Server bind |
 | `RUN_ON_STARTUP` | `0` (off) | Run the pipeline once at boot |
 | `PIPELINE_CRON` | _(off)_ | Daily pipeline run at HH:MM |
+| `TZ` | host zone / UTC | IANA zone for log timestamps |
 | `PLANTAE_GREEN`, `PLANTAE_YELLOW` | `0.60`, `0.35` | Confidence tier thresholds |
 | `FUNGI_MIN_SCORE_DEFAULT` | `0.60` | Fungi sync threshold |
 
@@ -162,7 +163,10 @@ Two surfaces, both optional:
 Immich over a hostname the browser can't resolve (e.g. both in one
 compose network): the server keeps using `IMMICH_BASE_URL`, while
 "Open in Immich" links use the public URL. `PIPELINE_CRON` (HH:MM)
-runs the pipeline daily at that time. `CORS_ORIGINS` takes a
+runs the pipeline daily at that time. `TZ` sets the zone used for log timestamps: `compose.yml` mounts the
+host's `/etc/localtime`, which covers Linux automatically — set `TZ`
+in `.env` on Docker Desktop (macOS/Windows) or to pin a zone.
+`CORS_ORIGINS` takes a
 comma-separated origin list; set it empty for same-origin only.
 
 ---
