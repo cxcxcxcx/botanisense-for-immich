@@ -104,7 +104,7 @@ export function StatusPanel({ compact = false }: Props = {}) {
             type="button"
             onClick={handleStop}
             disabled={stopping}
-            className="px-2 py-0.5 rounded border border-[#a44] bg-transparent text-red-300 text-[11px] hover:bg-[#422] hover:border-red-400 disabled:opacity-50"
+            className="px-2 py-0.5 rounded text-[11px] danger-btn"
             title="Stop the running pipeline at the next batch boundary"
           >
             {stopping ? 'stopping…' : 'Stop'}
@@ -134,7 +134,7 @@ export function StatusPanel({ compact = false }: Props = {}) {
       </div>
       {bars.length > 0 && (
         <>
-          <div className={`flex h-1.5 rounded overflow-hidden bg-[#222] ${compact ? 'hidden' : ''}`}>
+          <div className={`flex h-1.5 rounded overflow-hidden bg-bg-2 ${compact ? 'hidden' : ''}`}>
             {bars.map(b => (
               <span
                 key={b.key}
