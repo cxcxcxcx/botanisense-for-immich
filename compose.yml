@@ -1,14 +1,11 @@
 # BotaniSense for Immich — docker compose setup.
 #
-#   1. cp .env.example .env          # then set IMMICH_API_KEY
-#   2. set IMMICH_BASE_URL below     # where the server reaches Immich
-#   3. docker compose up --build -d  # then open http://localhost:8765
+#   1. docker compose up --build -d
+#   2. open http://localhost:8765
+#   3. enter your Immich URL + API key in the form and click
+#      "Save & test connection"
 #
-# Optional KNN reclassification (~20 GB download, see README):
-#
-#   uv run scripts/download_knn_index.py --out knn-index
-#
-# then uncomment the two `knn:` lines below and restart.
+# No .env or config files needed. Everything below is optional.
 
 services:
   botanisense:
@@ -18,20 +15,29 @@ services:
     restart: unless-stopped
     ports:
       - "8765:8765"
-    environment:
-      # Where the SERVER reaches Immich (all API calls are server-side).
-      IMMICH_BASE_URL: "http://192.168.1.10:2283"
-      # Where the BROWSER reaches Immich, for "Open in Immich" links.
-      # Only set this when it differs from IMMICH_BASE_URL — e.g. if
-      # Immich runs in the same compose network and the server uses a
-      # service name the browser can't resolve:
-      # IMMICH_PUBLIC_URL: "http://192.168.1.10:2283"
-      # KNN_INVENTORY_DIR: "/app/knn-index"   # enable with the mount below
+    # All environment is optional. The Immich URL and API key can be
+    # entered in the web UI instead (stored in the database); setting
+    # them here pins the connection so UI-saved values are ignored
+    # until the vars are removed. Uncomment what you need:
+    #
+    # Where the SERVER reaches Immich (all API calls are server-side):
+    # environment:
+    #   IMMICH_BASE_URL: "http://192.168.1.10:2283"
+    #   # Where the BROWSER reaches Immich, for "Open in Immich" links.
+    #   # Only set this when it differs from IMMICH_BASE_URL — e.g. if
+    #   # Immich runs in the same compose network and the server uses a
+    #   # service name the browser can't resolve:
+    #   IMMICH_PUBLIC_URL: "http://192.168.1.10:2283"
+    #   KNN_INVENTORY_DIR: "/app/knn-index"   # enable with the mount below
     env_file:
-      - .env
+      # Optional secrets file — e.g. IMMICH_API_KEY. The web UI is the
+      # friendlier path; this is for automation / GitOps setups.
+      - path: .env
+        required: false
     volumes:
-      # SQLite DB, thumbnail cache, job logs, and the HuggingFace model
-      # cache (BioCLIP-2, ~4.3 GB, downloaded on first pipeline run).
+      # SQLite DB (incl. the saved Immich connection), thumbnail cache,
+      # job logs, and the HuggingFace model cache (BioCLIP-2, ~4.3 GB,
+      # downloaded on first pipeline run).
       - ./data:/app/data
       # Optional: the KNN index, mounted read-only.
       # - ./knn-index:/app/knn-index:ro

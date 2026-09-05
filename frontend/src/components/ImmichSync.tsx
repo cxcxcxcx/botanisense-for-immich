@@ -25,7 +25,7 @@ import {
   removeClusterAlbums,
 } from '../api/endpoints';
 import type { SyncDefaults } from '../api/types';
-import { useApp, useSyncDefaults } from '../state/AppContext';
+import { useApp, useConfig, useSyncDefaults } from '../state/AppContext';
 import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
@@ -536,6 +536,11 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         </button>
       </header>
 
+      {/* Connection row: where the server points, with the edit path
+          for an already-configured install (the Welcome wizard covers
+          the not-yet-configured case). */}
+      <ConnectionRow />
+
       {seeded && (
         <p className="text-[0.72rem] text-fg-2 m-0">
           Defaults initialised from environment — edit below or just go.
@@ -878,4 +883,28 @@ async function previewSyncAllClusters(_pf: PeopleFilter): Promise<{ n_assets: nu
   const r = await listClusterAlbums();
   const n = r.albums.reduce((s, a) => s + (a.n_assets ?? 0), 0);
   return { n_assets: n };
+}
+// One-line "where the server points" indicator with the edit path for
+// an already-configured install. Reads the config cached in the
+// reducer (fetched at App mount, refreshed after the form saves).
+export function ConnectionRow() {
+  const { dispatch } = useApp();
+  const config = useConfig();
+  if (!config?.base_url) return null;
+  return (
+    <div className="flex items-center gap-2 flex-wrap text-[0.72rem] text-fg-2">
+      <span aria-hidden="true" className="text-green-400">●</span>
+      <span className="font-mono">
+        {config.base_url}
+        {config.source === 'env' ? ' (set by environment)' : ''}
+      </span>
+      <button
+        type="button"
+        className="text-fg-1 hover:text-fg underline decoration-dotted"
+        onClick={() => dispatch({ type: 'OPEN_CONNECTION_MODAL' })}
+      >
+        Edit
+      </button>
+    </div>
+  );
 }

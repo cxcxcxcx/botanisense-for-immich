@@ -222,7 +222,7 @@ def test_worker_excludes_junk_clusters_from_totals_and_progress(db_path):
         app._cluster_album_jobs[job_id] = _new_job_dict()
 
     with mock.patch.object(app, "_immich_client", return_value=fake), \
-         mock.patch.object(app, "BASE_URL", "http://x"), \
+         mock.patch.dict(os.environ, {"IMMICH_BASE_URL": "http://x"}), \
          mock.patch("time.sleep"):
         app._cluster_album_sync_all_worker(job_id, force_recreate=False)
 
@@ -268,7 +268,7 @@ def test_worker_progress_never_exceeds_filtered_count(db_path):
         return storage.set_cluster_album(conn, **kw)
 
     with mock.patch.object(app, "_immich_client", return_value=fake), \
-         mock.patch.object(app, "BASE_URL", "http://x"), \
+         mock.patch.dict(os.environ, {"IMMICH_BASE_URL": "http://x"}), \
          mock.patch.object(storage, "set_cluster_album", _track_set_cluster_album), \
          mock.patch("time.sleep"):
         app._cluster_album_sync_all_worker(job_id, force_recreate=False)
@@ -293,7 +293,7 @@ def test_worker_all_clusters_junk_yields_zero_cluster_run(db_path):
         app._cluster_album_jobs[job_id] = _new_job_dict()
 
     with mock.patch.object(app, "_immich_client", return_value=fake), \
-         mock.patch.object(app, "BASE_URL", "http://x"), \
+         mock.patch.dict(os.environ, {"IMMICH_BASE_URL": "http://x"}), \
          mock.patch("time.sleep"):
         app._cluster_album_sync_all_worker(job_id, force_recreate=False)
 

@@ -67,6 +67,13 @@ there are no backports.
 
 ## Configuration
 
-The app loads `config.toml` (gitignored) for non-secret settings and
-`.env` for the Immich API key. **Never commit these files.** The
-templates `config.example.toml` and `.env.example` show what each key does.
+The Immich URL and API key are configured either from the web UI
+(stored **in plaintext** in the SQLite DB under `data/state.db` — the
+same posture as a `.env` file on disk) or via the `IMMICH_BASE_URL` /
+`IMMICH_API_KEY` environment variables, which take precedence. Note
+that `POST /api/settings/immich` is unauthenticated: anyone who can
+reach the port can repoint the app at a different Immich server. This
+is consistent with the no-auth posture above and acceptable on a
+single-user LAN; don't expose this app more widely. **Never commit**
+`.env` or `data/state.db`. The `.env.example` template documents the
+supported environment variables.

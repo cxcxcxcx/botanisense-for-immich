@@ -52,11 +52,11 @@ Scope prefix (Browse / Run / Card / etc.) is optional but helpful.
 
 - [ ] Tests pass (`uv run pytest tests/ -x` and `npm run typecheck`)
 - [ ] Frontend builds (`cd frontend && npm run build`)
-- [ ] No new secrets in code or config files (`.env` and `config.toml`
+- [ ] No new secrets in code or committed files (`.env` and `data/`
       are gitignored; never commit them)
 - [ ] No hardcoded personal defaults (LAN IPs, filesystem paths,
-      absolute `/media/...` mounts) — see `config.example.toml` for
-      how settings should flow
+      absolute `/media/...` mounts) — new settings flow through env
+      vars (see `.env.example`) or the web-UI connection form
 - [ ] If adding a new env var, update both `.env.example` and the
       "Configuration" table in `README.md`
 
@@ -69,8 +69,8 @@ The following are gitignored but it's worth restating:
 - `data/thumbs/` — cached Immich thumbnails (~1.4M files for a17k library)
 - `weights/` — downloaded ML model weights (~5 GB)
 - `frontend/dist/` — built frontend assets
-- `.env` — Immich API key
-- `config.toml` — user config
+- `.env` — Immich API key / env-pinned settings
+- `data/state.db` — SQLite DB (also holds the UI-saved connection)
 
 If you accidentally `git add` one of these, `git rm --cached` will
 untrack without deleting the working copy.

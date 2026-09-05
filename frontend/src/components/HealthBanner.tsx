@@ -1,20 +1,32 @@
 import { useEffect, useState } from 'react';
 import { getHealth } from '../api/endpoints';
 import type { Health } from '../api/types';
+import { useApp, useConnectionModal } from '../state/AppContext';
 
 // Top-of-page banner that surfaces blocking misconfigurations before
-// the user starts a 5-minute pipeline run. Polled once on mount (not
-// via SSE — health is slow-changing and a one-shot is cheap).
+// the user starts a 5-minute pipeline run. Fetched once on mount (not
+// via SSE — health is slow-changing and a one-shot is cheap), and
+// re-fetched when the "Fix connection" modal closes so a saved
+// connection clears the banner without a reload.
 //
 // Tone:
 //   - red:    Immich unreachable OR API key invalid (blockers — pipeline
-//             cannot run).
-//   - yellow: KNN index missing OR BioCLIP weights not yet downloaded
-//             (warnings — pipeline still works in zero-shot mode).
+//             cannot run). Carries a "Fix connection" action opening the
+//             connection modal (same form as the Welcome wizard).
+//   - yellow: BioCLIP weights not yet downloaded (warning — the pipeline
+//             still works; KNN state is surfaced in its own section on
+//             the Run page rather than as a top-level highlight).
+
+interface Blocker {
+  text: string;
+  fixConnection?: boolean;
+}
 
 export function HealthBanner() {
   const [health, setHealth] = useState<Health | null>(null);
   const [dismissed, setDismissed] = useState(false);
+  const { dispatch } = useApp();
+  const connectionModalOpen = useConnectionModal();
 
   useEffect(() => {
     let cancelled = false;
@@ -22,31 +34,33 @@ export function HealthBanner() {
       .then(h => { if (!cancelled) setHealth(h); })
       .catch(() => { /* silently null — no banner */ });
     return () => { cancelled = true; };
-  }, []);
+  }, [connectionModalOpen]);
 
   if (!health || dismissed) return null;
 
   // Categorise findings.
-  const blockers: string[] = [];
+  const blockers: Blocker[] = [];
   const warnings: string[] = [];
 
   if (health.immich?.ok === false) {
-    blockers.push(
-      `Immich unreachable${health.immich.error ? ` — ${health.immich.error}` : ''}. ` +
-      'Check `[immich].base_url` in config.toml.',
-    );
+    blockers.push({
+      text:
+        `Immich unreachable${health.immich.error ? ` — ${health.immich.error}` : ''}. ` +
+        (health.immich.error === 'not configured'
+          ? 'Enter your Immich URL and API key to get started.'
+          : 'Check that Immich is up and the URL is right.'),
+      fixConnection: true,
+    });
   }
   if (health.api_key?.ok === false) {
-    blockers.push(
-      `Immich API key invalid${health.api_key.error ? ` (${health.api_key.error})` : ''}. ` +
-      'Regenerate in Immich → Administration → API Keys.',
-    );
-  }
-  if (health.knn?.configured && health.knn?.built === false) {
-    warnings.push(
-      `KNN reference index missing at ${health.knn.path}. ` +
-      'Build it from the Run page to enable re-classification.',
-    );
+    blockers.push({
+      text:
+        `Immich API key invalid${health.api_key.error ? ` (${health.api_key.error})` : ''}. ` +
+        (health.api_key.error === 'not configured'
+          ? ''
+          : 'Generate a new one in Immich → Administration → API Keys.'),
+      fixConnection: true,
+    });
   }
   if (health.bioclip?.weights_present === false) {
     warnings.push(
@@ -57,7 +71,6 @@ export function HealthBanner() {
 
   if (blockers.length === 0 && warnings.length === 0) return null;
 
-  const items = [...blockers, ...warnings];
   const isRed = blockers.length > 0;
 
   return (
@@ -78,8 +91,22 @@ export function HealthBanner() {
             {isRed ? 'Configuration problem' : 'Heads up'}
           </strong>
           <ul className="m-0 p-0 list-none space-y-1">
-            {items.map((m, i) => (
-              <li key={i}>{m}</li>
+            {blockers.map((b, i) => (
+              <li key={i} className="flex items-center gap-2 flex-wrap">
+                <span>{b.text}</span>
+                {b.fixConnection && (
+                  <button
+                    type="button"
+                    className="px-2 py-0.5 rounded border border-[#a44] text-[#fbb] text-[11px] hover:bg-[#3a1c1c]"
+                    onClick={() => dispatch({ type: 'OPEN_CONNECTION_MODAL' })}
+                  >
+                    Fix connection
+                  </button>
+                )}
+              </li>
+            ))}
+            {warnings.map((w, i) => (
+              <li key={`w${i}`}>{w}</li>
             ))}
           </ul>
         </div>

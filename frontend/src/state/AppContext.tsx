@@ -14,7 +14,7 @@ import {
   type Dispatch,
   type ReactNode,
 } from 'react';
-import type { SyncDefaults } from '../api/types';
+import type { PublicConfig, SyncDefaults } from '../api/types';
 
 // ---- Types ---------------------------------------------------------------
 
@@ -110,6 +110,14 @@ export interface AppState {
   // live in ImmichSync's local state — they don't go through the
   // reducer because they shouldn't survive a remount.
   syncDefaults: SyncDefaults | null;
+  // /api/config, fetched once at App mount and refreshed after the
+  // connection form saves. Drives the connection form's prefill and
+  // the env-pinned notice. Null until the first fetch resolves.
+  config: PublicConfig | null;
+  // The "Fix connection" modal (ConnectForm inside a Modal). Opened
+  // from HealthBanner's Immich blockers and ImmichSync's connection
+  // row; the Welcome wizard embeds ConnectForm directly instead.
+  connectionModalOpen: boolean;
   // Multi-select state (UX-17). Set of asset_ids the user has
   // checked via the Card checkbox. Lives in the global reducer so
   // the floating action bar (rendered by Grid) and the cards can
@@ -131,6 +139,9 @@ export type Action =
   | { type: 'JOB_ERROR'; errorMsg: string }
   | { type: 'JOB_HIDE' }
   | { type: 'SET_SYNC_DEFAULTS'; defaults: SyncDefaults | null }
+  | { type: 'SET_CONFIG'; config: PublicConfig | null }
+  | { type: 'OPEN_CONNECTION_MODAL' }
+  | { type: 'CLOSE_CONNECTION_MODAL' }
   | { type: 'TOGGLE_SELECT'; assetId: string }
   | { type: 'SELECT_RANGE'; assetIds: string[]; selected: boolean }
   | { type: 'CLEAR_SELECTION' };
@@ -161,6 +172,8 @@ const INITIAL: AppState = {
   job: defaultJob(),
   filtersCollapsed: false,
   syncDefaults: null,
+  config: null,
+  connectionModalOpen: false,
   selection: new Set<string>(),
 };
 
@@ -244,6 +257,12 @@ function reducer(state: AppState, action: Action): AppState {
       return { ...state, job: defaultJob() };
     case 'SET_SYNC_DEFAULTS':
       return { ...state, syncDefaults: action.defaults };
+    case 'SET_CONFIG':
+      return { ...state, config: action.config };
+    case 'OPEN_CONNECTION_MODAL':
+      return { ...state, connectionModalOpen: true };
+    case 'CLOSE_CONNECTION_MODAL':
+      return { ...state, connectionModalOpen: false };
     case 'TOGGLE_SELECT': {
       const next = new Set(state.selection);
       if (next.has(action.assetId)) next.delete(action.assetId);
@@ -299,6 +318,12 @@ export function useJob() {
 }
 export function useSyncDefaults() {
   return useApp().state.syncDefaults;
+}
+export function useConfig() {
+  return useApp().state.config;
+}
+export function useConnectionModal() {
+  return useApp().state.connectionModalOpen;
 }
 
 export function useSelection() {

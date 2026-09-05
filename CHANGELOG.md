@@ -11,6 +11,14 @@ development since the BotaniSense-for-Immich rebrand in mid-2026.
 
 ### Features
 
+- **In-app setup — no config files.** The Immich URL and API key are
+  entered in the web UI (Welcome screen), stored in the app's SQLite
+  DB, and take effect immediately; edit them later via the health
+  banner's "Fix connection" or the Run page's Sync section.
+  `IMMICH_BASE_URL` / `IMMICH_API_KEY` environment variables still
+  work and pin the connection. `config.toml` is gone; an existing
+  file is migrated automatically on first boot of the new version
+  (base URL → DB, KNN/CORS values → environment).
 - **Immich smart-search ingestion.** Runs Immich's `/api/search/smart`
   with a configurable seed query and ingests the top-N matching assets
   (default 10 000).

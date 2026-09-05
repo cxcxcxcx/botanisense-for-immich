@@ -259,11 +259,34 @@ export interface KnnBuildLogsResponse {
 // Every field is optional at the type level because the endpoint is
 // best-effort and may degrade gracefully; the banner falls back to
 // "loading…" if the whole request fails.
-// /api/config — non-secret config surfaced to the SPA. Currently
-// just the public Immich URL, used by AssetDetail's "Open in Immich"
-// button. Extend as the UI needs more runtime info.
+// /api/config — non-secret config surfaced to the SPA.
+// `immich_public_url` drives AssetDetail's "Open in Immich" button.
+// `base_url` / `api_key_set` / `source` drive the connection form
+// (Welcome screen + "Fix connection" modal): the URL is not a secret
+// and is returned so the form can pre-fill it; the API key is only
+// ever surfaced as a boolean — its value never leaves the server.
+// `env_pinned` = env vars are set, so a UI-saved connection is
+// shadowed until they're removed (the form says so).
 export interface PublicConfig {
   immich_public_url: string;
+  base_url: string;
+  api_key_set: boolean;
+  source: 'env' | 'db' | 'none';
+  env_pinned: boolean;
+}
+
+// POST /api/settings/immich — save the Immich connection from the web
+// UI. Blank api_key = keep the saved one. The response carries the
+// fresh health payload so the form can show connected/broken without
+// a second round trip.
+export interface ImmichConnectionParams {
+  base_url: string;
+  api_key?: string;
+}
+export interface SaveConnectionResponse {
+  saved: boolean;
+  env_pinned: boolean;
+  health: Health;
 }
 
 export interface HealthImmich {

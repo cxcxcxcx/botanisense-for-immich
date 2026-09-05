@@ -11,17 +11,18 @@ import { JobPanel } from './components/JobPanel';
 import { ImmichSync } from './components/ImmichSync';
 import { LegendBar } from './components/LegendBar';
 import { StatusPanel } from './components/StatusPanel';
-import { KnnAlert } from './components/KnnAlert';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Welcome } from './components/Welcome';
 import { HealthBanner } from './components/HealthBanner';
 import { PlantaeLegend } from './components/PlantaeLegend';
 import { ShortcutsHelpModal } from './components/ShortcutsHelpModal';
 import { SelectionActionBar } from './components/SelectionActionBar';
+import { ConnectionModal } from './components/ConnectionModal';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
+import { getConfig } from './api/endpoints';
 
 export function App() {
   const { dispatch } = useApp();
@@ -61,6 +62,16 @@ export function App() {
   // On mount, hydrate the reducer from URL (and fall back to localStorage).
   useEffect(() => {
     dispatch({ type: 'SET_FILTERS', patch: initialFilters() });
+  }, [dispatch]);
+
+  // Fetch the non-secret config once (connection form prefill + the
+  // env-pinned notice); refreshed after the connection form saves.
+  useEffect(() => {
+    let cancelled = false;
+    getConfig()
+      .then(cfg => { if (!cancelled) dispatch({ type: 'SET_CONFIG', config: cfg }); })
+      .catch(() => { /* form falls back to an empty prefill */ });
+    return () => { cancelled = true; };
   }, [dispatch]);
 
   // Back/forward navigation: re-parse the URL. Both popstate (history
@@ -130,12 +141,10 @@ export function App() {
         {view === 'run' ? (
           <section className="run-section">
             {/* Run-page sections, top-to-bottom:
-                  1. KNN warning — only when reference index is missing
-                  2. Pipeline run — params + Run button + live progress
-                  3. Sync to IMMICH — clusters / Plantae / Fungi / Remove
-                  4. Data tools — KNN build / EXIF backfill / purge / detect people
-                  5. Logs — pipeline + worker output */}
-            <KnnAlert />
+                  1. Pipeline run — params + Run button + live progress
+                  2. Sync to IMMICH — clusters / Plantae / Fungi / Remove
+                  3. Data tools — KNN status + build / EXIF backfill / purge / detect people
+                  4. Logs — pipeline + worker output */}
             <section className="run-card" aria-label="Pipeline">
               <header className="run-card-header">
                 <h3 className="run-card-title">
@@ -198,6 +207,7 @@ export function App() {
       <PlantaeLegend dismissible={view !== 'run'} />
       <SelectionActionBar />
       <ShortcutsHelpModal open={showShortcuts} onClose={() => setShowShortcuts(false)} />
+      <ConnectionModal />
       </ErrorBoundary>
     </>
   );

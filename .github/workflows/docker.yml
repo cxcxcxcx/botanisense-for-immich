@@ -4,6 +4,13 @@ name: Docker image
 # and every v* tag (latest + semver). Pull counts on the package page
 # are the project's usage signal — this app deliberately phones home
 # to nobody.
+#
+# Before pushing, the image is smoke-tested: run it UNCONFIGURED (no
+# Immich URL/key) and assert it boots, serves the SPA, reports health
+# with db.ok=true + immich.ok=false, keeps KNN off, and accepts a
+# connection save (a real DB write into the mounted volume). This
+# catches the classic first-boot failure modes: missing SPA, startup
+# crash, unwritable data dir.
 
 on:
   push:
@@ -25,6 +32,56 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
+      # Build locally first (no push) so the smoke test runs against
+      # the exact artifact that will be published.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: botanisense:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke test — deliberately unconfigured (no IMMICH_* env): the
+      # app must boot and serve so the web UI can collect the
+      # connection. /api/health answers 200 even then.
+      - name: Smoke test the image
+        run: |
+          docker run -d --name smoke -p 8765:8765 botanisense:ci
+
+          # Wait for boot (image build download bursts can be slow).
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8765/api/health > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+            if [ "$i" = "60" ]; then
+              echo "::error::container never became healthy"
+              docker logs smoke
+              exit 1
+            fi
+          done
+
+          cat /tmp/health.json
+          # DB reachable (catches unwritable-data-dir boot crashes)…
+          grep -q '"db":{"ok":true' /tmp/health.json
+          # …and unconfigured = Immich reported unreachable, not a crash.
+          grep -q '"immich":{"ok":false' /tmp/health.json
+
+          # SPA is served (catches a missing/broken frontend build).
+          curl -sf http://localhost:8765/ | grep -qi '<!doctype html'
+          # KNN is data-optional: off unless an index is mounted.
+          curl -sf http://localhost:8765/api/knn-status | grep -q '"index_built":false'
+
+          # The settings write path works (a real SQLite write in the
+          # volume — would have caught the root-owned ./data bug).
+          curl -sf -X POST http://localhost:8765/api/settings/immich \
+            -H 'Content-Type: application/json' \
+            -d '{"base_url":"http://127.0.0.1:9","api_key":"ci-smoke-key"}' \
+            | grep -q '"saved":true'
+
+          docker rm -f smoke
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -41,6 +98,7 @@ jobs:
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
+      # Fully cached from the build above — this step only pushes.
       - uses: docker/build-push-action@v6
         with:
           context: .
@@ -48,4 +106,3 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max

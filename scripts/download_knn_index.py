@@ -19,8 +19,8 @@ The metadata DuckDB is what maps a neighbor id back to species name
 and reference-image URL. `--faiss-only` skips it to save the download,
 but expect neighbor resolution to fail without it.
 
-Point the server at the result with `KNN_INVENTORY_DIR=/abs/path/to/out`
-(config.toml `[knn].inventory_dir` works too) and restart.
+Point the server at the result by setting KNN_INVENTORY_DIR=/abs/path/to/out
+(in the environment or compose.yml) and restarting.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def main() -> int:
     print(
         f"\nDone. Enable KNN with:\n"
         f"  KNN_INVENTORY_DIR={Path(args.out).resolve()}\n"
-        f"(or config.toml [knn].inventory_dir), then restart the server."
+        f"then set KNN_INVENTORY_DIR and restart the server."
     )
     return 0
 

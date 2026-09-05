@@ -55,82 +55,22 @@ from pipeline import (
     run_pipeline,
 )
 
-# tomllib is stdlib in 3.11+. On 3.10 we need the `tomli` backport
-# (declared in pyproject.toml with a python_version<"3.11" marker).
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        raise SystemExit(
-            "Python 3.10 requires the 'tomli' package for config.toml support.\n"
-            "Run `uv add tomli` and restart."
-        )
-
-
-def _config_path() -> Path | None:
-    """Where to read config.toml from, honoring BOTANISENSE_CONFIG override."""
-    explicit = os.environ.get("BOTANISENSE_CONFIG")
-    if explicit:
-        if not Path(explicit).exists():
-            raise SystemExit(
-                f"BOTANISENSE_CONFIG={explicit!r} but that file does not exist."
-            )
-        return Path(explicit)
-    candidate = Path("config.toml")
-    return candidate if candidate.exists() else None
-
-
-def _load_config() -> dict:
-    """Load user config from TOML.
-
-    Path precedence:
-      1. $BOTANISENSE_CONFIG env var (file must exist if set).
-      2. ./config.toml (optional; if absent, env vars work standalone).
-
-    Returns an empty dict when no config file exists. The constants
-    below use `cfg.get(...) or os.environ.get(...)` so env vars still
-    win for any value the user prefers to set in `.env`.
-
-    Cached by file mtime so a config.toml edit is picked up on the next
-    request — no worker restart needed. (uvicorn --reload only watches
-    .py, not .toml.)
-    """
-    global _cfg, _cfg_mtime
-    path = _config_path()
-    if path is None:
-        # No config file at all. Return whatever _cfg is (possibly {})
-        # but invalidate mtime so a config that appears later triggers a
-        # fresh load on the next call.
-        _cfg_mtime = None
-        return _cfg if _cfg is not None else {}
-    try:
-        mtime = path.stat().st_mtime_ns
-    except FileNotFoundError:
-        _cfg_mtime = None
-        return {}
-    if _cfg is not None and _cfg_mtime == mtime:
-        return _cfg
-    with path.open("rb") as f:
-        _cfg = tomllib.load(f)
-    _cfg_mtime = mtime
-    return _cfg
-
-
 load_dotenv()
-_cfg: dict = {}  # populated below via _load_config()
-_cfg_mtime: int | None = None
-_cfg = _load_config()  # initial load; subsequent calls go through _load_config()
 
-# Non-secret settings come from config.toml with env-var override. The
-# previously-hardcoded LAN defaults were a leak of the developer's home
-# network layout — see config.example.toml for the user-facing template.
-BASE_URL = (
-    _cfg.get("immich", {}).get("base_url")
-    or os.environ.get("IMMICH_BASE_URL", "")
-)
-API_KEY = os.environ.get("IMMICH_API_KEY", "")
+# --- Runtime configuration ---------------------------------------------------
+#
+# Two surfaces only (config.toml support was removed; see
+# _migrate_legacy_config for the one-time bridge from an old file):
+#
+#   1. Environment variables — IMMICH_BASE_URL / IMMICH_API_KEY / QUERY /
+#      … — how docker-compose and .env configure a deployment.
+#   2. The Immich connection row in SQLite (album_meta key
+#      "immich_connection"), written by POST /api/settings/immich from
+#      the web UI (Welcome screen, or HealthBanner → "Fix connection").
+#
+# The Immich connection resolves per call with precedence env > DB, so a
+# UI save takes effect on the next request without a restart. See
+# immich_base_url() / immich_api_key() below.
 QUERY = os.environ.get("QUERY", "intentional plant photos")
 N_SAMPLES = int(os.environ.get("N_SAMPLES", "10000"))
 TOP_K = int(os.environ.get("TOP_K", "5"))
@@ -176,45 +116,156 @@ _log = logging.getLogger("app")
 # it to the user. None when PIPELINE_CRON is unset.
 _next_run_at_iso: str | None = None
 # KNN reclassification — separate from the zero-shot pipeline. Set
-# KNN_INVENTORY_DIR (in config.toml [knn] or env) to the directory
-# holding tol200m_bioclip2.faiss + labels.parquet + INDEX_VERSION.txt.
-# Leave it unset / pointing at a non-existent dir to disable the KNN UI
-# gracefully.
-#
-# Resolution is a callable (not a captured Path) so config.toml edits
-# take effect on the next request WITHOUT a uvicorn restart — and the
-# /api/knn/health banner always reports what's actually live. The
-# function re-reads _cfg (module-level cache of config.toml parsed at
-# import) which means a `touch config.toml` to invalidate will be wired
-# below; for now, edits land on the next worker restart or
-# /api/knn/health rebuild (re-imports _cfg).
+# KNN_INVENTORY_DIR to the directory holding tol200m_bioclip2.faiss +
+# labels.parquet + INDEX_VERSION.txt (or the official imageomics
+# layout). Leave it unset / pointing at a non-existent dir to disable
+# the KNN UI gracefully. Resolved per call so a changed env takes
+# effect without a restart.
 def KNN_INVENTORY_DIR() -> Path:
-    """Resolve KNN inventory dir fresh on every call.
-
-    Reads `_load_config()` (which mtime-caches config.toml) so a
-    config.toml edit takes effect on the next request without a worker
-    restart. Env var `KNN_INVENTORY_DIR` overrides config.toml.
-    """
-    return Path(
-        _load_config().get("knn", {}).get("inventory_dir")
-        or os.environ.get("KNN_INVENTORY_DIR", "")
-    )
+    """Resolve the KNN inventory dir fresh on every call (env only)."""
+    return Path(os.environ.get("KNN_INVENTORY_DIR", ""))
 KNN_K = int(os.environ.get("KNN_K", "10"))
 
-if not API_KEY:
-    raise SystemExit("IMMICH_API_KEY missing in .env / environment")
 
-if not BASE_URL:
-    raise SystemExit(
-        "IMMICH_BASE_URL missing — set it in config.toml [immich].base_url "
-        "or as an environment variable, then restart."
+# --- Immich connection (URL + API key) ---------------------------------------
+#
+# The API key is stored in the DB in plaintext — the same posture as a
+# .env file on disk — and is never returned by any endpoint (only a
+# boolean api_key_set). These are plain functions rather than captured
+# constants so a connection saved from the web UI applies to the next
+# request without a restart, including in pipeline child processes
+# (which fork this module and call the same accessors).
+
+def _connection_settings() -> dict:
+    """Read the UI-saved connection row, tolerating a missing/unready DB."""
+    try:
+        with storage.connect(DB_PATH) as conn:
+            return storage.get_connection_settings(conn) or {}
+    except Exception:
+        # Fresh file before init_db, or a schema-less DB (tests).
+        return {}
+
+
+def immich_base_url() -> str:
+    """Resolved Immich base URL: env var, else the UI-saved row."""
+    return (
+        os.environ.get("IMMICH_BASE_URL", "")
+        or str(_connection_settings().get("base_url") or "")
     )
+
+
+def immich_api_key() -> str:
+    """Resolved Immich API key: env var, else the UI-saved row."""
+    return (
+        os.environ.get("IMMICH_API_KEY", "")
+        or str(_connection_settings().get("api_key") or "")
+    )
+
+
+def immich_connection_source() -> str:
+    """Where the effective connection comes from: "env" | "db" | "none"."""
+    if os.environ.get("IMMICH_BASE_URL", ""):
+        return "env"
+    if _connection_settings().get("base_url"):
+        return "db"
+    return "none"
+
+
+def _require_immich_connection() -> tuple[str, str]:
+    """Guard for endpoints that need a working Immich connection."""
+    base_url, api_key = immich_base_url(), immich_api_key()
+    if not base_url or not api_key:
+        raise HTTPException(
+            status_code=409,
+            detail="Immich is not configured — enter the Immich URL and "
+                   "API key in the app (Welcome screen, or 'Fix "
+                   "connection' in the health banner).",
+        )
+    return base_url, api_key
+
+
+def _migrate_legacy_config() -> None:
+    """One-time bridge from the removed config.toml.
+
+    config.toml is no longer a supported configuration surface. While a
+    legacy file exists (checked on every boot, so this is idempotent):
+
+      - [immich].base_url is copied into the DB connection row when the
+        row has no URL yet — the file is going away; the value must not
+        be lost. (The API key is NOT copied — it stays env-only unless
+        the user enters it in the web UI.)
+      - [knn].inventory_dir / [cors].origins are injected into the
+        environment when the corresponding env var is unset — those are
+        deployment knobs whose permanent home is the environment.
+
+    Deleting config.toml completes the migration.
+    """
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomli as tomllib
+        except ImportError:
+            _log.warning(
+                "legacy config.toml present but no TOML reader available "
+                "(python<3.11 without tomli) — ignoring it"
+            )
+            return
+    path = Path(os.environ.get("BOTANISENSE_CONFIG") or "config.toml")
+    if not path.exists():
+        return
+    try:
+        with path.open("rb") as f:
+            cfg = tomllib.load(f)
+    except Exception as e:
+        _log.warning("legacy config.toml unreadable (%s) — ignoring", e)
+        return
+
+    knn_dir = cfg.get("knn", {}).get("inventory_dir")
+    if knn_dir and not os.environ.get("KNN_INVENTORY_DIR"):
+        os.environ["KNN_INVENTORY_DIR"] = str(knn_dir)
+        _log.info(
+            "migrated [knn].inventory_dir from config.toml into "
+            "KNN_INVENTORY_DIR for this process — set the env var "
+            "(or delete config.toml) to make it permanent"
+        )
+    cors = cfg.get("cors", {}).get("origins")
+    if cors and not os.environ.get("CORS_ORIGINS"):
+        os.environ["CORS_ORIGINS"] = ",".join(str(o) for o in cors)
+        _log.info(
+            "migrated [cors].origins from config.toml into CORS_ORIGINS "
+            "for this process — set the env var (or delete config.toml) "
+            "to make it permanent"
+        )
+    base_url = cfg.get("immich", {}).get("base_url")
+    if base_url:
+        with storage.connect(DB_PATH) as conn:
+            saved = storage.get_connection_settings(conn) or {}
+            if not saved.get("base_url"):
+                storage.set_connection_settings(
+                    conn,
+                    base_url=str(base_url),
+                    api_key=str(saved.get("api_key") or ""),
+                )
+                _log.info(
+                    "migrated [immich].base_url from config.toml into the "
+                    "app database — config.toml is no longer read"
+                )
 
 # React SPA mount. After `npm run build` writes frontend/dist/, FastAPI
 # serves it at /. Dev mode uses Vite on :5173 with proxy → :8765.
 FRONTEND_DIST = Path(__file__).parent / "frontend" / "dist"
 
 storage.init_db(DB_PATH)
+_migrate_legacy_config()
+if not immich_base_url() or not immich_api_key():
+    # Not an error: the app boots so the web UI can collect the
+    # connection (Welcome screen). Every Immich-touching endpoint
+    # answers 409 until it's saved.
+    _log.warning(
+        "Immich is not configured yet — enter the Immich URL and API "
+        "key in the web UI, or set IMMICH_BASE_URL / IMMICH_API_KEY."
+    )
 # Persist pipeline logs to a file so the web UI can show them after the
 # terminal scrollback has rolled past. Same dir as the DB.
 attach_log_file(Path(DB_PATH).parent / "pipeline.log")
@@ -261,7 +312,45 @@ _clusters_cache_lock = threading.Lock()
 #    repeat visits. The Cache-Control header is still 24h so clients
 #    (and any reverse proxy) also cache downstream.
 _thumb_client: httpx.AsyncClient | None = None
-_thumb_client_lock = threading.Lock()  # guards lazy init / shutdown
+_thumb_client_lock = threading.Lock()  # guards lazy init / shutdown / swap
+
+
+def _new_thumb_client() -> httpx.AsyncClient:
+    """Build the shared /thumb/* client from the CURRENT connection.
+
+    Called at startup and again whenever the connection is re-saved via
+    POST /api/settings/immich (the client captures base_url + api key
+    in its headers, so it must be rebuilt when those change).
+    """
+    return httpx.AsyncClient(
+        base_url=immich_base_url(),
+        headers={"x-api-key": immich_api_key(), "Accept": "image/*"},
+        timeout=30.0,
+        limits=httpx.Limits(
+            max_connections=50,
+            max_keepalive_connections=20,
+            keepalive_expiry=30.0,
+        ),
+    )
+
+
+def _rebuild_thumb_client() -> None:
+    """Swap in a thumb client for the new connection, closing the old.
+
+    In-flight requests holding the old client may error once it closes;
+    the browser retry covers that. No-op before lifespan startup has
+    created the client.
+    """
+    global _thumb_client
+    with _thumb_client_lock:
+        old = _thumb_client
+        _thumb_client = _new_thumb_client()
+    if old is None:
+        return
+    try:
+        asyncio.get_running_loop().create_task(old.aclose())
+    except RuntimeError:
+        old.close()  # no running loop in this thread
 _THUMB_CACHE_MAX = 500
 _thumb_cache: OrderedDict[tuple[str, str], tuple[bytes, str]] = OrderedDict()
 _thumb_cache_lock = asyncio.Lock()  # all cache mutations
@@ -443,20 +532,19 @@ _knn_labels = None
 _knn_meta: dict | None = None
 # Path the cached index was loaded FROM. When KNN_INVENTORY_DIR() resolves
 # to a different path, we invalidate _knn_index/_knn_labels/_knn_meta so a
-# config.toml edit picks up a fresh index without a worker restart.
+# changed KNN_INVENTORY_DIR picks up a fresh index without a restart.
 _knn_loaded_dir: Path | None = None
 
 
 def _get_knn_index():
     """Return (faiss_index, labels_table, meta) or None if the inventory
     isn't built yet. Cached for the lifetime of the process; invalidated
-    if KNN_INVENTORY_DIR() resolves to a different path (config.toml
-    edit)."""
+    if KNN_INVENTORY_DIR() resolves to a different path."""
     global _knn_index, _knn_labels, _knn_meta, _knn_loaded_dir
-    # Re-resolve every call: config.toml edits take effect on the next
-    # request, no restart needed. Also: if the inventory_dir was edited
-    # to a different path, invalidate the cached index — the file might
-    # not even exist there.
+    # Re-resolve every call so an env change takes effect on the next
+    # request, no restart needed. Also: if the inventory_dir changed to
+    # a different path, invalidate the cached index — the file might not
+    # even exist there.
     inventory = KNN_INVENTORY_DIR()
     # Detect which layout is on disk (knn_io._load_index does the same).
     custom_index = inventory / "tol200m_bioclip2.faiss"
@@ -582,9 +670,10 @@ def _run_and_store(*, query: str, n_samples: int, top_k: int,
     # singleton lazily on first predict() — for fully-cached runs (n_new
     # == 0 across kingdom, species, and bbox-bioclip) the model never
     # loads, saving ~5.5 GB of resident memory.
+    base_url, api_key = _require_immich_connection()
     out = run_pipeline(
-        base_url=BASE_URL,
-        api_key=API_KEY,
+        base_url=base_url,
+        api_key=api_key,
         query=query,
         n_samples=n_samples,
         top_k=top_k,
@@ -715,6 +804,10 @@ async def _start_run(query: str, n_samples: int, top_k: int,
     """
     import multiprocessing as _mp
 
+    # Fail fast with a clear message before forking — the child would
+    # only discover the missing connection at its first Immich call.
+    _require_immich_connection()
+
     job_id = uuid.uuid4().hex[:8]
     status_path = Path(DB_PATH).parent / f"pipeline-{job_id}.status.json"
     log_path = Path(DB_PATH).parent / f"pipeline-{job_id}.log"
@@ -793,8 +886,8 @@ def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
         log.setLevel(_logging.INFO)
 
         _pipeline.run_pipeline(
-            base_url=BASE_URL,
-            api_key=API_KEY,
+            base_url=immich_base_url(),
+            api_key=immich_api_key(),
             query=query,
             n_samples=n_samples,
             top_k=top_k,
@@ -838,22 +931,14 @@ async def lifespan(_app: FastAPI):
     # matches Immich's per-IP limit on most installs; 50 max-connections
     # lets a single grid request fan out without head-of-line blocking.
     global _thumb_client
-    async with httpx.AsyncClient(
-        base_url=BASE_URL,
-        headers={"x-api-key": API_KEY, "Accept": "image/*"},
-        timeout=30.0,
-        limits=httpx.Limits(
-            max_connections=50,
-            max_keepalive_connections=20,
-            keepalive_expiry=30.0,
-        ),
-    ) as client:
-        _thumb_client = client
+    _thumb_client = _new_thumb_client()
+    try:
         await _lifespan_inner()
-        try:
-            yield
-        finally:
-            _thumb_client = None
+        yield
+    finally:
+        client, _thumb_client = _thumb_client, None
+        if client is not None:
+            await client.aclose()
 
 
 async def _scheduler_loop(cron: str) -> None:
@@ -900,10 +985,15 @@ async def _scheduler_loop(cron: str) -> None:
         # POST /api/run, but invoked in-process (no HTTP hop).
         try:
             from pipeline import run_pipeline  # local import: torch/bioclip is heavy
+            if not immich_base_url() or not immich_api_key():
+                _log.warning(
+                    "scheduler: skipping run — Immich is not configured yet"
+                )
+                continue
             await asyncio.to_thread(
                 run_pipeline,
-                base_url=BASE_URL,
-                api_key=API_KEY,
+                base_url=immich_base_url(),
+                api_key=immich_api_key(),
                 query=QUERY,
                 n_samples=N_SAMPLES,
                 top_k=TOP_K,
@@ -1005,21 +1095,16 @@ app = FastAPI(title="BotaniSense for Immich", lifespan=lifespan)
 # (the server isn't reachable from the public internet by default),
 # but it's the wrong default for a hardened deployment. To narrow,
 # set CORS_ORIGINS (comma-separated, e.g. "https://a.example.com,
-# https://b.example.com") or `[cors].origins` in config.toml; the env
-# var wins, matching the precedence used everywhere else. An empty
-# value means same-origin only — stricter, and distinct from leaving
-# both unset. Allow_credentials stays False, so we can safely use "*"
-# (browsers reject wildcard + credentials; we don't use cookies).
-_cors_origins = None
+# https://b.example.com"). An empty value means same-origin only —
+# stricter, and distinct from leaving it unset. Allow_credentials
+# stays False, so we can safely use "*" (browsers reject wildcard +
+# credentials; we don't use cookies).
 _cors_env = os.environ.get("CORS_ORIGINS")
-if _cors_env is not None:
-    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
-else:
-    _cors_toml = _cfg.get("cors", {}).get("origins", None)
-    if _cors_toml is not None:
-        _cors_origins = list(_cors_toml)
-if _cors_origins is None:
-    _cors_origins = ["*"]
+_cors_origins = (
+    [o.strip() for o in _cors_env.split(",") if o.strip()]
+    if _cors_env is not None
+    else ["*"]
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -1198,33 +1283,41 @@ async def health() -> dict:
     api_key_ok = False
     api_key_scope = "none"
     api_key_err: str | None = None
-    try:
-        # Cheap call: server info, no admin scope required.
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=4.0) as c:
-            r = await c.get("/api/server/ping", headers={"x-api-key": API_KEY})
-        if r.status_code == 200:
-            immich_ok = True
-            immich_version = r.json().get("version", None) if r.headers.get("content-type", "").startswith("application/json") else None
-        else:
-            immich_err = f"HTTP {r.status_code} from /api/server/ping"
-    except Exception as e:
-        immich_err = f"{type(e).__name__}: {e}"
+    _base_url = immich_base_url()
+    _api_key = immich_api_key()
+    if not _base_url or not _api_key:
+        # Unconfigured: the web UI collects the connection. Don't hit
+        # the network — both checks report the same actionable state.
+        immich_err = "not configured"
+        api_key_err = "not configured"
+    else:
+        try:
+            # Cheap call: server info, no admin scope required.
+            async with httpx.AsyncClient(base_url=_base_url, timeout=4.0) as c:
+                r = await c.get("/api/server/ping", headers={"x-api-key": _api_key})
+            if r.status_code == 200:
+                immich_ok = True
+                immich_version = r.json().get("version", None) if r.headers.get("content-type", "").startswith("application/json") else None
+            else:
+                immich_err = f"HTTP {r.status_code} from /api/server/ping"
+        except Exception as e:
+            immich_err = f"{type(e).__name__}: {e}"
 
-    # Distinct check for the API key's scope. /api/albums returns a
-    # paginated list and 401s without a valid key. We don't actually
-    # need the data, just the status.
-    try:
-        async with httpx.AsyncClient(base_url=BASE_URL, timeout=4.0) as c:
-            r = await c.get("/api/albums", headers={"x-api-key": API_KEY}, params={"take": 1})
-        if r.status_code == 200:
-            api_key_ok = True
-            api_key_scope = "ok"
-        elif r.status_code in (401, 403):
-            api_key_err = "invalid or revoked key"
-        else:
-            api_key_err = f"HTTP {r.status_code}"
-    except Exception as e:
-        api_key_err = f"{type(e).__name__}: {e}"
+        # Distinct check for the API key's scope. /api/albums returns a
+        # paginated list and 401s without a valid key. We don't actually
+        # need the data, just the status.
+        try:
+            async with httpx.AsyncClient(base_url=_base_url, timeout=4.0) as c:
+                r = await c.get("/api/albums", headers={"x-api-key": _api_key}, params={"take": 1})
+            if r.status_code == 200:
+                api_key_ok = True
+                api_key_scope = "ok"
+            elif r.status_code in (401, 403):
+                api_key_err = "invalid or revoked key"
+            else:
+                api_key_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            api_key_err = f"{type(e).__name__}: {e}"
 
     # --- KNN index ---
     knn_path = str(KNN_INVENTORY_DIR()) if KNN_INVENTORY_DIR() else ""
@@ -1289,16 +1382,95 @@ async def health() -> dict:
 async def public_config() -> dict:
     """Non-secret runtime config surfaced to the SPA.
 
-    Used by AssetDetail to render the "Open in Immich" button. The
-    URL is IMMICH_PUBLIC_URL when set, else IMMICH_BASE_URL — the
+    `immich_public_url` drives AssetDetail's "Open in Immich" button:
+    IMMICH_PUBLIC_URL when set, else the effective base URL — the
     override matters when the server reaches Immich over a hostname
     the browser can't resolve (e.g. both in one docker-compose
     network: the server says http://immich:2283, the browser needs
     http://<lan-host>:2283).
+
+    `base_url` + `api_key_set` + `source` drive the connection form
+    (Welcome screen / "Fix connection"): the URL is not a secret and
+    is returned so the form can pre-fill it, but the API key is only
+    ever surfaced as a boolean — never its value.
     """
     return {
-        "immich_public_url": os.environ.get("IMMICH_PUBLIC_URL") or BASE_URL
+        "immich_public_url": os.environ.get("IMMICH_PUBLIC_URL")
+        or immich_base_url(),
+        "base_url": immich_base_url(),
+        "api_key_set": bool(immich_api_key()),
+        "source": immich_connection_source(),
+        "env_pinned": bool(
+            os.environ.get("IMMICH_BASE_URL")
+            or os.environ.get("IMMICH_API_KEY")
+        ),
     }
+
+
+class ImmichConnectionParams(BaseModel):
+    base_url: str
+    # Blank = keep the already-saved key (the form pre-fills nothing
+    # for the key; it can't show what it doesn't have).
+    api_key: str = ""
+
+
+@app.post("/api/settings/immich")
+async def set_immich_connection(params: ImmichConnectionParams) -> dict:
+    """Save the Immich connection from the web UI.
+
+    Stores the URL + API key in the SQLite DB (album_meta key
+    "immich_connection"); both resolve via env > DB, so an env-pinned
+    deployment keeps working while the save waits in the wings —
+    reported back as env_pinned so the form can say so.
+
+    Returns the fresh /api/health payload so the form can show
+    "connected" or the concrete error immediately, without a second
+    round trip.
+    """
+    from urllib.parse import urlsplit
+
+    url = params.base_url.strip().rstrip("/")
+    if not url:
+        raise HTTPException(status_code=422, detail="Immich URL is required")
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Enter a plain http(s) URL, e.g. http://192.168.1.10:2283",
+        )
+
+    env_key = os.environ.get("IMMICH_API_KEY", "")
+    api_key = params.api_key.strip() or env_key or immich_api_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=422,
+            detail="Immich API key is required — create one in Immich "
+                   "under Administration → Settings → API Keys",
+        )
+
+    with storage.connect(DB_PATH) as conn:
+        storage.set_connection_settings(conn, base_url=url, api_key=api_key)
+    _log.info(
+        "Immich connection saved from the web UI (%s, source env_pinned=%s)",
+        url,
+        bool(os.environ.get("IMMICH_BASE_URL")),
+    )
+    # Rebuild the shared thumbnail client so /thumb/* follows the new
+    # connection immediately.
+    _rebuild_thumb_client()
+
+    env_pinned = bool(
+        os.environ.get("IMMICH_BASE_URL") or os.environ.get("IMMICH_API_KEY")
+    )
+    # Reuse the /api/health logic for the immediate connected/broken
+    # signal (aliased: a local named `health` would shadow the function).
+    fresh_health = await health()
+    return {"saved": True, "env_pinned": env_pinned, "health": fresh_health}
 
 
 @app.get("/api/logs")
@@ -1790,7 +1962,8 @@ async def asset_detail(asset_id: str) -> dict:
 # — the plants worker was a strict subset of the kingdom worker. The
 # one-click Plantae button in the UI now calls the kingdom endpoints.
 def _immich_client() -> ImmichClient:
-    return ImmichClient(base_url=BASE_URL, api_key=API_KEY, timeout=60.0)
+    base_url, api_key = _require_immich_connection()
+    return ImmichClient(base_url=base_url, api_key=api_key, timeout=60.0)
 
 
 
@@ -2322,7 +2495,7 @@ def _cluster_album_worker(
                 _cluster_album_jobs[job_id]["album_id"] = album_id
                 _cluster_album_jobs[job_id]["reused_existing"] = reused
                 _cluster_album_jobs[job_id]["album_url"] = (
-                    f"{BASE_URL}/albums/{album_id}"
+                    f"{immich_base_url()}/albums/{album_id}"
                 )
 
             added_total = 0
@@ -2345,7 +2518,7 @@ def _cluster_album_worker(
                 conn,
                 cluster_id=cluster_id,
                 album_id=album_id,
-                album_url=f"{BASE_URL}/albums/{album_id}",
+                album_url=f"{immich_base_url()}/albums/{album_id}",
                 n_assets=len(asset_ids),
                 reused=reused,
             )
@@ -2619,7 +2792,7 @@ def _cluster_album_sync_all_worker(
                         conn,
                         cluster_id=cluster_id,
                         album_id=album_id,
-                        album_url=f"{BASE_URL}/albums/{album_id}",
+                        album_url=f"{immich_base_url()}/albums/{album_id}",
                         n_assets=len(asset_ids),
                         reused=reused,
                     )
@@ -3010,7 +3183,7 @@ def _kingdom_album_worker(
                 j = _kingdom_jobs[job_id]
                 j["album_id"] = album_id
                 j["reused_existing"] = reused
-                j["album_url"] = f"{BASE_URL}/albums/{album_id}"
+                j["album_url"] = f"{immich_base_url()}/albums/{album_id}"
 
             added_total = 0
             t0 = _time.monotonic()
@@ -3196,7 +3369,7 @@ async def kingdom_album_status(kingdom: str = Query(default="Plantae")) -> dict:
         "exists": True,
         "kingdom": kingdom,
         "album_id": saved["album_id"],
-        "album_url": f"{BASE_URL}/albums/{saved['album_id']}",
+        "album_url": f"{immich_base_url()}/albums/{saved['album_id']}",
         "n_assets": int(saved.get("n_assets", 0)),
         "min_score": float(saved.get("min_score", PLANTAE_GREEN)),
     }
@@ -3473,6 +3646,15 @@ _FULLSIZE_ALIASES = {"fullsize", "original", "full"}
 
 @app.get("/thumb/{asset_id}")
 async def thumb(asset_id: str, size: str = "preview") -> Response:
+    # Thumbnails are proxied from Immich — nothing to serve until the
+    # connection exists. (Keeps an unconfigured first boot clean: the
+    # grid can't render anyway.)
+    if not immich_base_url() or not immich_api_key():
+        raise HTTPException(
+            status_code=409,
+            detail="Immich is not configured — enter the Immich URL and "
+                   "API key in the app first.",
+        )
     # Coerce fullsize-ish aliases down to the largest valid Immich size.
     if size in _FULLSIZE_ALIASES:
         size = "preview"  # "preview" is the closest to full-quality Immich serves here

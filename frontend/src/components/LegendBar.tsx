@@ -12,6 +12,7 @@ import { useState } from 'react';
 import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
 import { reclassifyVisible } from '../api/endpoints';
+import { KnnAlert } from './KnnAlert';
 import { KnnBuildModal } from './KnnBuildModal';
 import { BackfillExifModal } from './BackfillExifModal';
 
@@ -20,6 +21,9 @@ export function LegendBar() {
   const push = useToasts();
   const [knnOpen, setKnnOpen] = useState(false);
   const [backfillOpen, setBackfillOpen] = useState(false);
+  // Bumped when a KNN build finishes so the status note refetches
+  // without a remount (getKnnStatus is fetched once per refreshKey).
+  const [knnRefresh, setKnnRefresh] = useState(0);
 
   const handlePurgeMissing = () => dispatch({ type: 'OPEN_JOB', kind: 'purge-missing', payload: {} });
   const handleDetectPeople = () => dispatch({ type: 'OPEN_JOB', kind: 'person-backfill', payload: {} });
@@ -42,6 +46,10 @@ export function LegendBar() {
         </h3>
         <span className="run-card-tag">Local DB</span>
       </header>
+
+      {/* Inline KNN status — lives here (not as a top-of-page banner)
+          because the action it points at is this card's build button. */}
+      <KnnAlert refreshKey={knnRefresh} />
 
       <div className="data-tool-grid">
         <button
@@ -86,7 +94,11 @@ export function LegendBar() {
         </button>
       </div>
 
-      <KnnBuildModal open={knnOpen} onClose={() => setKnnOpen(false)} />
+      <KnnBuildModal
+        open={knnOpen}
+        onClose={() => setKnnOpen(false)}
+        onBuilt={() => setKnnRefresh(k => k + 1)}
+      />
       <BackfillExifModal open={backfillOpen} onClose={() => setBackfillOpen(false)} />
     </section>
   );

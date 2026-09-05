@@ -1037,6 +1037,37 @@ def set_album_meta(conn: sqlite3.Connection, key: str, value: dict) -> None:
     conn.commit()
 
 
+# ---- Immich connection (URL + API key) --------------------------------------
+#
+# Stored in album_meta under one key so the pair is written atomically.
+# Plaintext, like the .env it replaces for UI-configured setups — see
+# SECURITY.md. The key is never returned by any API endpoint.
+
+CONNECTION_META_KEY = "immich_connection"
+
+
+def get_connection_settings(conn: sqlite3.Connection) -> dict | None:
+    """Return {"base_url", "api_key"} as saved from the web UI, or None."""
+    saved = get_album_meta(conn, CONNECTION_META_KEY)
+    if not saved:
+        return None
+    return {
+        "base_url": str(saved.get("base_url") or ""),
+        "api_key": str(saved.get("api_key") or ""),
+    }
+
+
+def set_connection_settings(
+    conn: sqlite3.Connection, *, base_url: str, api_key: str
+) -> None:
+    """Upsert the Immich connection saved from the web UI."""
+    set_album_meta(
+        conn,
+        CONNECTION_META_KEY,
+        {"base_url": base_url, "api_key": api_key},
+    )
+
+
 def ensure_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     """Return the cluster_names dict, recomputing if it's missing or stale.
 

@@ -21,42 +21,11 @@ from dotenv import load_dotenv
 
 import storage
 
-# Match the loader in app.py so env-var semantics are consistent across
-# the CLI and the server. Returns {} when no config file is present.
-if sys.version_info >= (3, 11):
-    import tomllib
-else:
-    try:
-        import tomli as tomllib
-    except ImportError:
-        raise SystemExit(
-            "Python 3.10 requires the 'tomli' package for config.toml support.\n"
-            "Run `uv add tomli` and restart."
-        )
-
-
-def _load_config() -> dict:
-    explicit = os.environ.get("BOTANISENSE_CONFIG")
-    if explicit:
-        if not Path(explicit).exists():
-            raise SystemExit(
-                f"BOTANISENSE_CONFIG={explicit!r} but that file does not exist."
-            )
-        path = explicit
-    else:
-        path = "config.toml"
-    if not Path(path).exists():
-        return {}
-    with Path(path).open("rb") as f:
-        return tomllib.load(f)
-
-
 DEFAULT_QUERY = "intentional plant photos"
 
 
 def main() -> int:
     load_dotenv()
-    _cfg = _load_config()
     # Import the heavy pipeline (pulls in torch/bioclip) only when we're
     # actually about to run, so `uv run run.py --run <id>` (read-only DB
     # dump) doesn't pay the cost.
@@ -101,12 +70,9 @@ def main() -> int:
     )
     ap.add_argument(
         "--inventory-dir",
-        default=(
-            _cfg.get("knn", {}).get("inventory_dir")
-            or os.environ.get("KNN_INVENTORY_DIR", "")
-        ),
+        default=os.environ.get("KNN_INVENTORY_DIR", ""),
         help="Directory containing tol200m_bioclip2.faiss + labels.parquet "
-             "+ INDEX_VERSION.txt.",
+             "+ INDEX_VERSION.txt (or the official imageomics layout).",
     )
     args = ap.parse_args()
 
@@ -165,20 +131,15 @@ def main() -> int:
         )
         return 0
 
-    base_url = (
-        _cfg.get("immich", {}).get("base_url")
-        or os.environ.get("IMMICH_BASE_URL", "")
-    )
+    base_url = os.environ.get("IMMICH_BASE_URL", "")
     api_key = os.environ.get("IMMICH_API_KEY")
-    if not base_url:
+    if not base_url or not api_key:
         print(
-            "IMMICH_BASE_URL missing — set it in config.toml [immich].base_url "
-            "or as an environment variable.",
+            "IMMICH_BASE_URL / IMMICH_API_KEY missing — set both in the "
+            "environment (.env works too), or configure them once in the "
+            "web app, which stores them in the same SQLite DB.",
             file=sys.stderr,
         )
-        return 1
-    if not api_key:
-        print("IMMICH_API_KEY missing in .env / environment", file=sys.stderr)
         return 1
 
     print(

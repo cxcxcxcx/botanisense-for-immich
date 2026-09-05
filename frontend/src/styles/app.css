@@ -182,13 +182,6 @@
   .text-leaf { @apply text-[#aadd99]; }
   [data-theme='light'] .text-leaf { @apply text-green-700; }
 
-  /* KNN inventory pill. Green when built, red when missing, gray
-     while loading. Inline so the header row can show it without a
-     separate strip. */
-  .knn-pill-ready      { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-emerald-900/40 text-emerald-300 border border-emerald-800; }
-  .knn-pill-unavailable { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-red-900/40 text-red-300 border border-red-800; }
-  .knn-pill-loading     { @apply px-2 py-0.5 rounded text-[11px] font-mono bg-bg-1 text-fg-1 border border-line2; }
-
   /* Pipeline status badge (StatusPanel). Distinct colors so the
      running / done / stopped / error states are immediately visible
      without depending on the (often-empty) stage label. */
@@ -410,13 +403,22 @@
   .run-card-tag        { @apply text-[9px] text-fg-1 uppercase tracking-widest border border-line2 px-1.5 py-0.5 rounded; }
   .run-card-edit-btn   { @apply text-[10px] text-fg-1 hover:text-fg transition-colors uppercase font-semibold tracking-wider bg-bg-2 px-2 py-1 rounded border border-line2; }
 
-  /* KNN warning alert — red-tinted card at the top of the Run page
-     when the KNN reference index is missing. Sole indicator now
-     (the header KnnPill was removed). */
+  /* KNN status indicators, rendered inside the Data tools card
+     (KnnAlert.tsx): red alert = built but unhealthy; amber note =
+     index missing. */
+  /* KNN status inside the Data tools card. Red-tinted alert = built
+     but unhealthy (correctness problem). Amber note = index missing
+     (a quality upgrade waiting to happen, not an error — so it is
+     NOT a top-of-page highlight; it points at the build button that
+     sits directly below it in the same card). */
   .knn-alert           { @apply bg-red-500/10 border border-red-500/20 rounded-xl p-3 flex items-start gap-3; }
   .knn-alert-icon      { @apply w-4 h-4 text-red-500 shrink-0 mt-0.5; }
   .knn-alert-title     { @apply text-xs font-medium text-red-400 m-0; }
   .knn-alert-body      { @apply text-[10px] text-red-500/70 mt-0.5 m-0; }
+  .knn-note            { @apply bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 flex items-start gap-3; }
+  .knn-note-icon       { @apply w-4 h-4 text-amber-400/80 shrink-0 mt-0.5; }
+  .knn-note-title      { @apply text-xs font-medium text-amber-300/90 m-0; }
+  .knn-note-body       { @apply text-[10px] text-fg-2 mt-0.5 m-0; }
 
   /* Run pipeline button — big emerald CTA per the mock. */
   .run-pipeline-btn    { @apply w-full bg-accent hover:opacity-90 text-bg font-bold text-sm px-4 py-2.5 rounded-xl transition-all shadow-lg shadow-accent/10 flex items-center justify-center gap-2 disabled:opacity-50; }

@@ -10,6 +10,7 @@ import type {
   ClusterAlbumMapping,
   ClustersResponse,
   Health,
+  ImmichConnectionParams,
   JobPreview,
   JobSnapshot,
   JobStart,
@@ -20,11 +21,13 @@ import type {
   KnnStatus,
   KingdomAlbumStatus,
   PipelineStatus,
+  PublicConfig,
   PurgeMissingPreview,
   PurgeMissingResult,
   ResultsQuery,
   ResultsResponse,
   RunParams,
+  SaveConnectionResponse,
   SyncDefaults,
   SyncDefaultsResponse,
 } from './types';
@@ -50,7 +53,16 @@ export const getHealth    = () =>
   fetchJson<Health>('/api/health');
 
 export const getConfig    = () =>
-  fetchJson<{ immich_public_url: string }>('/api/config');
+  fetchJson<PublicConfig>('/api/config');
+
+// POST /api/settings/immich — save the Immich connection (URL + API
+// key) from the web UI. Blank api_key keeps the saved one. Returns the
+// fresh health payload so the form can show connected/broken inline.
+export const saveImmichConnection = (params: ImmichConnectionParams) =>
+  fetchJson<SaveConnectionResponse>('/api/settings/immich', {
+    method: 'POST',
+    body: params,
+  });
 
 export const getLogs      = (tail = 200) =>
   fetchJson<{ lines: string[] }>('/api/logs', { query: { tail } });

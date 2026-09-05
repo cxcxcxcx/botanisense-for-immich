@@ -25,6 +25,11 @@ or `http://<your-lan-ip>:8765` (built). The exact IP depends on your
 host's network interface — `ip route get 1` or `ifconfig` will tell you.
 
 The running uvicorn is launched as:
+
+Configuration for development is the same two surfaces as production:
+`.env` (IMMICH_BASE_URL / IMMICH_API_KEY, loaded at startup) or the
+web UI connection form (stored in `data/state.db`; env vars win).
+There is no config.toml anymore.
 ```
 .venv/bin/uvicorn app:app --host 0.0.0.0 --port 8765 \
   --reload-exclude=data/ --reload-exclude=frontend/ \

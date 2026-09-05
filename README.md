@@ -75,18 +75,14 @@ shines. Below ~1 000 photos the run-once latency dominates; above
 
 ## Prerequisites
 
-- **Python ≥ 3.10** (3.11+ recommended; `tomllib` is stdlib there) —
-  not needed if you use Docker
-- **Node.js ≥ 20** (for the frontend build) — not needed if you use
-  Docker
+- **Docker** (with Compose v2) — the only install path
 - An **Immich instance** with an admin API key — see
   [Immich → Administration → Settings → API Keys][immich-keys]
 - **~5 GB free RAM** during a pipeline run (BioCLIP-2 + species
   label table live in the child process)
 - **~5 GB free disk** for the BioCLIP-2 artifacts (~4.3 GB: model
   weights + species label table; downloaded on first run into
-  `~/.cache/huggingface/`, or `data/huggingface/` in Docker) plus the
-  FastAPI thumb cache (`data/thumbs/`)
+  `data/huggingface/`) plus the FastAPI thumb cache (`data/thumbs/`)
 - The BioCLIP-2 model itself, from
   [`imageomics/bioclip-2`][bioclip-hf] — downloaded automatically on
   first use
@@ -98,88 +94,67 @@ shines. Below ~1 000 photos the run-once latency dominates; above
 
 ## Quickstart
 
-### Docker (recommended)
-
 ```bash
 git clone https://github.com/cxcxcxcx/botanisense-for-immich
 cd botanisense-for-immich
 
-# 1. Set your Immich admin API key
-cp .env.example .env
-$EDITOR .env
-
-# 2. Point the container at your Immich (where the *server* reaches it)
-$EDITOR compose.yml          # set IMMICH_BASE_URL
-
-# 3. Build + run, then open http://localhost:8765
+# 1. Build + run
 docker compose up --build -d
+
+# 2. Open http://localhost:8765
+#    → the Welcome screen asks for your Immich URL and API key.
+#      Click "Save & test connection" — it verifies immediately.
 ```
+
+No `.env`, no config files. The Immich URL + API key you enter are
+stored in the app's database (`./data/`) and take effect immediately;
+you can change them any time via **Fix connection** in the health
+banner or the **Edit** link on the Run page → Sync to IMMICH section.
 
 Don't want to build locally? Uncomment the `image:` line in
 `compose.yml` to pull the prebuilt image from GHCR instead
-(published by CI on every release).
+(published by CI on every release). Prefer not to type the key into
+the web UI? Set `IMMICH_BASE_URL` / `IMMICH_API_KEY` in `compose.yml`
+or a `.env` file instead — environment variables pin the connection.
 
 The image contains the backend and the built web UI (~2 GB; CPU-only
 torch). BioCLIP-2 downloads into `./data/` on the first pipeline run.
 To enable the optional KNN reclassification, see
 [KNN reclassification](#knn-reclassification-optional).
 
-### Manual install
-
-```bash
-git clone https://github.com/cxcxcxcx/botanisense-for-immich
-cd botanisense-for-immich
-
-# 1. Copy and edit your config (non-secret settings)
-cp config.example.toml config.toml
-$EDITOR config.toml     # set [immich].base_url
-
-# 2. Copy and edit your secrets
-cp .env.example .env
-$EDITOR .env            # set IMMICH_API_KEY
-
-# 3. Install + build
-uv sync
-cd frontend && npm install && npm run build && cd ..
-
-# 4. Run
-uvicorn app:app --host 0.0.0.0 --port 8765
-
-# 5. Open http://localhost:8765
-```
-
-For day-to-day development (HMR on the frontend, hot-reload on the
-backend), see [DEVELOPMENT.md](DEVELOPMENT.md).
+Contributing or developing from source (Python + Node)? See
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
 ## Configuration
 
-Non-secret settings live in `config.toml`; secrets live in `.env`. Both
-files are gitignored. The shipped templates (`config.example.toml` and
-`.env.example`) document every key.
+Two surfaces, both optional:
 
-The merge precedence is **environment variable > config.toml** for
-anything you might want to override per-launch (e.g. pointing the same
-binary at a different Immich for a one-off test).
+1. **The web UI** — the Immich URL + API key, stored in the app's
+   SQLite DB. This is the default path and needs no files.
+2. **Environment variables** — for automation, or to pin values so
+   UI edits can't change them (e.g. Immich reached over a Docker
+   network hostname). Compose and `.env` land here. Precedence for
+   the Immich connection is **environment > web UI**.
 
-| Key | Where | Default | Required? |
-|---|---|---|---|
-| `IMMICH_BASE_URL` | `config.toml [immich].base_url` or env | _(none)_ | ✅ |
-| `IMMICH_API_KEY` | `.env` only | _(none)_ | ✅ |
-| `IMMICH_PUBLIC_URL` | env | = `IMMICH_BASE_URL` | — |
-| `KNN_INVENTORY_DIR` | `config.toml [knn].inventory_dir` or env | _(empty; KNN off)_ | — |
-| `CORS_ORIGINS` | `config.toml [cors].origins` or env | _(any origin)_ | — |
-| `QUERY` | env | `"intentional plant photos"` | — |
-| `N_SAMPLES` | env | `10000` | — |
-| `TOP_K` | env | `5` | — |
-| `BATCH_SIZE` | env | `16` | — |
-| `DB_PATH` | env | `data/state.db` | — |
-| `HOST`, `PORT` | env | `0.0.0.0`, `8765` | — |
-| `RUN_ON_STARTUP` | env | `0` (off) | — |
-| `PIPELINE_CRON` | env | _(off)_ | — |
-| `PLANTAE_GREEN`, `PLANTAE_YELLOW` | env | `0.60`, `0.35` | — |
-| `FUNGI_MIN_SCORE_DEFAULT` | env | `0.60` | — |
+| Key | Default | Notes |
+|---|---|---|
+| `IMMICH_BASE_URL` | _(none — set in the web UI)_ | Where the server reaches Immich |
+| `IMMICH_API_KEY` | _(none — set in the web UI)_ | Immich admin API key |
+| `IMMICH_PUBLIC_URL` | = `IMMICH_BASE_URL` | Browser-side Immich URL for "Open in Immich" |
+| `KNN_INVENTORY_DIR` | _(empty; KNN off)_ | Directory holding a KNN index |
+| `CORS_ORIGINS` | _(any origin)_ | Comma-separated; empty = same-origin only |
+| `QUERY` | `"intentional plant photos"` | Seed query |
+| `N_SAMPLES` | `10000` | Max assets per run |
+| `TOP_K` | `5` | Species predictions per asset |
+| `BATCH_SIZE` | `16` | Inference batch size |
+| `DB_PATH` | `data/state.db` | SQLite location |
+| `HOST`, `PORT` | `0.0.0.0`, `8765` | Server bind |
+| `RUN_ON_STARTUP` | `0` (off) | Run the pipeline once at boot |
+| `PIPELINE_CRON` | _(off)_ | Daily pipeline run at HH:MM |
+| `PLANTAE_GREEN`, `PLANTAE_YELLOW` | `0.60`, `0.35` | Confidence tier thresholds |
+| `FUNGI_MIN_SCORE_DEFAULT` | `0.60` | Fungi sync threshold |
 
 `IMMICH_PUBLIC_URL` matters in Docker setups where the server reaches
 Immich over a hostname the browser can't resolve (e.g. both in one
@@ -213,11 +188,17 @@ Two ways to get an index:
 1. **Download the official imageomics index (recommended).**
 
    ```bash
-   uv run scripts/download_knn_index.py --out knn-index   # ~20 GB
+   # Run inside the container (huggingface_hub is already installed
+   # there) so the index lands in the persistent ./data volume. ~20 GB.
+   docker compose exec botanisense python scripts/download_knn_index.py \
+       --out /app/data/knn-index
    ```
 
-   then set `KNN_INVENTORY_DIR` to the absolute path (in Docker:
-   mount it and uncomment the two `knn:` lines in `compose.yml`).
+   then add `KNN_INVENTORY_DIR: /app/data/knn-index` to the
+   `environment:` block in `compose.yml` and `docker compose up -d`
+   again. (Alternatively download to any host directory and bind-mount
+   it read-only at `/app/knn-index` — see the commented block in
+   `compose.yml`.)
 
 2. **Build your own** from a TreeOfLife-200M parquet export with
    `python -m knn` — hours of CPU. The expected layout contract is
@@ -225,7 +206,9 @@ Two ways to get an index:
    (see `knn_io.py`).
 
 Without an index the feature is simply absent: the UI shows zero-shot
-predictions only, and the KNN code paths never load.
+predictions only, and the KNN code paths never load. The Data tools
+card on the Run page shows a short note when no index is configured —
+zero-shot species accuracy is noticeably weaker than KNN.
 
 [paper]: https://arxiv.org/abs/2311.18803
 

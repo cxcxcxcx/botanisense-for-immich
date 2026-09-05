@@ -12,6 +12,9 @@ import { useToasts } from './ToastProvider';
 interface Props {
   open: boolean;
   onClose: () => void;
+  // Called when the build finishes so the parent (LegendBar) can
+  // refresh its inline KNN status note without a remount.
+  onBuilt?: () => void;
 }
 
 type Phase = 'form' | 'running' | 'done' | 'error';
@@ -21,7 +24,7 @@ const FIELD_CLS =
 const INPUT_CLS =
   'bg-bg-2 text-fg border border-line2 px-2.5 py-1 rounded text-[0.85rem] font-mono focus:outline-none focus:border-accent w-full';
 
-export function KnnBuildModal({ open, onClose }: Props) {
+export function KnnBuildModal({ open, onClose, onBuilt }: Props) {
   const push = useToasts();
   const [phase, setPhase] = useState<Phase>('form');
   const [args, setArgs] = useState<KnnBuildArgs>({
@@ -60,8 +63,9 @@ export function KnnBuildModal({ open, onClose }: Props) {
     if (!streamJob) return;
     if (streamJob.status === 'done') {
       setPhase('done');
-      push({ kind: 'success', message: 'KNN index built — refresh to use' }, 4000);
+      push({ kind: 'success', message: 'KNN index built — reload the page to use it' }, 4000);
       getKnnStatus().catch(() => {});
+      onBuilt?.();
     } else if (streamJob.status === 'error') {
       setPhase('error');
       push({ kind: 'error', message: streamJob.error ?? 'build failed' }, 5000);

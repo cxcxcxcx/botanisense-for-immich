@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
-import { getResults, getStatus } from '../api/endpoints';
+import { getHealth, getResults, getStatus } from '../api/endpoints';
 import { navigate } from '../hooks/useRoute';
+import { ConnectForm } from './ConnectForm';
 
 // Onboarding wizard shown on the browse-list view when the pipeline has
 // not yet produced any data. Three steps — Connect → Seed query → First
@@ -18,9 +19,8 @@ import { navigate } from '../hooks/useRoute';
 // the in-progress walk-through cursor.
 //
 // Steps:
-//   1. Connect Immich — show the exact lines to paste into
-//      config.toml and .env (no server endpoint to write them, by
-//      design — secrets stay on disk).
+//   1. Connect Immich — the connection form (URL + API key), saved via
+//      POST /api/settings/immich and live-checked. No config files.
 //   2. Seed query — text input; value persists to localStorage and
 //      is read by ParamsForm as the default.
 //   3. First run — a CTA that jumps to the Run page with the seed
@@ -44,13 +44,17 @@ export function Welcome() {
   const [seedQuery, setSeedQuery] = useState<string>(readSeed);
   const [hasRuns, setHasRuns] = useState<boolean | null>(null);
   const [totalAssets, setTotalAssets] = useState<number | null>(null);
+  // null = still checking; true once /api/health reports the connection
+  // works (either pre-configured via env, or just saved via the form).
+  const [connected, setConnected] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     Promise.all([
       getStatus().catch(() => null),
       getResults({ page: 0, page_size: 1 }).catch(() => null),
-    ]).then(([status, resultsResp]) => {
+      getHealth().catch(() => null),
+    ]).then(([status, resultsResp, health]) => {
       if (cancelled) return;
       const ranSomething = status != null && (
         Object.keys(status.stage_times ?? {}).length > 0 ||
@@ -58,6 +62,9 @@ export function Welcome() {
       );
       setHasRuns(ranSomething);
       setTotalAssets(resultsResp?.pagination?.total ?? 0);
+      setConnected(
+        health?.immich?.ok === true && health?.api_key?.ok === true,
+      );
     });
     return () => { cancelled = true; };
   }, []);
@@ -91,27 +98,30 @@ export function Welcome() {
       {step === 'connect' && (
         <Step
           title="Connect Immich"
-          help="Two config files, both gitignored. Edit them once, restart the server."
+          help="Enter where the server reaches your Immich, and an API key it can use. Takes effect immediately — no restart."
         >
           <p className="text-fg-1 text-[13px] m-0 mb-3">
-            Copy the templates and fill in your Immich URL + admin API
-            key. The API key is generated in Immich → Administration →
-            Settings → API Keys.
+            The API key is generated in Immich → Administration →
+            Settings → API Keys (mark Asset Read + Album Read/Write).
+            It is stored on the server and never shown again.
           </p>
-          <CodeBlock
-            lines={[
-              '# In config.toml',
-              '[immich]',
-              'base_url = "http://192.168.1.10:2283"',
-              '',
-              '# In .env',
-              'IMMICH_API_KEY=your-key-here',
-            ]}
+          <ConnectForm
+            onSaved={(_cfg, health) =>
+              setConnected(health.immich?.ok === true && health.api_key?.ok === true)
+            }
           />
-          <p className="text-fg-2 text-[12px] m-0 mt-3">
-            After editing, restart uvicorn (Ctrl+C, then re-run).
-          </p>
-          <StepActions onNext={() => advance('seed')} nextLabel="Next: pick a seed query" />
+          <StepActions
+            onNext={() => advance('seed')}
+            nextLabel="Next: pick a seed query"
+            nextDisabled={connected !== true}
+            nextHint={
+              connected === null
+                ? 'Checking the connection…'
+                : connected === false
+                ? 'Save a working connection to continue'
+                : undefined
+            }
+          />
         </Step>
       )}
 
@@ -185,13 +195,17 @@ function StepActions({
   onBack,
   onNext,
   nextLabel,
+  nextDisabled,
+  nextHint,
 }: {
   onBack?: () => void;
   onNext: () => void;
   nextLabel: string;
+  nextDisabled?: boolean;
+  nextHint?: string;
 }) {
   return (
-    <div className="flex gap-2 mt-4">
+    <div className="flex gap-2 mt-4 items-center">
       {onBack && (
         <button
           type="button"
@@ -203,11 +217,16 @@ function StepActions({
       )}
       <button
         type="button"
-        className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover"
+        disabled={nextDisabled}
+        title={nextDisabled ? nextHint : undefined}
+        className="px-3 py-1.5 rounded bg-accent-dark border border-accent text-white text-sm hover:bg-accent-hover disabled:opacity-40 disabled:cursor-not-allowed"
         onClick={onNext}
       >
         {nextLabel}
       </button>
+      {nextDisabled && nextHint && (
+        <span className="text-fg-2 text-[11px]">{nextHint}</span>
+      )}
     </div>
   );
 }
@@ -248,10 +267,4 @@ function Stepper({ current }: { current: WizardStep }) {
   );
 }
 
-function CodeBlock({ lines }: { lines: string[] }) {
-  return (
-    <pre className="m-0 p-3 rounded bg-bg-2 border border-line2 text-[12px] font-mono text-fg overflow-x-auto">
-{lines.join('\n')}
-    </pre>
-  );
-}
+
