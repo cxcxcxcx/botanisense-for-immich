@@ -14,6 +14,19 @@ const STAGE_COLORS: Record<string, string> = {
   'bbox-bioclip': 'bg-stage-bioclip',
 };
 
+// Status badge classes must appear as LITERAL strings — Tailwind's
+// purge only keeps the .status-* rules it can see spelled out in the
+// source, and a template literal like `status-${status}` made the
+// scanner drop them all, leaving the badge as an unstyled span
+// (light theme: pale text floating with no chip background).
+const STATUS_CLS: Record<string, string> = {
+  idle: 'status-idle',
+  running: 'status-running',
+  done: 'status-done',
+  stopped: 'status-stopped',
+  error: 'status-error',
+};
+
 interface Props {
   /** When true, render only the badge + eta (browse-view header).
    *  Hides the progress bar + stage-time bar + legend. */
@@ -98,7 +111,7 @@ export function StatusPanel({ compact = false }: Props = {}) {
       className={`flex flex-col gap-2 font-mono text-[12px]/[1.6] border border-line2 rounded-lg bg-bg-1 p-3 ${compact ? 'text-[11px]' : ''}`}
     >
       <div className="flex flex-wrap items-center gap-2">
-        <span data-testid="status-badge" className={`status-${status}`}>{badgeText}</span>
+        <span data-testid="status-badge" className={STATUS_CLS[status] || 'status-idle'}>{badgeText}</span>
         {status === 'running' && (
           <button
             type="button"
