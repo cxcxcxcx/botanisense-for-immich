@@ -121,7 +121,12 @@ export function FilterCards() {
       }));
     }
     if (!resultsData) return [];
-    const tax: TaxonomyEntry[] = resultsData.taxonomy[filters.group_by] ?? [];
+    // `?.` on taxonomy too: an empty library returns the sentinel
+    // {"error":…,"results":[]} with no taxonomy field (same shape as
+    // the pagination trap below) — indexing the missing field threw
+    // "Cannot read properties of undefined (reading 'species')" on a
+    // fresh install browsed with the Species/Genus/Family chip active.
+    const tax: TaxonomyEntry[] = resultsData.taxonomy?.[filters.group_by] ?? [];
     return tax.map(t => ({
       key: t.name,
       label: t.name,
