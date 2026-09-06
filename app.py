@@ -280,8 +280,13 @@ _classifier = None
 # browsing (one entry per (filter, sort) combo, each ~2 MB). Reads
 # promote to the back; insertions push the oldest out the front.
 # Invalidated whenever a new pipeline run completes (and on demand).
+# While a run is ACTIVE, entries also expire after this many seconds —
+# the pipeline commits results per batch, and without the TTL the
+# first mid-run request pinned its (usually empty) payload for the
+# entire multi-hour run. Values are (payload, monotonic_ts) tuples.
 _RESULTS_CACHE_MAX = 8
-_results_cache: OrderedDict[str, dict] = OrderedDict()
+_RESULTS_CACHE_RUNNING_TTL = 10.0
+_results_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
 _results_lock = threading.Lock()
 
 
@@ -376,20 +381,34 @@ _REF_THUMB_EDGE = 320
 def _results_cache_get(key: str) -> dict | None:
     """Return the cached payload for `key`, or None. Promotes the key
     to the back of the LRU on hit so the most-recently-used entries
-    survive eviction."""
+    survive eviction.
+
+    While a pipeline job is active, entries older than
+    _RESULTS_CACHE_RUNNING_TTL are treated as misses: the search and
+    species stages commit new rows per batch, and this cache used to
+    pin the pre-run (often empty) grid for the whole multi-hour run —
+    the classic "ran for hours and every page is still empty". Idle
+    entries keep the previous never-expire behavior; the run-end
+    invalidation in _run_and_store is unchanged."""
+    running = _get_active_job() is not None
     with _results_lock:
         if key in _results_cache:
+            value, ts = _results_cache[key]
+            if running and (time.monotonic() - ts) > _RESULTS_CACHE_RUNNING_TTL:
+                del _results_cache[key]
+                return None
             _results_cache.move_to_end(key)
-            return _results_cache[key]
+            return value
     return None
 
 
 def _results_cache_put(key: str, value: dict) -> None:
     """Insert a payload, evicting the oldest entry if we'd exceed
     _RESULTS_CACHE_MAX. Combined with the move-to-end in GET, this
-    makes the cache a strict LRU."""
+    makes the cache a strict LRU. Entries are stamped with a
+    monotonic time for the run-active TTL in _results_cache_get."""
     with _results_lock:
-        _results_cache[key] = value
+        _results_cache[key] = (value, time.monotonic())
         while len(_results_cache) > _RESULTS_CACHE_MAX:
             _results_cache.popitem(last=False)
 

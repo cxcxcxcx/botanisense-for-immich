@@ -1,7 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getHealth, getResults, getStatus } from '../api/endpoints';
 import { navigate } from '../hooks/useRoute';
+import { useEventStream } from '../hooks/useEventStream';
+import type { EventSnapshot } from '../api/types';
 import { ConnectForm } from './ConnectForm';
+import { StatusPanel } from './StatusPanel';
 
 // Onboarding wizard shown on the browse-list view when the pipeline has
 // not yet produced any data. Two steps — Connect → First run — with a
@@ -12,6 +15,10 @@ import { ConnectForm } from './ConnectForm';
 //   - Hides itself once the pipeline has produced at least one asset.
 //     Server-state-driven so it works the same way on every port,
 //     every browser, every device — no per-origin localStorage trap.
+//   - While a pipeline run is ACTIVE this whole wizard is replaced by
+//     the live run status — "welcome, connect, run" is the wrong thing
+//     to show someone whose run is already chewing through their
+//     library.
 //
 // The wizard's step state is component-local — it resets each session,
 // which is fine because we're only using it for the in-progress
@@ -34,6 +41,12 @@ export function Welcome() {
   // null = still checking; true once /api/health reports the connection
   // works (either pre-configured via env, or just saved via the form).
   const [connected, setConnected] = useState<boolean | null>(null);
+  // Mount-time run state; the SSE snapshot (shared singleton) overrides
+  // it live, so a run started elsewhere flips this card to run status
+  // without a remount.
+  const [statusAtMount, setStatusAtMount] = useState<string | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
+  const { data: events } = useEventStream<EventSnapshot>('/api/events');
 
   useEffect(() => {
     let cancelled = false;
@@ -49,12 +62,40 @@ export function Welcome() {
       );
       setHasRuns(ranSomething);
       setTotalAssets(resultsResp?.pagination?.total ?? 0);
+      setStatusAtMount(status?.status ?? null);
       setConnected(
         health?.immich?.ok === true && health?.api_key?.ok === true,
       );
     });
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadKey]);
+
+  const liveStatus = events?.pipeline?.status;
+  const running = (liveStatus ?? statusAtMount) === 'running';
+  const wasRunning = useRef(running);
+  useEffect(() => {
+    // Run just finished while we were watching → refetch once so the
+    // wizard re-hides if the run produced data (totalAssets > 0).
+    if (wasRunning.current && !running) setReloadKey(k => k + 1);
+    wasRunning.current = running;
+  }, [running]);
+
+  // A run in progress IS the home-page message — replaces the wizard.
+  if (running) {
+    return (
+      <section
+        className="m-4 sm:m-6 p-6 sm:p-8 rounded-xl bg-bg-1 border border-line2 max-w-[720px]"
+        aria-label="Run in progress"
+      >
+        <h2 className="text-xl sm:text-2xl m-0 mb-3">Pipeline running</h2>
+        <StatusPanel />
+        <p className="text-fg-2 text-[11.5px] m-0 mt-3">
+          Results appear as the run commits them — the Browse grid fills
+          in batch by batch, no need to wait for the whole run.
+        </p>
+      </section>
+    );
+  }
 
   // Loading state — keep the wizard hidden until both API calls resolve,
   // so users don't see a one-frame flash of "Welcome to BotaniSense" on
