@@ -960,6 +960,7 @@ def discover_plantae_assets(
                     f"-> boundary, adding all {n_added} "
                     f"(run={len(accepted)}, stopping search)"
                 )
+                conn.commit()
                 return accepted
 
             if len(accepted) >= n_samples:
@@ -968,6 +969,7 @@ def discover_plantae_assets(
                 )
                 # Final progress update at 100% before returning.
                 set_chunk_progress(n_samples, n_samples)
+                conn.commit()
                 return accepted[:n_samples]
             # Live progress for the UI bar. Updates the SSE stream so
             # StatusPanel advances per-batch even when each batch's
@@ -975,6 +977,14 @@ def discover_plantae_assets(
             # 625 batches = several seconds of "silent" work
             # otherwise).
             set_chunk_progress(len(accepted), n_samples)
+            # Commit THIS batch's asset rows + kingdom scores now.
+            # storage.connect() only commits when its whole with-block
+            # exits — i.e. when the entire multi-hour run finishes — so
+            # without this every batch sat in one open transaction:
+            # /api/results saw a permanently empty DB mid-run, and any
+            # crash/stop/crash-loop ROLLED BACK the entire run (the
+            # "ran for hours, every page empty" report).
+            conn.commit()
 
         page += 1
         if page > 50:  # safety net
@@ -1542,6 +1552,9 @@ def run_pipeline(
                 f"exif_fetched={n_stitched_exif_fetched} "
                 f"full_upsert={n_stitched_full_upsert}"
             )
+            # Flush the stitch's asset-row upserts (URLs + EXIF) so a
+            # stop/crash right after search keeps them.
+            conn.commit()
             _log.info(
                 f"query={query!r}  n_requested={n_samples}  "
                 f"n_new={n_new}  n_cached={n_cached}  "
@@ -1629,6 +1642,14 @@ def run_pipeline(
                         _close_image(im)
                     del pil_images, feats_np, raw, preds_by_file
                     gc.collect()
+
+                    # Commit this chunk's embeddings + predictions (the
+                    # outer storage.connect() with-block won't commit
+                    # until the whole run ends — see the search-loop
+                    # commit for why that matters). This is what makes
+                    # the "each chunk commits" claim above actually
+                    # true.
+                    conn.commit()
 
                     _chunk_log(
                         "species",
@@ -1728,6 +1749,7 @@ def run_pipeline(
             # wrote the full mapping — but skipping it saves a write.
             if asset_to_cluster and not refit_done:
                 storage.set_cluster_ids(conn, asset_to_cluster=asset_to_cluster)
+            conn.commit()  # cluster assignments survive a mid-run stop
 
             _log.info(
                 f"[cluster] done  n_clusters={n_clusters}  "
@@ -1831,6 +1853,7 @@ def run_pipeline(
                     n_items=len(chunk_indices),
                     elapsed=time.monotonic() - kingdom_t0,
                 )
+                conn.commit()  # per-chunk checkpoint (see search-loop note)
                 i = j
             if kingdom_total_chunks:
                 _log.info(
@@ -1919,6 +1942,7 @@ def run_pipeline(
                             elapsed=time.monotonic() - yolo_t0,
                             note=f"{n_dets} new detections ({n_merged} merged)",
                         )
+                        conn.commit()  # per-chunk checkpoint (see search-loop note)
                         del pil_images, detections
                         gc.collect()
                         i = j
@@ -2183,6 +2207,7 @@ def run_pipeline(
                         n_items=n_crops,
                         elapsed=time.monotonic() - bbox_t0,
                     )
+                    conn.commit()  # per-chunk checkpoint (see search-loop note)
                     del crops, raw, preds_by_file
                     gc.collect()
                     i = j
