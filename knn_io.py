@@ -312,12 +312,15 @@ def _load_custom_index(index_path, labels_path, index_dir):
             self._path = path
             self._metadata = metadata
             self._cache: pa.Table | None = None
-            # How many rows per row group (default 64K-1M for Parquet;
-            # ours is ~43K based on row_groups=2171 for 91M rows).
-            self._rows_per_rg = max(
-                1,
-                metadata.num_rows // max(1, metadata.num_row_groups),
-            )
+            # Exact row-group boundaries from the file's own metadata.
+            # Row groups are NOT uniform — knn.py writes one group per
+            # 25K-row batch plus a partial tail — so idx // avg_size is
+            # wrong for every group after the first (and crashes on tail
+            # indices). searchsorted against the real offsets is exact.
+            n_rg = max(1, metadata.num_row_groups)
+            sizes = [metadata.row_group(i).num_rows for i in range(n_rg)]
+            self._rg_offsets = np.zeros(n_rg + 1, dtype="int64")
+            np.cumsum(sizes, out=self._rg_offsets[1:])
 
         def _materialize(self) -> pa.Table:
             if self._cache is None:
@@ -335,26 +338,28 @@ def _load_custom_index(index_path, labels_path, index_dir):
             idx_np = idx_np.astype("int64", copy=False)
             if len(idx_np) == 0:
                 return pa.table({c.name: [] for c in self._metadata.schema})
-            # Compute which row groups are needed. For each index, the
-            # containing row group is idx // rows_per_rg. Gather the
-            # unique set of row groups, read them, then concat the
-            # matching slices.
-            rg_idx = (idx_np // self._rows_per_rg).tolist()
-            unique_rgs = sorted(set(rg_idx))
+            # Map each index to its row group via the real offsets, read
+            # each needed group exactly once, and assemble rows in INPUT
+            # order (classify_via_knn slices the result positionally per
+            # query — order is part of the contract).
+            rg_idx = np.searchsorted(self._rg_offsets, idx_np, side="right") - 1
+            rg_idx = np.clip(rg_idx, 0, len(self._rg_offsets) - 2)
+            unique_rgs = np.unique(rg_idx)
             pf = pq.ParquetFile(self._path)
-            pieces: list[pa.Table] = []
-            for rg in unique_rgs:
-                rg_table = pf.read_row_group(rg)
-                # The row group's rows are [rg * RPR, (rg+1) * RPR).
-                rg_lo = rg * self._rows_per_rg
-                rg_hi = rg_lo + rg_table.num_rows
-                # Filter indices that fall in this row group.
-                rg_idx_local = [int(i) - rg_lo for i in idx_np if rg_lo <= int(i) < rg_hi]
-                if rg_idx_local:
-                    pieces.append(rg_table.take(pa.array(rg_idx_local)))
-            if not pieces:
-                return pa.table({c.name: [] for c in self._metadata.schema})
-            return pa.concat_tables(pieces)
+            rg_tables = [pf.read_row_group(int(rg)) for rg in unique_rgs]
+            # Row position of each requested index within the concat of
+            # the selected groups: cum_rows[sel_pos] + (idx - group_lo).
+            cum_rows = np.zeros(len(unique_rgs), dtype="int64")
+            np.cumsum([t.num_rows for t in rg_tables[:-1]], out=cum_rows[1:])
+            big = (
+                pa.concat_tables(rg_tables)
+                if len(rg_tables) > 1 else rg_tables[0]
+            )
+            positions = np.empty(len(idx_np), dtype="int64")
+            for p, rg in enumerate(unique_rgs.tolist()):
+                mask = rg_idx == rg
+                positions[mask] = cum_rows[p] + (idx_np[mask] - int(self._rg_offsets[rg]))
+            return big.take(pa.array(positions))
 
         def column(self, name):
             return self._materialize().column(name)

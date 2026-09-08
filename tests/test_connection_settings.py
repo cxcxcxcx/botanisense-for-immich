@@ -133,16 +133,39 @@ def test_blank_key_keeps_saved_key(tmp_path, monkeypatch):
             json={"base_url": DEAD_URL, "api_key": "original-key"},
         )
         assert first.status_code == 200
-        # URL-only edit: blank api_key means "keep what's saved".
+        # Same-URL edit: blank api_key means "keep what's saved".
         second = c.post(
             "/api/settings/immich",
-            json={"base_url": "http://127.0.0.1:20", "api_key": ""},
+            json={"base_url": DEAD_URL, "api_key": ""},
         )
     assert second.status_code == 200
     import storage  # noqa: E402
     with storage.connect(db_path) as conn:
         saved = storage.get_connection_settings(conn)
-    assert saved == {"base_url": "http://127.0.0.1:20", "api_key": "original-key"}
+    assert saved == {"base_url": DEAD_URL, "api_key": "original-key"}
+
+
+def test_blank_key_with_new_url_is_422(tmp_path, monkeypatch):
+    """Blank key + CHANGED url must be refused: pairing the saved key
+    with a new host would send that key to whoever controls the URL."""
+    client, app, db_path = _boot(tmp_path, monkeypatch)
+    with client as c:
+        first = c.post(
+            "/api/settings/immich",
+            json={"base_url": DEAD_URL, "api_key": "original-key"},
+        )
+        assert first.status_code == 200
+        second = c.post(
+            "/api/settings/immich",
+            json={"base_url": "http://127.0.0.1:20", "api_key": ""},
+        )
+    assert second.status_code == 422
+    assert "key" in second.json()["detail"].lower()
+    # The saved connection is untouched.
+    import storage  # noqa: E402
+    with storage.connect(db_path) as conn:
+        saved = storage.get_connection_settings(conn)
+    assert saved == {"base_url": DEAD_URL, "api_key": "original-key"}
 
 
 def test_no_key_anywhere_is_422(tmp_path, monkeypatch):

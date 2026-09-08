@@ -222,14 +222,29 @@ export function JobPanel() {
     sseRegistryKey ?? 'kingdom_jobs',
     sseJobId,
   );
+  // Stable per-run identity for effect deps: the whole `job` object is
+  // replaced on every dispatch, so keying effects on it restarts them
+  // at dispatch cadence (RTT) instead of their intended cadence.
+  const jobRunKey =
+    job.kind === 'idle'
+      ? ''
+      : `${job.kind}:${job.state}:${job.jobId ?? ''}:${job.payload.clusterId ?? ''}:${job.payload.kingdom ?? ''}`;
 
   // When the panel enters the confirm state, kick off the preview (if any).
+  // Guarded by a signature ref: JOB_PREVIEW_OK replaces the job object
+  // (state stays 'confirm'), so keying this effect on `job` alone would
+  // re-fetch in a loop — for purge-missing each fetch is a server-side
+  // Immich dry-run scan. Re-fetch only when the panel identity changes.
+  const previewedForRef = useRef<string | null>(null);
   useEffect(() => {
     if (job.kind === 'idle') return;
     const activeJob = job;
     if (activeJob.state !== 'confirm') return;
     const cfg = buildConfigs(activeJob.payload.clusterId)[activeJob.kind];
     if (!cfg.hasPreview) return;
+    const sig = `${activeJob.kind}:${JSON.stringify(activeJob.payload)}`;
+    if (previewedForRef.current === sig) return;
+    previewedForRef.current = sig;
     let cancelled = false;
     cfg.preview()
       .then(r => {
@@ -243,8 +258,6 @@ export function JobPanel() {
         dispatch({ type: 'JOB_PREVIEW_ERR', errorMsg: msg });
       });
     return () => { cancelled = true; };
-    // job.kind & job.payload change when the user opens a new panel; we want
-    // the preview to re-fetch when that happens.
   }, [job, dispatch]);
 
   // Track the running job. Two paths:
@@ -315,7 +328,11 @@ export function JobPanel() {
     // Handled by the streamJob-driven effect below — no imperative
     // loop needed.
     return undefined;
-  }, [job, dispatch, push]);
+    // Keyed on the stable per-run identity — the whole `job` object is
+    // replaced by every JOB_PROGRESS dispatch, which would restart this
+    // effect (and re-poll) at RTT cadence instead of every 400 ms.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobRunKey, dispatch, push]);
 
   // React to SSE snapshots for the running job. `streamJob` is the
   // job's current state from the latest server-emitted snapshot; each
@@ -353,6 +370,12 @@ export function JobPanel() {
     }
     // status === 'running' (or any other in-progress state)
     const { added, total } = cfg.extractProgress(streamJob);
+    // Only dispatch when the numbers actually moved. JOB_PROGRESS
+    // always returns a new state object, so an unconditional dispatch
+    // here re-rendered the app, re-ran this effect (its deps include
+    // the fresh `job`), and dispatched again — an infinite loop that
+    // pegged a core for the whole job duration.
+    if (job.progress.added === added && job.progress.total === total) return;
     dispatch({ type: 'JOB_PROGRESS', added, total });
   }, [streamJob, activeCfg, job, dispatch, push]);
 

@@ -122,16 +122,20 @@ export function ParamsForm({ paramsOpen }: Props) {
   // actual run state, not just "click is being processed".
   const { data: snapshot } = useEventStream<EventSnapshot>('/api/events');
   const running = snapshot?.pipeline?.status === 'running';
-  // `awaiting` covers the window from click → SSE confirms a terminal
-  // state. It is NOT cleared when the POST returns, because there's a
-  // brief gap between /api/run returning and the server's first SSE
-  // push. Without this, the button would flicker back to "Run
-  // Pipeline" before the user sees "Running…". Cleared in three
-  // places:
+  // `awaiting` covers the window from click → the SSE confirms the run
+  // is live. It is NOT cleared when the POST returns (there's a gap
+  // between /api/run returning and the server's first SSE push) and it
+  // is NOT cleared by just any terminal status: the snapshot the SSE
+  // already holds at click time still shows the PREVIOUS run's
+  // "done", and letting that stale value clear `awaiting` re-enabled
+  // the button seconds before the new run ever showed up. So a
+  // terminal status only counts once the SSE has reported "running"
+  // for this click (`runConfirmedRef`). Cleared in:
   //   1. handleRun's catch block — POST failed, let the user retry.
-  //   2. The useEffect below — SSE reports done/error/stopped.
-  //   3. (Implicit) when the SSE's `running` flag flips on, `busy` is
-  //      already true via `running`; we don't need to clear awaiting.
+  //   2. The useEffect below — SSE confirms "running" (busy visuals
+  //      continue via `running`), then releases on done/error/stopped.
+  //   3. The backstop timer in handleRun — SSE never confirmed (child
+  //      died at boot), so don't latch the button forever.
   const [awaiting, setAwaiting] = useState(false);
   const busy = running || awaiting;
   // Synchronous "busy" guard — `awaiting` is React state and only
@@ -141,20 +145,51 @@ export function ParamsForm({ paramsOpen }: Props) {
   // form even when the submit button is disabled) would re-enter
   // handleRun and fire /api/run twice. `busyRef` is a ref — set
   // synchronously on click — so the second invocation early-returns
-  // before the second POST goes out.
+  // before the second POST goes out. It stays latched until the
+  // confirmed run reaches a terminal state, so Enter still can't
+  // double-submit mid-run.
   const busyRef = useRef(false);
+  // Set once the SSE has shown "running" since the click. Only a
+  // terminal status seen AFTER this latch releases the button.
+  const runConfirmedRef = useRef(false);
+  // Backstop timer armed after a successful POST (see handleRun).
+  const releaseTimerRef = useRef<number | null>(null);
   const push = useToasts();
 
-  // Clear `awaiting` (and the ref) once the server reports a
-  // terminal pipeline state. We don't react to "idle" — that's also
-  // the initial state, and a momentary SSE reconnect could surface
-  // "idle" right before the run actually starts.
+  useEffect(() => () => {
+    // Unmount: don't leave the backstop timer firing post-unmount.
+    if (releaseTimerRef.current !== null) window.clearTimeout(releaseTimerRef.current);
+  }, []);
+
   useEffect(() => {
-    if (!awaiting) return;
+    if (!awaiting && !busyRef.current) return;
     const status = snapshot?.pipeline?.status;
-    if (status === 'done' || status === 'error' || status === 'stopped') {
+    if (status === 'running') {
+      // Our run is live — `running` owns the busy visuals from here,
+      // so awaiting can drop. busyRef stays latched (Enter-in-input
+      // submits even with the button disabled) until the run ends.
+      runConfirmedRef.current = true;
+      if (releaseTimerRef.current !== null) {
+        window.clearTimeout(releaseTimerRef.current);
+        releaseTimerRef.current = null;
+      }
       setAwaiting(false);
-      busyRef.current = false;
+      return;
+    }
+    if (
+      !runConfirmedRef.current ||
+      (status !== 'done' && status !== 'error' && status !== 'stopped')
+    ) {
+      // Either a pre-run snapshot value (idle / the previous run's
+      // "done") or still mid-run — keep the button latched.
+      return;
+    }
+    runConfirmedRef.current = false;
+    setAwaiting(false);
+    busyRef.current = false;
+    if (releaseTimerRef.current !== null) {
+      window.clearTimeout(releaseTimerRef.current);
+      releaseTimerRef.current = null;
     }
   }, [snapshot, awaiting]);
 
@@ -162,6 +197,7 @@ export function ParamsForm({ paramsOpen }: Props) {
     e.preventDefault();
     if (busyRef.current) return;
     busyRef.current = true;
+    runConfirmedRef.current = false;
     setAwaiting(true);
     try {
       const resp = await runPipeline({
@@ -176,12 +212,22 @@ export function ParamsForm({ paramsOpen }: Props) {
         { kind: 'success', message: `Pipeline started (job ${jobId ?? '?'})` },
         2500,
       );
-      // Note: we deliberately don't `setAwaiting(false)` here. The SSE
-      // will tell us when the run actually finishes (done/error/stopped),
-      // at which point the useEffect above clears awaiting.
+      // Note: we deliberately don't `setAwaiting(false)` here — the
+      // useEffect above clears it when the SSE confirms the run. The
+      // timer below is only the backstop for the case where the SSE
+      // NEVER confirms (child died before its first status write, or
+      // the SSE connection is gone): release the button rather than
+      // latching the user out of the form forever.
+      releaseTimerRef.current = window.setTimeout(() => {
+        releaseTimerRef.current = null;
+        if (runConfirmedRef.current) return; // effect owns the release
+        setAwaiting(false);
+        busyRef.current = false;
+      }, 30_000);
     } catch (err) {
       setAwaiting(false);
       busyRef.current = false;
+      runConfirmedRef.current = false;
       push(
         { kind: 'info', message: err instanceof Error ? err.message : String(err) },
         4000,

@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -309,6 +310,15 @@ def init_db(path: str | Path) -> None:
             # User-set Plantae override (UX-17). NULL = use the model;
             # 0 = force non-plant; 1 = force plant.
             ("ALTER TABLE assets ADD COLUMN plantae_override INTEGER", "plantae_override"),
+            # Plant-detection scan marker: NULL = not yet run through
+            # the yolo stage; a timestamp = scanned, INCLUDING scans
+            # that found zero boxes (an empty detections table is
+            # otherwise indistinguishable from "never scanned").
+            # Independent of the predictions cache so a run that dies
+            # between the species and yolo stages still resumes
+            # detection. The yolo stage stamps has_person in the same
+            # write — one forward pass covers both markers.
+            ("ALTER TABLE assets ADD COLUMN yolo_scanned_at TEXT", "yolo_scanned_at"),
         ]:
             try:
                 conn.execute(stmt)
@@ -1478,12 +1488,24 @@ def find_kingdom_assets(
     outer WHERE on taxon_scores (FK CASCADE).
     """
     extra = _PEOPLE_FILTER_SQL[people_filter]
-    join_assets = " JOIN assets a ON a.asset_id = t.asset_id" if extra else ""
+    # Plantae album sync honors plantae_override: force-plant (1) is
+    # included regardless of score; force-non-plant (0) is excluded even
+    # with a high score. Needs the assets JOIN, which people_filter may
+    # already have added.
+    override_aware = kingdom == "Plantae"
+    join_assets = (
+        " JOIN assets a ON a.asset_id = t.asset_id"
+        if (extra or override_aware) else ""
+    )
+    if override_aware:
+        qual = "(a.plantae_override IS 1 OR (a.plantae_override IS NOT 0 AND t.score >= ?))"
+    else:
+        qual = "t.score >= ?"
     rows = conn.execute(
         f"""
         SELECT DISTINCT t.asset_id
         FROM taxon_scores t{join_assets}
-        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND t.score >= ?
+        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND {qual}
         {extra}
         """,
         (kingdom, float(min_score)),
@@ -1502,12 +1524,20 @@ def count_kingdom_assets(
     endpoint (avoids materializing the asset_id list). Same
     `people_filter` semantics as `find_kingdom_assets`."""
     extra = _PEOPLE_FILTER_SQL[people_filter]
-    join_assets = " JOIN assets a ON a.asset_id = t.asset_id" if extra else ""
+    override_aware = kingdom == "Plantae"
+    join_assets = (
+        " JOIN assets a ON a.asset_id = t.asset_id"
+        if (extra or override_aware) else ""
+    )
+    if override_aware:
+        qual = "(a.plantae_override IS 1 OR (a.plantae_override IS NOT 0 AND t.score >= ?))"
+    else:
+        qual = "t.score >= ?"
     row = conn.execute(
         f"""
         SELECT COUNT(DISTINCT t.asset_id) AS n
         FROM taxon_scores t{join_assets}
-        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND t.score >= ?
+        WHERE t.rank = 'kingdom' AND t.taxon_name = ? AND {qual}
         {extra}
         """,
         (kingdom, float(min_score)),
@@ -1567,6 +1597,32 @@ def embeddings_have_asset(conn: sqlite3.Connection, asset_id: str) -> bool:
         "SELECT 1 FROM embeddings WHERE asset_id = ?", (asset_id,)
     ).fetchone()
     return row is not None
+
+
+def bulk_fetch_embeddings(
+    conn: sqlite3.Connection, *, asset_ids: list[str]
+) -> dict[str, np.ndarray]:
+    """Bulk: returns {asset_id: vector} for the subset of `asset_ids`
+    that has a row in the embeddings table (one SELECT for the whole
+    batch). Used by the species/kingdom stages to skip a BioCLIP re-
+    encode for assets whose normalized image feature vector was already
+    persisted — the search stage encodes every unseen asset once while
+    scoring kingdoms, so reusing that vector removes a full ViT forward
+    pass per asset. Callers must check the vector's dim against the
+    loaded model's embed dim (a DB built against BioCLIP-1's 512-dim
+    model must not be fed to BioCLIP-2's 768-dim text head)."""
+    if not asset_ids:
+        return {}
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT asset_id, vector FROM embeddings "
+        f"WHERE asset_id IN ({placeholders})",
+        list(asset_ids),
+    ).fetchall()
+    return {
+        r["asset_id"]: np.frombuffer(r["vector"], dtype="<f4").copy()
+        for r in rows
+    }
 
 
 # ---------- predictions --------------------------------------------------
@@ -1664,13 +1720,18 @@ def bulk_fetch_prediction_counts(
 
 
 def replace_detections(
-    conn: sqlite3.Connection, *, asset_id: str, detections: Iterable[dict]
+    conn: sqlite3.Connection, *, asset_id: str, detections: Iterable[dict],
 ) -> list[int]:
     """`detections` is an iterable of dicts with keys
     `label, score, x, y, w, h` where x/y/w/h are normalized 0..1 and
     describe the top-left corner + size. Returns the new detection row
     IDs in insertion order so the caller can chain a per-detection
-    follow-up (e.g. BioCLIP on each bbox crop) without re-querying."""
+    follow-up (e.g. BioCLIP on each bbox crop) without re-querying.
+
+    Deletes EVERY existing row for the asset first — the caller must
+    have fresh boxes for all labels (the yolo stage derives plant,
+    person and hand boxes from the same forward pass). Use
+    `append_detections` instead when existing rows should survive."""
     conn.execute("DELETE FROM detections WHERE asset_id=?", (asset_id,))
     rows = [
         (
@@ -1728,11 +1789,48 @@ def replace_detections(
     return out
 
 
-def detections_have_asset(conn: sqlite3.Connection, asset_id: str) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM detections WHERE asset_id = ?", (asset_id,)
-    ).fetchone()
-    return row is not None
+def bulk_yolo_scanned_assets(
+    conn: sqlite3.Connection, *, asset_ids: list[str]
+) -> set[str]:
+    """Returns the subset of `asset_ids` whose plant-detection scan has
+    already completed (assets.yolo_scanned_at IS NOT NULL). One SELECT
+    for the whole batch. The marker is independent of the species-
+    predictions cache and is set even for scans that found ZERO boxes
+    (an empty detections table must not read as "never scanned"), so
+    the pipeline uses it to decide which assets the yolo stage still
+    owes."""
+    if not asset_ids:
+        return set()
+    placeholders = ",".join("?" for _ in asset_ids)
+    rows = conn.execute(
+        f"SELECT asset_id FROM assets "
+        f"WHERE yolo_scanned_at IS NOT NULL "
+        f"AND asset_id IN ({placeholders})",
+        list(asset_ids),
+    ).fetchall()
+    return {r["asset_id"] for r in rows}
+
+
+def mark_yolo_scanned(
+    conn: sqlite3.Connection, *, asset_id: str, has_person: bool
+) -> None:
+    """Stamp assets.yolo_scanned_at (and has_person) so neither the
+    yolo stage nor the person stage ever re-scans this asset. Set AFTER
+    the detection rows are written, including when the asset had zero
+    detections — an empty detections table otherwise reads as 'never
+    scanned' and the asset would re-enter the worklist on every run.
+
+    `has_person` comes from the same forward pass (storage.
+    has_real_person over the merged boxes) — stamping it here is what
+    keeps the pipeline's person sweep a residual-only stage. Required,
+    not optional: the yolo model's label set always includes the
+    person/hand labels, so there is no legitimate "scanned but
+    person-unknown" state."""
+    conn.execute(
+        "UPDATE assets SET yolo_scanned_at = datetime('now'), "
+        "has_person = ? WHERE asset_id=?",
+        (int(bool(has_person)), asset_id),
+    )
 
 
 # YOLO labels that count as "this image has a person in it". Kept in
@@ -3394,13 +3492,24 @@ def get_run_taxonomy_summary(
 # asset that has no Plantae score (verified: exactly 1 out of 19,304)
 # and treats it as non_plant.
 def _plantae_score_expr(asset_alias: str = "a") -> str:
-    """Return the SQL expression that yields the Plantae kingdom score
-    for the given asset table alias. Use `a` in the outer query and
-    `a2` inside correlated subqueries that JOIN a different alias."""
-    return (
+    """SQL expression for the EFFECTIVE Plantae score of the given asset
+    table alias (use `a` in the outer query, `a2` inside correlated
+    subqueries that JOIN a different alias).
+
+    The user's `plantae_override` wins over the model score: 1 forces
+    plant (1.0, always green-tier / included), 0 forces non-plant (0.0,
+    always excluded), NULL defers to the BioCLIP kingdom score. This is
+    the single chokepoint every plant/non-plant filter and tier
+    predicate goes through, so the override applies everywhere at once.
+    """
+    score = (
         f"COALESCE((SELECT ts.score FROM taxon_scores ts "
         f"WHERE ts.asset_id = {asset_alias}.asset_id AND ts.rank = 'kingdom' "
         f"AND ts.taxon_name = 'Plantae'), 0)"
+    )
+    return (
+        f"CASE {asset_alias}.plantae_override "
+        f"WHEN 1 THEN 1.0 WHEN 0 THEN 0.0 ELSE {score} END"
     )
 
 
@@ -3522,7 +3631,7 @@ def get_all_results(
                a.thumbnail_url, a.cluster_id,
                a.first_seen_at,
                a.captured_at, a.latitude, a.longitude,
-               a.has_person,
+               a.has_person, a.plantae_override,
                (SELECT sr.rank_position
                   FROM search_results sr
                   WHERE sr.asset_id = a.asset_id
@@ -3621,6 +3730,14 @@ def get_all_results(
     taxon_by_asset: dict[str, dict[str, float]] = {}
     for s in score_rows:
         taxon_by_asset.setdefault(s["asset_id"], {})[s["taxon_name"]] = float(s["score"])
+    # Apply the user's plantae_override to the page's score map too, so
+    # the card tier dots match the SQL filter (which uses the same
+    # override-aware effective score).
+    for r in rows:
+        if r["plantae_override"] is not None:
+            taxon_by_asset.setdefault(r["asset_id"], {})["Plantae"] = (
+                1.0 if r["plantae_override"] == 1 else 0.0
+            )
 
     # Build sibling meta for every asset that passed the SQL filter
     # (so we can populate near_dups with hidden siblings too).

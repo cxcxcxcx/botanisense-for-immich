@@ -1,11 +1,13 @@
 // KnnStatusNote (rendered by <KnnAlert />) — inline KNN status shown
 // INSIDE the Data tools card on the Run page, right above the
 // "Build KNN index" button. Deliberately not a top-of-page banner:
-// a missing index is a quality upgrade waiting to happen, not an
-// error — so the missing state is a muted amber note that says the
-// zero-shot results aren't great yet and points at the button below.
-// Only a built-but-unhealthy index keeps the red alert treatment
-// (that one IS a correctness problem: neighbours are arbitrary).
+// a missing index is the GOOD state, not an error — in the current
+// setup zero-shot is the more accurate path, so the note exists to
+// steer people away from building unless they specifically want to
+// debug or inspect the reference embeddings (the index is also very
+// memory-hungry). Only a built-but-unhealthy index keeps the red
+// alert treatment (that one IS a correctness problem: neighbours are
+// arbitrary).
 
 import { useEffect, useState } from 'react';
 import { getKnnStatus } from '../api/endpoints';
@@ -68,10 +70,12 @@ export function KnnAlert({ refreshKey = 0 }: { refreshKey?: number }) {
       <div>
         <h4 className="knn-note-title">KNN reclassification: not set up</h4>
         <p className="knn-note-body">
-          Predictions are zero-shot only, and species-level accuracy
-          isn&apos;t great yet. Build a KNN index (button below) to
-          re-classify against ~234M reference embeddings — builds take
-          hours to days depending on size.
+          Predictions are zero-shot — and in the current setup that is
+          the more accurate path, so KNN is <strong>not
+          recommended</strong>. The reference index is kept for
+          debugging / understanding the embeddings only: it performs
+          worse than zero-shot here and is very memory-hungry. The
+          build button below exists for that; you can safely ignore it.
         </p>
         {data.inventory_dir && (
           <p className="knn-note-body text-[10px] text-fg-1 mt-1">

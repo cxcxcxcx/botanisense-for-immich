@@ -27,6 +27,14 @@ import httpx
 _log = logging.getLogger("immich_client")
 
 
+class ImmichProbeError(RuntimeError):
+    """Raised when an asset existence probe gets a response that is
+    neither 200 (exists) nor 404 (missing) — 401/403 (bad/expired key),
+    429 (rate limit), 5xx (Immich restarting). The purge flow must ABORT
+    on this: treating those as "missing" would delete every local row.
+    """
+
+
 @dataclass
 class ImmichAsset:
     id: str
@@ -222,7 +230,10 @@ class ImmichClient:
             "get_asset_metadata %s: unexpected status %s",
             asset_id, r.status_code,
         )
-        self._exif_cache[asset_id] = None
+        # NOT cached: a 429/5xx is Immich having a moment, not the
+        # asset having no metadata. Caching it here would pin "no EXIF"
+        # for the rest of the run even after Immich recovers. (Only the
+        # definitive 404 above is cached as None.)
         return None
 
     @staticmethod
@@ -293,13 +304,23 @@ class ImmichClient:
         ) as ac:
             async def probe(aid: str) -> str | None:
                 async with sem:
-                    # Transport errors MUST bubble — if Immich is
-                    # unreachable and we silently return None, the
-                    # purge endpoint would mark every asset as missing
-                    # and DELETE them. A non-200 response (e.g. 404)
-                    # is the correct signal to treat as missing.
+                    # Only 200 (exists) and 404 (missing) are
+                    # definitive. Transport errors MUST bubble too —
+                    # if Immich is unreachable, rate-limiting (429),
+                    # rejecting the key (401/403), or 5xx'ing mid-restart
+                    # and we treated any of those as "missing", the
+                    # purge endpoint would mark EVERY asset as missing
+                    # and DELETE them. Abort the whole purge instead.
                     r = await ac.head(f"/api/assets/{aid}")
-                    return aid if r.status_code == 200 else None
+                    if r.status_code == 200:
+                        return aid
+                    if r.status_code == 404:
+                        return None
+                    raise ImmichProbeError(
+                        f"Immich returned HTTP {r.status_code} while "
+                        f"probing assets (first id: {aid}) — aborting "
+                        f"purge; check the API key and that Immich is up."
+                    )
 
             results = await asyncio.gather(*(probe(a) for a in asset_ids))
         return {x for x in results if x is not None}

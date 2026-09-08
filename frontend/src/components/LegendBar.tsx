@@ -55,7 +55,7 @@ export function LegendBar() {
         <button
           className="data-tool-btn"
           onClick={() => setKnnOpen(true)}
-          title="Build the FAISS KNN index from TreeOfLife-200M parquet embeddings. Heavy: minutes-to-hours; logs stream into a tail viewer."
+          title="Build the FAISS KNN index from TreeOfLife-200M parquet embeddings. Debugging tool, not recommended: in the current setup KNN is less accurate than zero-shot and the index is very memory-hungry. Heavy: minutes-to-hours; logs stream into a tail viewer."
         >
           <BrainIcon />
           Build KNN index
@@ -71,7 +71,7 @@ export function LegendBar() {
         <button
           className="data-tool-btn"
           onClick={handleReclassifyVisible}
-          title="Queue KNN reclassification for every asset currently visible in the browse grid."
+          title="Queue KNN reclassification for every asset currently visible in the browse grid. Debugging only — KNN is expected to be less accurate than the zero-shot predictions here."
         >
           <ActivityIcon />
           Reclassify with KNN

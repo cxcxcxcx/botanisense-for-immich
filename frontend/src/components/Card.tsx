@@ -7,7 +7,6 @@ import { formatPct } from '../lib/format';
 
 interface Props {
   row: ResultRow;
-  onUpdated: (assetId: string) => void;
 }
 
 export function Card({ row }: Props) {

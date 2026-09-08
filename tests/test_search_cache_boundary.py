@@ -128,6 +128,40 @@ class _FakeClassifier:
         self.predict_calls = 0
         self.create_image_features_calls = 0
 
+    device = "cpu"
+
+    def get_txt_embeddings(self):
+        import torch
+        return torch.zeros(8, 5)
+
+    def create_probabilities(self, feats, txt_embeddings):
+        import torch
+        n = feats.shape[0]
+        return torch.softmax(
+            torch.zeros(n, txt_embeddings.shape[1]) + 0.2, dim=1
+        )
+
+    def format_species_probs(self, image_key, probs, k=5):
+        return [
+            {
+                "file_name": image_key,
+                "kingdom": "Plantae",
+                "family": "Fam",
+                "genus": "Gen",
+                "species": "sp",
+                "common_name": "common",
+                "score": 0.95 - pos * 0.01,
+            }
+            for pos in range(min(k, 5))
+        ]
+
+    def format_grouped_probs(self, image_key, probs, rank, min_prob=1e-9, k=5):
+        rows = [
+            {"file_name": image_key, "kingdom": "Plantae", "score": 0.95},
+            {"file_name": image_key, "kingdom": "Fungi", "score": 0.02},
+        ]
+        return rows[:k]
+
     def predict(self, images, *, rank, k):
         from bioclip import Rank
         self.predict_calls += 1

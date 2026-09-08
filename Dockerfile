@@ -58,13 +58,18 @@ WORKDIR /app
 COPY pyproject.toml ./
 RUN uv pip install --system --no-cache -r pyproject.toml
 
-# Warm the YOLO-World weight download (27 MB) so first person-scan
-# doesn't need to fetch it, and so a read-only /app still works —
-# yolo.py loads it by bare filename from the CWD.
-RUN python -c "from ultralytics import YOLOWorld; YOLOWorld('yolov8s-world.pt')"
+# Warm model downloads so first scan doesn't need to fetch them, and so
+# a read-only /app still works — yolo.py loads weights by bare filename
+# from the CWD, and ultralytics resolves its weights dir to
+# $CWD/weights (settings weights_dir="weights"), which is root-owned at
+# runtime. set_classes() also imports OpenAI CLIP and downloads its
+# ViT-B/32 text-encoder weights (~340 MB into /app/weights/clip), so
+# doing it here both proves the `clip` dep is present and bakes the
+# weights into the image world-readable.
+RUN python -c "from ultralytics import YOLOWorld; m = YOLOWorld('yolov8s-world.pt'); m.set_classes(['plant'])"
 
 COPY --from=frontend /build/dist frontend/dist
-COPY app.py pipeline.py storage.py clusters.py \
+COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
      knn.py knn_io.py immich_client.py run.py yolo.py ./
 
 RUN useradd --uid 1000 --create-home botanisense \

@@ -17,7 +17,9 @@ import gc
 import json
 import logging
 import os
+import shutil
 import sqlite3
+import io as _io
 import tempfile
 import time
 from collections import defaultdict
@@ -136,10 +138,23 @@ def _resolve_classifier() -> "object | None":
                 "[model] loading BioCLIP-2 (first use downloads ~4.3 GB "
                 "of weights + label table; progress bar in docker logs)"
             )
+            # Pin the intra-op pool explicitly. torch's default is
+            # already the physical-core count, but the run child is
+            # forked from uvicorn and a run once crawled at
+            # ~2 s/img (~1.5 threads' worth) for no reason the
+            # environment showed — an explicit set here makes the
+            # intended parallelism independent of anything inherited.
+            # Measured on the 16-thread dev box (encode 32 previews):
+            # 1T 1.58 s/img · 2T 0.86 · 4T 0.60 · 8T 0.33 · 16T 0.36
+            # — 8 (physical cores) is the knee; hyperthreads regress.
+            import torch
+
+            torch.set_num_threads(min(8, os.cpu_count() or 8))
             _t0 = time.monotonic()
             _clf_cache = _TreeOfLifeClassifier()
             _log.info(
-                f"[model] BioCLIP-2 ready in {time.monotonic() - _t0:.0f}s"
+                f"[model] BioCLIP-2 ready in {time.monotonic() - _t0:.0f}s "
+                f"(torch threads={torch.get_num_threads()})"
             )
     return _clf_cache
 
@@ -189,13 +204,21 @@ class _PipelineStop(Exception):
 
 def request_stop() -> bool:
     """Signal the running pipeline to stop at the next batch boundary.
-    Returns True if a stop was actually requested (i.e. the pipeline
-    was running); False if nothing was running."""
-    with _state_lock:
-        was_running = _state["status"] == "running"
-    if was_running:
-        _stop_event.set()
-    return was_running
+    Returns True if the pipeline looked like it was running.
+
+    Deliberately lock-free: this runs inside the SIGTERM handler, on the
+    main thread while it is paused mid-bytecode. If it took
+    _state_lock (non-reentrant) and the main thread was inside any
+    `with _state_lock:` block — every chunk boundary is — the handler
+    would deadlock against the thread that can never release the lock,
+    and only the parent's 45s SIGKILL watchdog would recover. Event.set
+    is a plain flag flip, safe from a signal handler. An early stop
+    (before the run marks itself "running") is honored by the worker,
+    which checks stop_requested() right before run_pipeline.
+    """
+    was_set = _stop_event.is_set()
+    _stop_event.set()
+    return was_set or _state.get("status") == "running"
 
 
 def clear_stop() -> None:
@@ -452,16 +475,27 @@ def _chunk_log(
     *,
     n_items: int,
     elapsed: float,
+    items_done: int | None = None,
     note: str = "",
 ) -> None:
     """Log a chunk progress line with ETA. Safe to call on every chunk
-    (called once per chunk). chunk_idx is 1-based for human readability."""
+    (called once per chunk). chunk_idx is 1-based for human readability.
+
+    `items_done` is the cumulative number of items processed in the
+    stage so far; the rate is items_done/elapsed. The old code divided
+    the CURRENT chunk's n_items by the CUMULATIVE elapsed, which decayed
+    to 0.0/s by mid-stage (16 items / 8000 s) even though throughput was
+    steady. Callers pass the stage's running total (e.g. `j`, the chunk
+    loop cursor); when omitted we fall back to chunk_idx * n_items."""
     if total_chunks <= 0:
         return
     done = chunk_idx
     per_chunk = elapsed / done if done > 0 else 0.0
     remaining = max(0, total_chunks - done) * per_chunk
-    rate = n_items / elapsed if elapsed > 0 else 0.0
+    cumulative_items = (
+        items_done if items_done is not None else done * max(1, n_items)
+    )
+    rate = cumulative_items / elapsed if elapsed > 0 else 0.0
     tail = f"  {note}" if note else ""
     _log.info(
         f"[{stage}] chunk {done}/{total_chunks}  items={n_items}  "
@@ -469,7 +503,6 @@ def _chunk_log(
         f"eta={_fmt_eta(remaining)}{tail}"
     )
     # Mirror into the shared state so the UI can show the same numbers.
-    cumulative_items = chunk_idx * max(1, n_items)  # rough; refined per-stage
     set_state(
         stage=stage,
         chunk_idx=chunk_idx,
@@ -606,37 +639,194 @@ PLANT_BATCH_MAJORITY = 0.30      # 30% of the batch must be candidates to contin
 PLANT_MIN_BATCH_FOR_BOUNDARY = 24
 
 
+def _classify_features(
+    clf,
+    feats,
+    keys: list[str],
+    *,
+    rank_enum,
+    k: int,
+    min_prob: float = 1e-9,
+) -> list[dict]:
+    """Run BioCLIP's text classification head on PRECOMPUTED image
+    features and return the same list-of-dicts shape clf.predict()
+    returns (rows tagged with `keys` as file_name).
+
+    This is numerically clf.predict()'s classification step — softmax
+    over logit_scale * feats @ txt_embeddings, then top-k / rank-grouped
+    formatting — minus the image encoding. clf.predict() re-opens and
+    re-encodes every image internally (a full ViT-L/14 forward pass on
+    CPU), so any caller that already encoded images — e.g. to persist
+    the embedding, or because it loaded a stored embedding from the DB —
+    must go through here instead of calling predict() again, or it pays
+    for the vision tower twice per chunk.
+    """
+    probs = clf.create_probabilities(feats, clf.get_txt_embeddings()).detach().cpu()
+    is_species = getattr(rank_enum, "name", str(rank_enum)).upper() == "SPECIES"
+    out: list[dict] = []
+    for i, key in enumerate(keys):
+        if is_species:
+            out.extend(clf.format_species_probs(key, probs[i], k))
+        else:
+            out.extend(clf.format_grouped_probs(key, probs[i], rank_enum, min_prob, k))
+    return out
+
+
+_PIL_DRAFT_SIZE = 448  # ~2x the model's 224px input — decode-cheap
+
+
+def _decode_preview(blob: bytes) -> Image.Image:
+    """Decode a downloaded preview for BioCLIP — in memory only; raw
+    photos are never written to disk.
+
+    The model squashes everything to 224×224, but the naive
+    `Image.open(...).convert("RGB")` decodes the FULL preview (1440px+ —
+    occasionally a multi-MP original Immich serves in its place) and
+    the transforms then ToTensor that whole frame before Resize squashes
+    it. That was ~2 s of single-threaded decode/resize per photo — the
+    search stage's real bottleneck, invisible in every thread/MKL
+    profile. `draft` downscales during JPEG decode; `thumbnail` caps
+    whatever survives (WebP ignores draft).
+    """
+    img = Image.open(_io.BytesIO(blob))
+    try:
+        img.draft("RGB", (_PIL_DRAFT_SIZE, _PIL_DRAFT_SIZE))
+    except Exception:
+        pass
+    img = img.convert("RGB")
+    if max(img.size) > _PIL_DRAFT_SIZE:
+        img.thumbnail((_PIL_DRAFT_SIZE, _PIL_DRAFT_SIZE), Image.BILINEAR)
+    return img
+
+
+_KINGDOM_BIN_CACHE: dict[int, tuple] = {}
+
+
+def _kingdom_bins(clf) -> tuple["torch.Tensor", list[str]]:
+    """Index every label-table row into a kingdom bin, cached per
+    classifier instance (the table is ~785k rows; building the index is
+    a one-time ~1s walk). The cache keeps a strong reference to the
+    classifier so its id() can't be recycled onto a different one."""
+    cached = _KINGDOM_BIN_CACHE.get(id(clf))
+    if cached is not None:
+        return cached[1], cached[2]
+    import torch
+
+    kingdoms = [name_ary[0][0] for name_ary in clf.get_current_txt_names()]
+    bins = sorted(set(kingdoms))
+    bin_of = {name: i for i, name in enumerate(bins)}
+    idx = torch.tensor([bin_of[k] for k in kingdoms], dtype=torch.long)
+    _KINGDOM_BIN_CACHE[id(clf)] = (clf, idx, bins)
+    return idx, bins
+
+
+def _unload_classifier() -> None:
+    """Drop the cached BioCLIP classifier and hand its memory back.
+
+    BioCLIP's residency (~5-6 GB: fp32 weights, the 784k×768 text table
+    ≈ 2.4 GB, the python label names, allocator-retained activations) is
+    held for the classifier's lifetime by design — but it never needs to
+    overlap with YOLO. Stages run grouped by model: BioCLIP finishes
+    (search/species/kingdom), we unload, YOLO loads (yolo/person), and
+    bbox-bioclip re-resolves the classifier when it needs it again (one
+    ~10-20 s warm-cache load). Keeping both resident at once is what
+    OOM-killed runs on memory-tight hosts."""
+    global _clf_cache
+    if _clf_cache is None:
+        return
+    _clf_cache = None
+    # The kingdom-bin index holds a strong ref to the classifier —
+    # dropping the cache without clearing this would keep the whole
+    # model alive anyway.
+    _KINGDOM_BIN_CACHE.clear()
+    gc.collect()
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def _score_batch_for_kingdoms(
     clf,
-    paths: list[str],
-) -> dict[str, dict[str, float]]:
-    """Run BioCLIP kingdom-rank predict on `paths` and return
-    {file_path: {kingdom: score}} for Plantae and Fungi. Other kingdoms
-    (Animalia, etc.) are skipped — discovery only cares about plants and
-    mushrooms. Cached scores should be checked before calling this; we
-    don't cache here because the caller (discover_plantae_assets)
-    persists the rows after we get them back."""
-    if not paths:
-        return {}
-    # BioCLIP needs the Rank enum, not a string. Resolve lazily via the
-    # PEP 562 __getattr__ on this module so the import cost stays
-    # deferred until the first live run.
-    import sys as _sys
-    _Rank = _sys.modules[__name__].Rank
-    raw = clf.predict(images=paths, rank=_Rank.KINGDOM, k=5)
-    # Build {path: {Plantae: x, Fungi: y}} so the discovery loop can
+    items: list[tuple[str, bytes]],
+) -> tuple[dict[str, dict[str, float]], dict[str, np.ndarray]]:
+    """Run BioCLIP kingdom-rank prediction on downloaded previews.
+
+    `items` is [(asset_id, preview_bytes)] — raw photos stay in memory
+    only, nothing is written to disk.
+
+    Returns (scores, vec_by_id):
+      scores     — {asset_id: {kingdom: score}} for Plantae and Fungi
+                   only. Other kingdoms (Animalia, etc.) are skipped —
+                   discovery only cares about plants and mushrooms.
+      vec_by_id  — {asset_id: normalized 768-d float32 image feature
+                   vector} so the caller can persist it as the asset's
+                   embedding. The species stage would otherwise encode
+                   these exact same images a second time (and the old
+                   clf.predict() path encoded them once here AND again
+                   inside predict — this encode-once path is the fix).
+
+    Kingdom probabilities are the same numbers BioCLIP's grouped
+    formatting produces for rank=KINGDOM — softmax over the full label
+    table, then each row's probability summed into its kingdom bin —
+    but computed as one index_add instead of BioCLIP's per-image Python
+    loop over all ~785k label rows (~2 s/img in format_grouped_probs;
+    triage only needs 7 kingdom numbers).
+
+    Cached scores should be checked before calling this; we don't cache
+    here because the caller (discover_plantae_assets) persists the rows
+    after we get them back."""
+    if not items:
+        return {}, {}
+    import torch
+
+    # Encode once. clf.predict(images=paths) would do this same encode
+    # internally — we do it here so the feature vector can be (a) reused
+    # for kingdom classification in this call and (b) persisted to the
+    # embeddings table for the species stage to reuse.
+    pil_images = []
+    kept_items = []
+    for _aid, _blob in items:
+        try:
+            pil_images.append(_decode_preview(_blob))
+            kept_items.append((_aid, _blob))
+        except Exception as e:
+            # One corrupt/truncated thumbnail must not abort the run —
+            # skip the asset; the next run re-tries it (nothing was
+            # cached for it).
+            _log.warning(
+                "[search] %s: undecodable thumbnail (%s: %s) — skipping",
+                _aid, type(e).__name__, e,
+            )
+    items = kept_items
+    if not items:
+        return {}, {}
+    try:
+        feats = clf.create_image_features(pil_images, normalize=True)
+        with torch.no_grad():
+            probs = clf.create_probabilities(
+                feats, clf.get_txt_embeddings()
+            ).detach().cpu()
+            bin_idx, bins = _kingdom_bins(clf)
+            sums = torch.zeros(
+                (probs.shape[0], len(bins)), dtype=probs.dtype
+            ).index_add_(1, bin_idx, probs)
+        feats_np = feats.detach().cpu().numpy().astype("<f4")
+    finally:
+        for im in pil_images:
+            _close_image(im)
+    vec_by_id = {key: feats_np[i] for i, (key, _) in enumerate(items)}
+    # Build {asset_id: {Plantae: x, Fungi: y}} so the discovery loop can
     # decide on Plantae OR Fungi candidates in one pass.
     out: dict[str, dict[str, float]] = {}
-    for row in raw:
-        kingdom = row.get("kingdom")
-        if kingdom not in ("Plantae", "Fungi"):
-            continue
-        f = row["file_name"]
-        score = float(row["score"])
-        d = out.setdefault(f, {})
-        if score > d.get(kingdom, 0.0):
-            d[kingdom] = score
-    return out
+    for i, (key, _) in enumerate(items):
+        d = out.setdefault(key, {})
+        for j, kingdom in enumerate(bins):
+            if kingdom in ("Plantae", "Fungi"):
+                d[kingdom] = float(sums[i][j])
+    return out, vec_by_id
 
 
 def discover_plantae_assets(
@@ -648,7 +838,6 @@ def discover_plantae_assets(
     n_samples: int,
     base_url: str,
     api_key: str,
-    thumb_dir: Path,
     decision_batch_size: int = PLANT_BATCH_SIZE,
     stop_criterion: float | None = None,
     stop_event=None,
@@ -689,6 +878,13 @@ def discover_plantae_assets(
     page_size = PLANT_PAGE_SIZE
 
     set_state(stage="search", query=query, n_requested=n_samples)
+    # Rate/ETA sources for the per-batch breakdown lines and the UI
+    # panel. Without these the panel renders the stale default 0.0/s
+    # for the whole (potentially hours-long) stage. scored_total drives
+    # the rate; the ETA denominator is the ACCEPT target because Immich
+    # may dry up before n_samples photos are ever streamed.
+    search_t0 = time.monotonic()
+    scored_total = 0
 
     _log.info(
         f"[search] streaming Immich smart-search for query={query!r}, "
@@ -729,12 +925,12 @@ def discover_plantae_assets(
             check_stop(stop_event)
 
             # Gather cache hits and download preds in one pass.
-            # plantae_by_path: {path: {"Plantae": p, "Fungi": f}} — max of
-            # the two is used downstream to decide if a photo counts as a
-            # "candidate" (plant OR mushroom).
-            plantae_by_path: dict[str, dict[str, float]] = {}
-            to_predict_paths: list[str] = []
-            to_predict_assets: list[ImmichAsset] = []
+            # plantae_by_id: {asset_id: {"Plantae": p, "Fungi": f}} —
+            # max of the two is used downstream to decide if a photo
+            # counts as a "candidate" (plant OR mushroom).
+            plantae_by_id: dict[str, dict[str, float]] = {}
+            # (asset_id, preview bytes) — raw photos stay in memory only.
+            to_predict_items: list[tuple[str, bytes]] = []
             # Per-batch breakdown for the log so the user can see what
             # the batch actually did:
             #   n_cached      — taxon_scores read from DB (no BioCLIP)
@@ -745,6 +941,10 @@ def discover_plantae_assets(
             n_predict = 0
             n_thumb_dl = 0
             n_dedup = 0
+            # Per-batch phase timers (seconds), surfaced in the
+            # breakdown so a slow batch names its slow phase instead of
+            # hiding inside one wall-clock number.
+            t_meta = t_dl = t_enc = t_db = 0.0
             # Bulk DB reads for this batch — replaces 3 per-asset
             # SELECTs that previously dominated the search loop
             # (~30s for 10k cached photos). One SELECT for the cache
@@ -807,7 +1007,7 @@ def discover_plantae_assets(
                     # made the search boundary think nothing was a
                     # plant. Don't reintroduce that bug.
                     d = cached_scores.get(asset.id, {})
-                    plantae_by_path[str(thumb_dir / f"{asset.id}.jpg")] = {
+                    plantae_by_id[asset.id] = {
                         "Plantae": float(d.get("Plantae") or 0.0),
                         "Fungi": float(d.get("Fungi") or 0.0),
                     }
@@ -815,53 +1015,73 @@ def discover_plantae_assets(
                 # Cache miss — fetch EXIF so the freshly-inserted row
                 # has the capture time + GPS (captured_at IS NOT NULL
                 # check gates against re-fetching photos we already
-                # know about from an earlier run).
-                existing = existing_assets.get(asset.id, {})
-                if existing.get("captured_at") is None:
-                    exif = ImmichClient.extract_exif(
-                        client.get_asset_metadata(asset.id)
+                # know about from an earlier run). Per-asset errors are
+                # contained: a 500/undecodable asset must not abort the
+                # whole run — it stays un-cached, so the next run
+                # retries it.
+                try:
+                    existing = existing_assets.get(asset.id, {})
+                    if existing.get("captured_at") is None:
+                        _t0 = time.monotonic()
+                        exif = ImmichClient.extract_exif(
+                            client.get_asset_metadata(asset.id)
+                        )
+                        t_meta += time.monotonic() - _t0
+                    else:
+                        exif = {"captured_at": None, "latitude": None, "longitude": None}
+                    storage.upsert_asset(
+                        conn,
+                        asset_id=asset.id,
+                        original_file_name=asset.original_file_name,
+                        original_url=original_url,
+                        thumbnail_url=thumbnail_url,
+                        captured_at=exif["captured_at"],
+                        latitude=exif["latitude"],
+                        longitude=exif["longitude"],
                     )
-                else:
-                    exif = {"captured_at": None, "latitude": None, "longitude": None}
-                storage.upsert_asset(
-                    conn,
-                    asset_id=asset.id,
-                    original_file_name=asset.original_file_name,
-                    original_url=original_url,
-                    thumbnail_url=thumbnail_url,
-                    captured_at=exif["captured_at"],
-                    latitude=exif["latitude"],
-                    longitude=exif["longitude"],
-                )
-                n_predict += 1
-                p = thumb_dir / f"{asset.id}.jpg"
-                if not p.exists():
+                    n_predict += 1
                     n_thumb_dl += 1
+                    _t0 = time.monotonic()
                     thumb_bytes = client.download_bytes(
                         f"/api/assets/{asset.id}/thumbnail"
                         f"?size={THUMBNAIL_SIZE}"
                     )
-                    p.write_bytes(thumb_bytes)
-                to_predict_paths.append(str(p))
-                to_predict_assets.append(asset)
+                    t_dl += time.monotonic() - _t0
+                    to_predict_items.append((asset.id, thumb_bytes))
+                except Exception as e:
+                    _log.warning(
+                        "[search] %s: %s: %s — skipping asset",
+                        asset.id, type(e).__name__, e,
+                    )
+                    continue
             # Compact suffix shared by all three log branches below.
             # `n_added` falls out of the branch-local counter; the
-            # breakdown is computed once up front.
-            breakdown = (
-                f"cached={n_cached} predict={n_predict} "
-                f"(thumbs_dl={n_thumb_dl}) dedup={n_dedup}"
+            # breakdown is computed once up front. The trailing rate is
+            # cumulative photos-scored / elapsed for the whole stage —
+            # per-batch counts (n_items/this-batch-elapsed) swing
+            # wildly with cache hit rate, the cumulative number is the
+            # one that predicts finish time.
+            scored_total += n_predict + n_cached
+            search_elapsed = time.monotonic() - search_t0
+            search_rate = (
+                scored_total / search_elapsed if search_elapsed > 0 else 0.0
             )
 
             # Run BioCLIP kingdom-rank on the misses. Persist each row.
-            if to_predict_paths:
+            if to_predict_items:
                 if clf is None:
                     # Lazy: only construct the model when we actually
                     # have BioCLIP work to do. The caller passes None
                     # so the singleton resolves on first use.
                     clf = _resolve_classifier()
-                scores = _score_batch_for_kingdoms(clf, to_predict_paths)
-                for asset, p in zip(to_predict_assets, to_predict_paths):
-                    kingdom_scores = scores.get(p, {})
+                _t0 = time.monotonic()
+                scores, vec_by_id = _score_batch_for_kingdoms(
+                    clf, to_predict_items
+                )
+                t_enc += time.monotonic() - _t0
+                _t0 = time.monotonic()
+                for asset_id, _blob in to_predict_items:
+                    kingdom_scores = scores.get(asset_id, {})
                     plantae = kingdom_scores.get("Plantae", 0.0)
                     fungi = kingdom_scores.get("Fungi", 0.0)
                     # Persist whichever kingdoms came back above 0; the full
@@ -872,19 +1092,39 @@ def discover_plantae_assets(
                     if persist:
                         storage.upsert_taxon_scores(
                             conn,
-                            asset_id=asset.id,
+                            asset_id=asset_id,
                             rank="kingdom",
                             scores=persist,
                         )
-                    plantae_by_path[p] = kingdom_scores
+                    # Persist the image feature vector computed above so
+                    # the species stage classifies from it instead of
+                    # encoding this image a second time. The vector is
+                    # model-specific (dim checked on reuse), so no rank
+                    # dependency here.
+                    vec = vec_by_id.get(asset_id)
+                    if vec is not None:
+                        storage.upsert_embedding(
+                            conn, asset_id=asset_id, vector=vec
+                        )
+                    plantae_by_id[asset_id] = kingdom_scores
+                t_db += time.monotonic() - _t0
+
+            # Built AFTER the encode/persist phases so their timers are
+            # real — this string is consumed by the log branches below.
+            breakdown = (
+                f"cached={n_cached} predict={n_predict} "
+                f"(thumbs_dl={n_thumb_dl}) dedup={n_dedup} "
+                f"{search_rate:.1f}/s "
+                f"[meta {t_meta:.1f}s dl {t_dl:.1f}s "
+                f"enc {t_enc:.1f}s db {t_db:.1f}s]"
+            )
 
             # Build ordered list of (asset, max_kingdom_score) for the batch.
             # A photo counts as a candidate if EITHER kingdom exceeds the
             # threshold — so both plants AND mushrooms enter the run.
             scored: list[tuple[ImmichAsset, float]] = []
             for asset in batch:
-                p = str(thumb_dir / f"{asset.id}.jpg")
-                d = plantae_by_path.get(p, {})
+                d = plantae_by_id.get(asset.id, {})
                 max_score = max(d.get("Plantae", 0.0), d.get("Fungi", 0.0))
                 scored.append((asset, max_score))
 
@@ -977,6 +1217,21 @@ def discover_plantae_assets(
             # 625 batches = several seconds of "silent" work
             # otherwise).
             set_chunk_progress(len(accepted), n_samples)
+            # Speed readout for the UI panel. ETA extrapolates the
+            # ACCEPT rate so far over the remaining accept target —
+            # rough by design (acceptance ratio drifts page to page and
+            # Immich may run out of results first), but it beats the
+            # stale 0.0/s the panel showed before.
+            if search_elapsed > 0:
+                accept_rate = len(accepted) / search_elapsed
+                remaining = max(0, n_samples - len(accepted))
+                set_state(
+                    stage="search",
+                    rate=search_rate,
+                    eta_seconds=(
+                        remaining / accept_rate if accept_rate > 0 else 0.0
+                    ),
+                )
             # Commit THIS batch's asset rows + kingdom scores now.
             # storage.connect() only commits when its whole with-block
             # exits — i.e. when the entire multi-hour run finishes — so
@@ -1002,10 +1257,12 @@ def discover_plantae_assets(
 
 
 def run_knn_reclassify_bbox(
-    conn,
     *,
     detection_id: int,
     index_dir: Path,
+    db_path: str | Path,
+    base_url: str,
+    api_key: str,
     k: int = 10,
 ) -> dict:
     """KNN reclassify a single cropped bbox (per-crop 'Reclassify crop'
@@ -1043,7 +1300,7 @@ def run_knn_reclassify_bbox(
         )
 
     # Look up the detection + the asset's image URL.
-    with storage.connect(DB_PATH) as conn_ro:
+    with storage.connect(db_path) as conn_ro:
         det = storage.get_detection_with_asset_url(
             conn_ro, detection_id=detection_id,
         )
@@ -1051,7 +1308,7 @@ def run_knn_reclassify_bbox(
         raise ValueError(f"detection {detection_id} not found")
 
     # Skip if cached for this (version, k).
-    with storage.connect(DB_PATH) as conn_ck:
+    with storage.connect(db_path) as conn_ck:
         if storage.bbox_knn_predictions_have_detection(
             conn_ck,
             detection_id=detection_id,
@@ -1081,7 +1338,7 @@ def run_knn_reclassify_bbox(
     # Download the image. Prefer the asset's stored original_url
     # (whatever Immich returned at ingest time); fall back to the
     # /api/assets/{id}/original endpoint if the URL has since rotated.
-    client = ImmichClient(base_url=BASE_URL, api_key=API_KEY)
+    client = ImmichClient(base_url=base_url, api_key=api_key)
     url = det.get("original_url") or f"/api/assets/{det['asset_id']}/original"
     try:
         img_bytes = client.download_bytes(url)
@@ -1095,8 +1352,8 @@ def run_knn_reclassify_bbox(
         x = max(0.0, float(det["x"]))
         y = max(0.0, float(det["y"]))
         # detections stored as top-left xywh (floats 0..1 over image)
-        bw = max(1.0, float(det["w"]))
-        bh = max(1.0, float(det["h"]))
+        bw = float(det["w"])
+        bh = float(det["h"])
         x0 = int(round(x * w_img))
         y0 = int(round(y * h_img))
         x1 = int(round((x + bw) * w_img))
@@ -1119,6 +1376,10 @@ def run_knn_reclassify_bbox(
         feats = clf.create_image_features([crop], normalize=True)
     feats_np = feats.detach().cpu().numpy().astype("<f4")
     del feats
+    # This entry point runs inside uvicorn (asyncio.to_thread), not in
+    # the pipeline worker — free the ~6 GB classifier immediately so a
+    # later pipeline run doesn't coexist with a resident copy here.
+    _unload_classifier()
 
     # FAISS KNN.
     results = _knn.classify_via_knn(
@@ -1129,7 +1390,7 @@ def run_knn_reclassify_bbox(
     result = results[0]
 
     # Persist + return.
-    with storage.connect(DB_PATH) as conn_wr:
+    with storage.connect(db_path) as conn_wr:
         storage.replace_bbox_knn_predictions(
             conn_wr,
             detection_id=detection_id,
@@ -1264,6 +1525,27 @@ def run_knn_reclassify(
     }
 
 
+def _sweep_stale_scratch() -> None:
+    """Remove `immich_bioclip_*` scratch dirs left by runs that died by
+    SIGKILL/OOM — those bypass run_pipeline's finally rmtree. Called at
+    run start (worker and CLI share this path). Age-gated to >24h so a
+    concurrent live run's scratch is never touched: a live bbox stage
+    rewrites its dir every chunk, while a hard-killed dir's mtime freezes
+    at death. The end-of-run rmtree handles the clean-stop case."""
+    cutoff = time.time() - 24 * 3600
+    try:
+        root = Path(tempfile.gettempdir())
+        for d in root.glob("immich_bioclip_*"):
+            try:
+                if d.is_dir() and d.stat().st_mtime < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    _log.info("[cleanup] removed stale scratch dir %s", d)
+            except OSError:
+                continue
+    except OSError:
+        pass
+
+
 def run_pipeline(
     *,
     base_url: str,
@@ -1341,6 +1623,7 @@ def run_pipeline(
     _stage_begin("search", chunk_total=n_samples)
 
     client = ImmichClient(base_url=base_url, api_key=api_key)
+    tmp: Path | None = None
     try:
         with storage.connect(db_path) as conn:
             # Lazy classifier: only construct the TreeOfLifeClassifier
@@ -1349,7 +1632,7 @@ def run_pipeline(
             # BioCLIP model on CPU is ~5.5 GB resident — loading it for
             # an entirely-cached run wastes that until the process dies.
             # Both downstream stages gate on `if needs_bioclip:` /
-            # `if to_predict_paths:`, so the singleton is only created
+            # `if to_predict_items:`, so the singleton is only created
             # when inference is genuinely about to run.
             clf = None
 
@@ -1360,13 +1643,10 @@ def run_pipeline(
                 rank=rank_name,
                 top_k=top_k,
             )
-            # Persistent thumb cache: keyed by asset_id, lives next to
-            # the DB so cache-hit re-runs don't re-download thumbs.
-            # Crop files (per-detection) still go in `tmp` since they're
-            # only needed for the duration of one predict() call.
-            db_path = Path(db_path)
-            thumb_dir = db_path.parent / "thumbs"
-            thumb_dir.mkdir(parents=True, exist_ok=True)
+            # Previews are fetched from Immich and decoded in memory —
+            # raw photos are never written to disk. Crop scratch (for a
+            # single predict() call) still uses `tmp`.
+            _sweep_stale_scratch()
             tmp = Path(tempfile.mkdtemp(prefix="immich_bioclip_"))
 
             # Stream-search Immich and stop at the plantae boundary.
@@ -1386,15 +1666,14 @@ def run_pipeline(
                 n_samples=n_samples,
                 base_url=base_url,
                 api_key=api_key,
-                thumb_dir=thumb_dir,
                 decision_batch_size=decision_batch_size,
                 stop_criterion=_stop_criteria,
                 stop_event=stop_event,
             )
             _stage_end("search")
 
-            needs_bioclip: list[tuple[ImmichAsset, Path | None]] = []
-            needs_yolo: list[tuple[ImmichAsset, Path | None]] = []
+            needs_bioclip: list[ImmichAsset] = []
+            needs_yolo: list[ImmichAsset] = []
             ordered_ids: list[str] = []
 
             # Stitch loop — populate / refresh the `assets` rows and
@@ -1431,6 +1710,15 @@ def run_pipeline(
             )
             cached_pred_counts = storage.bulk_fetch_prediction_counts(
                 conn, asset_ids=asset_ids, rank=rank_name
+            )
+            # YOLO scan status is its OWN cache dimension — an asset can
+            # have complete species predictions but never have been
+            # detection-scanned (a run that stopped or crashed between
+            # the species and yolo stages — e.g. the ultralytics
+            # config-dir PermissionError). Gate the yolo worklist on
+            # yolo_scanned_at, not on the predictions cache.
+            yolo_scanned_ids = storage.bulk_yolo_scanned_assets(
+                conn, asset_ids=asset_ids
             )
             _log.info(
                 f"[stitch] bulk SELECTs done in "
@@ -1475,17 +1763,28 @@ def run_pipeline(
                     # URLs are fine but the row is missing EXIF.
                     # Fetch it once and write only the EXIF columns
                     # — don't clobber the URLs that already match.
-                    exif = ImmichClient.extract_exif(
-                        client.get_asset_metadata(asset.id)
-                    )
-                    n_stitched_exif_fetched += 1
-                    storage.update_asset_exif(
-                        conn,
-                        asset_id=asset.id,
-                        captured_at=exif["captured_at"],
-                        latitude=exif["latitude"],
-                        longitude=exif["longitude"],
-                    )
+                    # Metadata fetch errors are contained (skip the
+                    # EXIF backfill for this asset) — one 500 from
+                    # Immich must not abort the run this late.
+                    try:
+                        exif = ImmichClient.extract_exif(
+                            client.get_asset_metadata(asset.id)
+                        )
+                    except Exception as e:
+                        _log.warning(
+                            "[stitch] %s: %s: %s — skipping EXIF backfill",
+                            asset.id, type(e).__name__, e,
+                        )
+                        exif = None
+                    if exif is not None:
+                        n_stitched_exif_fetched += 1
+                        storage.update_asset_exif(
+                            conn,
+                            asset_id=asset.id,
+                            captured_at=exif["captured_at"],
+                            latitude=exif["latitude"],
+                            longitude=exif["longitude"],
+                        )
                 elif has_exif:
                     # Row exists with EXIF but URLs have drifted
                     # (Immich renamed the file, base_url changed,
@@ -1502,28 +1801,40 @@ def run_pipeline(
                 else:
                     # Either a brand-new asset or a row with no EXIF
                     # AND drifted URLs. Fetch EXIF and do a full
-                    # upsert.
-                    exif = ImmichClient.extract_exif(
-                        client.get_asset_metadata(asset.id)
-                    )
-                    n_stitched_exif_fetched += 1
-                    storage.upsert_asset(
-                        conn,
-                        asset_id=asset.id,
-                        original_file_name=asset.original_file_name,
-                        original_url=original_url,
-                        thumbnail_url=thumbnail_url,
-                        captured_at=exif["captured_at"],
-                        latitude=exif["latitude"],
-                        longitude=exif["longitude"],
-                    )
-                    n_stitched_full_upsert += 1
+                    # upsert (metadata errors contained as above).
+                    try:
+                        exif = ImmichClient.extract_exif(
+                            client.get_asset_metadata(asset.id)
+                        )
+                        n_stitched_exif_fetched += 1
+                        storage.upsert_asset(
+                            conn,
+                            asset_id=asset.id,
+                            original_file_name=asset.original_file_name,
+                            original_url=original_url,
+                            thumbnail_url=thumbnail_url,
+                            captured_at=exif["captured_at"],
+                            latitude=exif["latitude"],
+                            longitude=exif["longitude"],
+                        )
+                        n_stitched_full_upsert += 1
+                    except Exception as e:
+                        _log.warning(
+                            "[stitch] %s: %s: %s — skipping asset upsert",
+                            asset.id, type(e).__name__, e,
+                        )
 
                 ordered_ids.append(asset.id)
                 if cached_pred_counts.get(asset.id, 0) < top_k:
                     # Defer download until the chunk loop reads it.
-                    needs_bioclip.append((asset, None))
-                    needs_yolo.append((asset, None))
+                    needs_bioclip.append(asset)
+                if asset.id not in yolo_scanned_ids:
+                    # Detection scan is independent of the predictions
+                    # cache — see yolo_scanned_ids above. Thumb download
+                    # is deferred to the yolo chunk loop (the species
+                    # loop also populates the shared path when it runs
+                    # first, but cached-species assets never enter it).
+                    needs_yolo.append(asset)
 
             n_new = len(needs_bioclip)
             n_cached = len(assets) - n_new
@@ -1587,49 +1898,113 @@ def run_pipeline(
                     if species_total_chunks > 0:
                         set_chunk_progress(i // batch_size + 1, species_total_chunks)
                     j = min(i + batch_size, len(needs_bioclip))
-                    pil_images: list[Image.Image] = []
-                    file_paths: list[str] = []
+                    import torch as _torch
                     chunk_indices: list[int] = []  # indices we just processed
+                    chunk_asset_ids: list[str] = []
 
                     for k in range(i, j):
-                        asset, p = needs_bioclip[k]
-                        if p is None:
-                            p = thumb_dir / f"{asset.id}.jpg"
-                            if not p.exists():
-                                _log.info(
-                                    f"[species] downloading thumb {asset.id}"
-                                )
-                                thumb_bytes = client.download_bytes(
-                                    f"/api/assets/{asset.id}/thumbnail"
-                                    f"?size={THUMBNAIL_SIZE}"
-                                )
-                                p.write_bytes(thumb_bytes)
-                            with Image.open(p) as im:
-                                im.verify()
-                            needs_bioclip[k] = (asset, p)
-                            # Mirror the populated path into needs_yolo.
-                            for jj, (a2, p2) in enumerate(needs_yolo):
-                                if a2.id == asset.id and p2 is None:
-                                    needs_yolo[jj] = (a2, p)
-                                    break
-                        pil_images.append(Image.open(p).convert("RGB"))
-                        file_paths.append(str(p))
                         chunk_indices.append(k)
+                        chunk_asset_ids.append(needs_bioclip[k].id)
 
-                    feats = clf.create_image_features(pil_images, normalize=True)
+                    # Reuse embeddings already persisted by the search
+                    # stage (its kingdom scoring encodes every unseen
+                    # asset once and stores the vector). Only assets
+                    # still missing a vector of the CURRENT model's
+                    # dimension get encoded here — dim guard so a DB
+                    # built against a different BioCLIP major version
+                    # is re-encoded rather than fed to the wrong text
+                    # head.
+                    expected_dim = int(clf.get_txt_embeddings().shape[0])
+                    stored_vecs = {
+                        aid: vec
+                        for aid, vec in storage.bulk_fetch_embeddings(
+                            conn, asset_ids=chunk_asset_ids
+                        ).items()
+                        if vec.shape[0] == expected_dim
+                    }
+                    # Per-asset download/decode with containment: one bad
+                    # thumbnail (HTTP 500, truncated JPEG) must not abort
+                    # the whole run — the run would otherwise die at the
+                    # same asset on every retry, forever. Skip the asset
+                    # this chunk; no cache rows are written for it, so the
+                    # next run picks it up again.
+                    dead: set[str] = set()
+                    pil_by_aid: dict = {}
+                    for k in range(i, j):
+                        asset = needs_bioclip[k]
+                        if asset.id in stored_vecs:
+                            continue
+                        try:
+                            blob = client.download_bytes(
+                                f"/api/assets/{asset.id}/thumbnail"
+                                f"?size={THUMBNAIL_SIZE}"
+                            )
+                            pil_by_aid[asset.id] = _decode_preview(blob)
+                        except Exception as e:
+                            dead.add(asset.id)
+                            _log.warning(
+                                "[species] %s: %s: %s — skipping asset",
+                                asset.id, type(e).__name__, e,
+                            )
+                    if dead:
+                        chunk_indices = [
+                            k for k in chunk_indices
+                            if needs_bioclip[k].id not in dead
+                        ]
+                        chunk_asset_ids = [
+                            aid for aid in chunk_asset_ids if aid not in dead
+                        ]
+                    if not chunk_indices:
+                        i = j
+                        continue
+                    feats = _torch.empty(
+                        (len(chunk_indices), expected_dim),
+                        dtype=_torch.float32,
+                    )
+                    encode_positions: list[int] = []
+                    for pos, k in enumerate(chunk_indices):
+                        vec = stored_vecs.get(needs_bioclip[k].id)
+                        if vec is not None:
+                            feats[pos] = _torch.from_numpy(vec)
+                        else:
+                            encode_positions.append(pos)
+                    if encode_positions:
+                        pil_images = [
+                            pil_by_aid[needs_bioclip[k].id]
+                            for k in (chunk_indices[p] for p in encode_positions)
+                        ]
+                        try:
+                            enc_feats = clf.create_image_features(
+                                pil_images, normalize=True
+                            )
+                            feats[encode_positions] = enc_feats.detach().cpu()
+                        finally:
+                            # Free the PIL decodes — yolo.detect reopens.
+                            for im in pil_images:
+                                _close_image(im)
+                    feats = feats.to(getattr(clf, "device", "cpu"))
+
+                    # Classify from the features we already hold — same
+                    # softmax clf.predict() computes, but WITHOUT a
+                    # second ViT encode (predict() re-opens the JPEGs
+                    # and re-runs encode_image internally — that was
+                    # ~half the species stage's wall time on CPU).
+                    raw = _classify_features(
+                        clf, feats, chunk_asset_ids,
+                        rank_enum=rank_enum, k=top_k,
+                    )
+                    preds_by_id = _group_predictions(raw, top_k)
                     feats_np = feats.detach().cpu().numpy().astype("<f4")
-                    del feats
-                    raw = clf.predict(images=file_paths, rank=rank_enum, k=top_k)
-                    preds_by_file = _group_predictions(raw, top_k)
 
-                    for k, vec in zip(chunk_indices, feats_np):
-                        asset, p = needs_bioclip[k]   # re-read; `p` is populated
-                        storage.upsert_embedding(
-                            conn, asset_id=asset.id, vector=vec
-                        )
-                        rows = preds_by_file.get(str(p), [])
+                    for pos, k in enumerate(chunk_indices):
+                        asset = needs_bioclip[k]
+                        if asset.id not in stored_vecs:
+                            storage.upsert_embedding(
+                                conn, asset_id=asset.id, vector=feats_np[pos]
+                            )
+                        rows = preds_by_id.get(asset.id, [])
                         if not rows:
-                            rows = _rows_for_image(preds_by_file, str(p))
+                            rows = _rows_for_image(preds_by_id, asset.id)
                         storage.replace_predictions(
                             conn,
                             asset_id=asset.id,
@@ -1637,10 +2012,7 @@ def run_pipeline(
                             rows=rows,
                         )
 
-                    # Free the PIL decodes — yolo.detect will reopen them.
-                    for im in pil_images:
-                        _close_image(im)
-                    del pil_images, feats_np, raw, preds_by_file
+                    del feats, feats_np, raw, preds_by_id
                     gc.collect()
 
                     # Commit this chunk's embeddings + predictions (the
@@ -1657,6 +2029,7 @@ def run_pipeline(
                         species_total_chunks,
                         n_items=len(chunk_indices),
                         elapsed=time.monotonic() - species_t0,
+                        items_done=j,
                     )
                     i = j
 
@@ -1672,12 +2045,13 @@ def run_pipeline(
             # fast path (approximate_predict on newly-embedded vectors);
             # only when the corpus has grown by GROWTH_THRESHOLD_PCT since
             # the last fit do we pay the full refit + Hungarian remap.
-            # cluster_names / _results_cache / near-dup caches are
-            # invalidated by `_run_and_store` after this function returns,
-            # so we don't bother here.
+            # The run runs in a separate worker process; the parent's
+            # caches are invalidated by app.py's reaper when it notices
+            # the child exit. cluster_names are dropped by
+            # pipeline_worker.py on success.
             _stage_begin("cluster")
             cluster_t0 = time.monotonic()
-            newly_embedded_ids: list[str] = [a.id for a, _p in needs_bioclip]
+            newly_embedded_ids: list[str] = [a.id for a in needs_bioclip]
             asset_to_cluster: dict[str, int] = {}
             n_clusters = 0
             refit_done = False
@@ -1764,27 +2138,42 @@ def run_pipeline(
             # when the species-rank top-K happens to be all one kingdom.
             # Iterates over EVERY asset in the run (not just the ones
             # missing species-rank predictions), with per-asset cache
-            # skipping via taxon_scores_have_asset. Thumb downloads are
-            # served from the persistent thumb_dir so cache-hit re-runs
-            # don't re-fetch.
+            # skipping via taxon_scores_have_asset. Assets needing a
+            # fresh encode fetch their preview at encode time — in
+            # memory only.
             KINGDOM_TOP_K = 5
+            import torch as _torch
             kingdom_assets: list[ImmichAsset] = []
-            kingdom_paths: list[Path] = []
-            for asset in assets:
-                if storage.taxon_scores_have_asset(
+            # Assets still missing kingdom scores. Their image features
+            # are almost always already in the embeddings table (the
+            # search stage persists one vector per asset it scores), so
+            # kingdom classification normally needs ZERO image encodes
+            # and ZERO thumbnail downloads — just the text-head matmul
+            # over stored vectors. Only legacy assets (no embedding row,
+            # or a vector from a different model version) fall back to
+            # a fresh encode below.
+            kingdom_missing = [
+                asset
+                for asset in assets
+                if not storage.taxon_scores_have_asset(
                     conn, asset_id=asset.id, rank="kingdom"
-                ):
-                    continue
-                p = thumb_dir / f"{asset.id}.jpg"
-                if not p.exists():
-                    _log.info(f"[kingdom] downloading thumb {asset.id}")
-                    thumb_bytes = client.download_bytes(
-                        f"/api/assets/{asset.id}/thumbnail"
-                        f"?size={THUMBNAIL_SIZE}"
-                    )
-                    p.write_bytes(thumb_bytes)
-                kingdom_assets.append(asset)
-                kingdom_paths.append(p)
+                )
+            ]
+            kingdom_assets = list(kingdom_missing)
+            kingdom_stored: dict[str, np.ndarray] = {}
+            if kingdom_missing:
+                if clf is None:
+                    clf = classifier if classifier is not None else _resolve_classifier()
+                expected_dim = int(clf.get_txt_embeddings().shape[0])
+                kingdom_stored = {
+                    aid: vec
+                    for aid, vec in storage.bulk_fetch_embeddings(
+                        conn, asset_ids=[a.id for a in kingdom_missing]
+                    ).items()
+                    if vec.shape[0] == expected_dim
+                }
+                # Assets WITHOUT a stored vector download their preview
+                # at encode time below — in memory only.
 
             kingdom_total_chunks = (
                 (len(kingdom_assets) + batch_size - 1) // batch_size
@@ -1807,51 +2196,87 @@ def run_pipeline(
                 j = min(i + batch_size, len(kingdom_assets))
                 if kingdom_total_chunks > 0:
                     set_chunk_progress(i // batch_size + 1, kingdom_total_chunks)
-                pil_images: list[Image.Image] = []
-                file_paths: list[str] = []
-                chunk_indices: list[int] = []
-                for k in range(i, j):
-                    p = kingdom_paths[k]
-                    pil_images.append(Image.open(p).convert("RGB"))
-                    file_paths.append(str(p))
-                    chunk_indices.append(k)
-                if not pil_images:
-                    i = j
-                    continue
-                raw_kingdom = clf.predict(
-                    images=file_paths, rank=kingdom_rank, k=KINGDOM_TOP_K
+                chunk_assets = kingdom_assets[i:j]
+                # Assemble one feature matrix for the chunk: stored
+                # vectors for assets already embedded (the common case),
+                # fresh encodes only for the rest. This replaces a
+                # clf.predict() call that re-encoded EVERY image.
+                feats_rows: list = [None] * len(chunk_assets)
+                encode_positions: list[int] = []
+                for pos, asset in enumerate(chunk_assets):
+                    vec = kingdom_stored.get(asset.id)
+                    if vec is not None:
+                        feats_rows[pos] = _torch.from_numpy(vec)
+                    else:
+                        encode_positions.append(pos)
+                if encode_positions:
+                    pil_by_pos: dict = {}
+                    for pos in list(encode_positions):
+                        try:
+                            blob = client.download_bytes(
+                                f"/api/assets/{chunk_assets[pos].id}/thumbnail"
+                                f"?size={THUMBNAIL_SIZE}"
+                            )
+                            pil_by_pos[pos] = _decode_preview(blob)
+                        except Exception as e:
+                            # Skip the asset, keep the run alive; nothing
+                            # was cached for it so the next run retries.
+                            _log.warning(
+                                "[kingdom] %s: %s: %s — skipping asset",
+                                chunk_assets[pos].id, type(e).__name__, e,
+                            )
+                            encode_positions.remove(pos)
+                    pil_images = [pil_by_pos[p] for p in encode_positions]
+                if encode_positions:
+                    try:
+                        enc_feats = clf.create_image_features(
+                            pil_images, normalize=True
+                        )
+                        enc_np = enc_feats.detach().cpu().numpy().astype("<f4")
+                        for e, pos in enumerate(encode_positions):
+                            feats_rows[pos] = enc_feats[e].detach().cpu()
+                            # Persist the fresh vector so this fallback
+                            # encode is never paid twice.
+                            storage.upsert_embedding(
+                                conn,
+                                asset_id=chunk_assets[pos].id,
+                                vector=enc_np[e],
+                            )
+                    finally:
+                        for im in pil_images:
+                            _close_image(im)
+                feats = _torch.stack(feats_rows).to(
+                    getattr(clf, "device", "cpu")
                 )
-                kingdom_by_file: dict[str, dict[str, float]] = {}
+                raw_kingdom = _classify_features(
+                    clf, feats, [a.id for a in chunk_assets],
+                    rank_enum=kingdom_rank, k=KINGDOM_TOP_K,
+                )
+                kingdom_by_id: dict[str, dict[str, float]] = {}
                 for row in raw_kingdom:
                     f = row["file_name"]
-                    d = kingdom_by_file.setdefault(f, {})
+                    d = kingdom_by_id.setdefault(f, {})
                     prev = d.get(row["kingdom"])
                     if prev is None or row["score"] > prev:
                         d[row["kingdom"]] = float(row["score"])
-                for k, fp in zip(chunk_indices, file_paths):
-                    asset = kingdom_assets[k]
-                    scores = kingdom_by_file.get(fp) or {}
-                    if not scores:
-                        for k2, v in kingdom_by_file.items():
-                            if Path(k2).name == Path(fp).name:
-                                scores = v
-                                break
+                for pos, aid in enumerate(a.id for a in chunk_assets):
+                    asset = chunk_assets[pos]
+                    scores = kingdom_by_id.get(aid) or {}
                     storage.upsert_taxon_scores(
                         conn,
                         asset_id=asset.id,
                         rank="kingdom",
                         scores=scores,
                     )
-                for im in pil_images:
-                    _close_image(im)
-                del pil_images, raw_kingdom, kingdom_by_file
+                del feats, raw_kingdom, kingdom_by_id
                 gc.collect()
                 _chunk_log(
                     "kingdom",
                     (i // batch_size) + 1,
                     kingdom_total_chunks,
-                    n_items=len(chunk_indices),
+                    n_items=len(chunk_assets),
                     elapsed=time.monotonic() - kingdom_t0,
+                    items_done=j,
                 )
                 conn.commit()  # per-chunk checkpoint (see search-loop note)
                 i = j
@@ -1861,7 +2286,15 @@ def run_pipeline(
                     f"{_fmt_eta(time.monotonic() - kingdom_t0)}"
                 )
             _stage_end("kingdom")
-            del kingdom_assets, kingdom_paths
+            del kingdom_assets
+
+            # BioCLIP's stages are done (bbox-bioclip reloads it later).
+            # Free ~5-6 GB before YOLO loads so the two models never
+            # coexist — see _unload_classifier.
+            if clf is not None:
+                _log.info("[model] unloading BioCLIP (done until bbox)")
+                _unload_classifier()
+                clf = None
 
             # ---- YOLO-World: detect on uncached assets (chunked) ----
             # Detection rows are persisted as we go; the bbox BioCLIP
@@ -1870,6 +2303,19 @@ def run_pipeline(
             # off from here.
             yolo_total_chunks = (len(needs_yolo) + batch_size - 1) // batch_size
             yolo_t0 = time.monotonic()
+            # Hand freed allocator arenas back to the OS before YOLO
+            # loads its weights + CLIP text encoder (~1-2 GB on top of
+            # BioCLIP's footprint). glibc keeps freed torch tensors in
+            # its arenas, and on this memory-tight host the process was
+            # OOM-killed twice exactly here — a hard SIGKILL that skips
+            # every finally (run cleanup included).
+            gc.collect()
+            try:
+                import ctypes
+
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass
             _stage_begin("yolo", chunk_total=yolo_total_chunks)
             if needs_yolo:
                 _log.info(
@@ -1884,15 +2330,9 @@ def run_pipeline(
                             set_chunk_progress(i // batch_size + 1, yolo_total_chunks)
                         check_stop(stop_event)
                         j = min(i + batch_size, len(needs_yolo))
-                        todo: list[tuple[int, ImmichAsset, Path]] = []
+                        todo: list[tuple[int, ImmichAsset]] = []
                         for k in range(i, j):
-                            asset, p = needs_yolo[k]
-                            if p is None:
-                                # BioCLIP loop didn't reach this asset (e.g.
-                                # already-cached prediction). Skip YOLO too.
-                                continue
-                            if not storage.detections_have_asset(conn, asset.id):
-                                todo.append((k, asset, p))
+                            todo.append((k, needs_yolo[k]))
                         if not todo:
                             i = j
                             continue
@@ -1903,11 +2343,36 @@ def run_pipeline(
                             _yolo.get_model()
                             yolo_model_loaded = True
 
-                        pil_images = [Image.open(p).convert("RGB") for _, _, p in todo]
-                        detections = _yolo.detect(pil_images, conf=yolo_conf)
+                        # Detection is independent of the BioCLIP stages
+                        # (this is what lets a run that died between
+                        # species and yolo resume without re-running
+                        # BioCLIP) — previews are fetched per chunk and
+                        # decoded in memory. Per-asset errors skip just
+                        # that asset (mark_yolo_scanned isn't reached,
+                        # so the next run retries it).
+                        pil_images = []
+                        todo_ok = []
+                        for _k, asset in todo:
+                            try:
+                                blob = client.download_bytes(
+                                    f"/api/assets/{asset.id}/thumbnail"
+                                    f"?size={THUMBNAIL_SIZE}"
+                                )
+                                pil_images.append(_decode_preview(blob))
+                                todo_ok.append((_k, asset))
+                            except Exception as e:
+                                _log.warning(
+                                    "[yolo] %s: %s: %s — skipping asset",
+                                    asset.id, type(e).__name__, e,
+                                )
+                        todo = todo_ok
+                        detections = (
+                            _yolo.detect(pil_images, conf=yolo_conf)
+                            if pil_images else []
+                        )
                         n_dets = 0
                         n_merged = 0
-                        for (_k, asset, p), dets in zip(todo, detections):
+                        for (_k, asset), dets in zip(todo, detections):
                             # Class-agnostic IoU merge: when YOLO returns
                             # multiple boxes for the same region under
                             # different classes (e.g. "plant" + "leaf"),
@@ -1916,22 +2381,62 @@ def run_pipeline(
                             before = len(dets)
                             dets = _merge_overlapping_boxes(dets)
                             n_merged += before - len(dets)
-                            # Strip person/face/human boxes — those are
-                            # the person stage's responsibility (it
-                            # uses append_detections). Letting them
-                            # through here would (a) duplicate every
-                            # person box when an asset flows through
-                            # both stages in the same run and (b) route
-                            # person crops through BioCLIP-reclassify
-                            # (wrong — BioCLIP is plant-focused).
+                            # ONE forward pass feeds everything: this
+                            # model's label table already includes
+                            # person/face/human/hand, so the boxes the
+                            # person stage used to re-scan the same
+                            # images for are right here. Persist all
+                            # three tiers from this pass:
+                            #   plant  — every box; bbox-bioclip
+                            #            re-verifies at BBOX_BIOCLIP_MIN
+                            #   person — only >= PERSON_MIN_CONF, because
+                            #            has_person is a UI-facing boolean
+                            #            with no second-stage check
+                            #   hand   — >= HAND_MIN_CONF; feeds the
+                            #            has_real_person() suppression
+                            #            rule below
+                            # Below-threshold person/hand boxes are
+                            # dropped entirely (not lumped into plants).
                             plant_dets = [
                                 d for d in dets
                                 if d["label"] not in PERSON_LABELS
+                                and d["label"] != HAND_LABEL
                             ]
+                            person_dets = [
+                                d for d in dets
+                                if d["label"] in PERSON_LABELS
+                                and d["score"] >= PERSON_MIN_CONF
+                            ]
+                            hand_dets = [
+                                d for d in dets
+                                if d["label"] == HAND_LABEL
+                                and d["score"] >= HAND_MIN_CONF
+                            ]
+                            # Unscoped replace: this pass produced fresh
+                            # boxes for EVERY label, so any earlier rows
+                            # (e.g. person rows from a standalone
+                            # backfill) are stale by definition. Their
+                            # bbox_predictions children cascade-delete
+                            # with them — also correct, since those
+                            # detection_ids no longer exist.
                             new_ids = storage.replace_detections(
-                                conn, asset_id=asset.id, detections=plant_dets
+                                conn, asset_id=asset.id,
+                                detections=plant_dets + person_dets + hand_dets,
                             )
                             n_dets += len(new_ids)
+                            # Scan markers — set even when the asset had
+                            # zero boxes, so a clean scan is
+                            # distinguishable from "never scanned" and
+                            # the asset never re-enters this worklist.
+                            # has_person derives from the same boxes
+                            # (hand-suppression rule inside
+                            # has_real_person), which is what lets the
+                            # person stage below skip every asset this
+                            # stage has seen.
+                            storage.mark_yolo_scanned(
+                                conn, asset_id=asset.id,
+                                has_person=has_real_person(dets),
+                            )
                         for im in pil_images:
                             _close_image(im)
                         _chunk_log(
@@ -1940,6 +2445,7 @@ def run_pipeline(
                             yolo_total_chunks,
                             n_items=len(todo),
                             elapsed=time.monotonic() - yolo_t0,
+                            items_done=j,
                             note=f"{n_dets} new detections ({n_merged} merged)",
                         )
                         conn.commit()  # per-chunk checkpoint (see search-loop note)
@@ -1958,16 +2464,20 @@ def run_pipeline(
                 )
             _stage_end("yolo")
 
-            # ---- Person detection: scan all assets (one-time backfill) ----
-            # Unlike the yolo stage above (which only iterates plantae
-            # candidates from `discover_plantae_assets`), this stage
-            # scans EVERY asset in the DB where `has_person IS NULL`.
-            # On the first run after this change that's ~19,300 assets.
-            # Subsequent runs only touch newly-ingested assets. Uses
-            # `append_detections` (NOT `replace_detections`) so existing
-            # plant detections and their `bbox_predictions` FK CASCADE
-            # children stay cached — only person/face/human boxes are
-            # added. Gate: `WHERE has_person IS NULL`.
+            # ---- Person detection: residual sweep ----
+            # The yolo stage above already derives has_person for every
+            # asset it scans — same model, same forward pass, its label
+            # table includes person/face/human/hand. Unlike that stage
+            # (which only iterates plantae candidates from
+            # `discover_plantae_assets`), this sweep covers EVERY asset
+            # in the DB where `has_person IS NULL`: candidates left over
+            # from earlier runs with different queries, or rows written
+            # before the yolo stage started stamping has_person. That
+            # gate makes this a no-op once the library is fully covered.
+            # Uses `append_detections` (NOT `replace_detections`) so
+            # existing plant detections and their `bbox_predictions` FK
+            # CASCADE children stay cached — only person/face/human/hand
+            # boxes are added.
             _stage_begin("person")
             try:
                 n_total = 0
@@ -1993,39 +2503,51 @@ def run_pipeline(
                     page_num += 1
                     # Inner batch loop — chunked for the YOLO forward
                     # pass (matches batch_size used elsewhere).
-                    todo_paths: list[tuple[str, Path, str]] = []
+                    todo_items: list[tuple[str, str]] = []
                     for asset_id, _fn, _ts in todo:
-                        p = thumb_dir / f"{asset_id}.jpg"
-                        if not p.exists():
-                            thumb_bytes = client.download_bytes(
-                                f"/api/assets/{asset_id}/thumbnail"
-                                f"?size={THUMBNAIL_SIZE}"
-                            )
-                            p.write_bytes(thumb_bytes)
-                        todo_paths.append((asset_id, p, _ts))
+                        todo_items.append((asset_id, _ts))
                     # Process in chunks of `batch_size`. YOLO-World's
-                    # first forward pass here rebakes the 17-label
+                    # first forward pass here rebakes the open-vocab
                     # embedding table under the singleton's _LOCK; the
                     # previous yolo stage's finally already unloaded so
                     # we get the fresh 17-class init.
                     person_t0 = time.monotonic()
-                    for i in range(0, len(todo_paths), batch_size):
+                    for i in range(0, len(todo_items), batch_size):
                         check_stop(stop_event)
-                        chunk = todo_paths[i : i + batch_size]
-                        pil_images = [Image.open(p).convert("RGB") for _, p, _ in chunk]
+                        chunk = todo_items[i : i + batch_size]
+                        pil_images = []
+                        chunk_ok = []
+                        for aid, _ts in chunk:
+                            try:
+                                pil_images.append(_decode_preview(
+                                    client.download_bytes(
+                                        f"/api/assets/{aid}/thumbnail"
+                                        f"?size={THUMBNAIL_SIZE}"
+                                    )
+                                ))
+                                chunk_ok.append((aid, _ts))
+                            except Exception as e:
+                                # Skipped assets stay unscanned
+                                # (has_person stays NULL) so the next
+                                # run retries them.
+                                _log.warning(
+                                    "[person] %s: %s: %s — skipping asset",
+                                    aid, type(e).__name__, e,
+                                )
+                        chunk = chunk_ok
+                        if not chunk:
+                            continue
                         detections = _yolo.detect(pil_images, conf=yolo_conf)
-                        for (asset_id, _, _ts), dets in zip(chunk, detections):
+                        for (asset_id, _ts), dets in zip(chunk, detections):
                             # Class-agnostic IoU merge — same as yolo
                             # stage. A photo with overlapping person +
                             # face boxes collapses to one detection.
                             dets = _merge_overlapping_boxes(dets)
                             # Keep ONLY person/face/human/hand boxes —
-                            # the yolo stage already persisted the plant
-                            # boxes for any plantae candidate that
-                            # flowed through it. If we appended plant
-                            # boxes here too, plantae candidates would
-                            # end up with duplicate plant rows in the
-                            # detections table. Hand is kept because
+                            # plant boxes for these assets, if any, were
+                            # persisted by an earlier run's yolo stage,
+                            # and appending plant boxes again would
+                            # duplicate those rows. Hand is kept because
                             # has_real_person() cross-checks it to
                             # suppress hand-silhouette false positives.
                             person_dets = [
@@ -2058,17 +2580,17 @@ def run_pipeline(
                             _close_image(im)
                         del pil_images
                         gc.collect()
-                    n_total += len(todo_paths)
+                    n_total += len(todo_items)
                     elapsed = time.monotonic() - person_t0
                     _log.info(
                         f"[person] page {page_num} "
-                        f"items={len(todo_paths)}  scanned_so_far={n_total}  "
+                        f"items={len(todo_items)}  scanned_so_far={n_total}  "
                         f"elapsed={_fmt_eta(elapsed)}"
                     )
                     # Advance cursor to the last row of this page so a
                     # SIGKILL/OOM between pages resumes where we left off.
-                    cursor_ts = todo_paths[-1][2]
-                    cursor_id = todo_paths[-1][0]
+                    cursor_ts = todo_items[-1][1]
+                    cursor_id = todo_items[-1][0]
                     # Periodic commit so a 70-min backfill flushes
                     # progress to disk and survives a SIGKILL/OOM
                     # between pages. The pipeline's outer commit at
@@ -2088,10 +2610,10 @@ def run_pipeline(
             # Iterates over EVERY detection across the run (not just the
             # ones collected during the YOLO pass), filtering by score
             # >= BBOX_BIOCLIP_MIN and skipping cached bbox_predictions.
-            # Thumbs come from the persistent thumb_dir. Decoupled from
-            # the species-rank cache so cached assets also get bbox
-            # classification on the next run.
-            all_bbox_targets: list[tuple[Path, int, dict]] = []
+            # Previews are fetched per chunk at crop time — in memory
+            # only. Decoupled from the species-rank cache so cached
+            # assets also get bbox classification on the next run.
+            all_bbox_targets: list[tuple[str, int, dict]] = []
             for asset in assets:
                 dets = storage.fetch_detections(
                     conn, asset_id=asset.id, rank=rank_name
@@ -2099,11 +2621,13 @@ def run_pipeline(
                 for d in dets:
                     if d["score"] < BBOX_BIOCLIP_MIN:
                         continue
-                    # Skip person/face/human boxes — BioCLIP is
-                    # plant-focused, so re-classifying a person crop
-                    # would produce a meaningless Plantae score. Plant
-                    # crops go through BioCLIP as before.
-                    if d["label"] in PERSON_LABELS:
+                    # Skip person/face/human/hand boxes — BioCLIP is
+                    # plant-focused, so re-classifying one of those
+                    # crops would produce a meaningless Plantae score.
+                    # (Hand boxes are persisted for has_person's
+                    # suppression cross-check, not for classification.)
+                    # Plant crops go through BioCLIP as before.
+                    if d["label"] in PERSON_LABELS or d["label"] == HAND_LABEL:
                         continue
                     if storage.bbox_predictions_have_detection(
                         conn,
@@ -2112,15 +2636,7 @@ def run_pipeline(
                         need=BBOX_BIOCLIP_TOP_K,
                     ):
                         continue
-                    p = thumb_dir / f"{asset.id}.jpg"
-                    if not p.exists():
-                        _log.info(f"[bbox-bioclip] downloading thumb {asset.id}")
-                        thumb_bytes = client.download_bytes(
-                            f"/api/assets/{asset.id}/thumbnail"
-                            f"?size={THUMBNAIL_SIZE}"
-                        )
-                        p.write_bytes(thumb_bytes)
-                    all_bbox_targets.append((p, d["id"], d))
+                    all_bbox_targets.append((asset.id, d["id"], d))
 
             bbox_total_chunks = (
                 (len(all_bbox_targets) + batch_size - 1) // batch_size
@@ -2152,11 +2668,25 @@ def run_pipeline(
                     crops: list[Image.Image] = []
                     crop_paths: list[str] = []
                     crop_meta: list[tuple[int, Path]] = []  # (det_id, src_path)
-                    by_src: dict[Path, Image.Image] = {}
+                    by_src: dict[str, Image.Image] = {}
                     try:
                         for src, det_id, d in chunk:
                             if src not in by_src:
-                                by_src[src] = Image.open(src).convert("RGB")
+                                try:
+                                    blob = client.download_bytes(
+                                        f"/api/assets/{src}/thumbnail"
+                                        f"?size={THUMBNAIL_SIZE}"
+                                    )
+                                    by_src[src] = _decode_preview(blob)
+                                except Exception as e:
+                                    # Skip this source image's crops; the
+                                    # detections stay uncached so the
+                                    # next run retries them.
+                                    _log.warning(
+                                        "[bbox-bioclip] %s: %s: %s — skipping source",
+                                        src, type(e).__name__, e,
+                                    )
+                                    continue
                             full = by_src[src]
                             W, H = full.size
                             x0 = max(0, int(d["x"] * W))
@@ -2200,12 +2730,21 @@ def run_pipeline(
                     n_crops = len(crops)
                     for im in crops:
                         _close_image(im)
+                    # The JPEGs are only needed as clf.predict() inputs.
+                    # Unlink per-chunk so the scratch dir holds one batch
+                    # at a time instead of every crop for the whole run.
+                    for cp in crop_paths:
+                        try:
+                            os.unlink(cp)
+                        except OSError:
+                            pass
                     _chunk_log(
                         "bbox-bioclip",
                         (i // batch_size) + 1,
                         bbox_total_chunks,
                         n_items=n_crops,
                         elapsed=time.monotonic() - bbox_t0,
+                        items_done=j,
                     )
                     conn.commit()  # per-chunk checkpoint (see search-loop note)
                     del crops, raw, preds_by_file
@@ -2296,6 +2835,17 @@ def run_pipeline(
             )
     finally:
         client.close()
+        # mkdtemp (unlike TemporaryDirectory) never cleans itself up —
+        # without this every run leaks a scratch dir of crop jpgs in /tmp.
+        # Log (don't swallow) partial-cleanup failures; the boot-time
+        # _sweep_stale_scratch() reaps what survives.
+        if tmp is not None:
+            shutil.rmtree(
+                tmp,
+                onerror=lambda _f, p, _e: _log.warning(
+                    "[cleanup] could not remove scratch entry %s", p
+                ),
+            )
 
 
 def run_person_backfill(
@@ -2320,7 +2870,7 @@ def run_person_backfill(
     pipeline. Uses cursor pagination (`after_first_seen_at` +
     `after_asset_id`) so re-runs after a crash or stop always resume
     cleanly — no rows skipped due to offset drift. Runs YOLO with the
-    17-label model, persists person-only boxes via `append_detections`,
+    open-vocab label set, persists person-only boxes via `append_detections`,
     sets `has_person` accordingly.
 
     Args:
@@ -2350,8 +2900,6 @@ def run_person_backfill(
     _yolo = _self.yolo
 
     db_path = Path(db_path)
-    thumb_dir = db_path.parent / "thumbs"
-    thumb_dir.mkdir(parents=True, exist_ok=True)
 
     client = ImmichClient(base_url=base_url, api_key=api_key)
     n_total_scanned = 0
@@ -2407,25 +2955,35 @@ def run_person_backfill(
                 )
                 if not todo:
                     break
-                # Resolve thumbs (download if missing).
-                todo_paths: list[tuple[str, Path, str]] = []
+                todo_items: list[tuple[str, str]] = []
                 for asset_id, _fn, _ts in todo:
-                    p = thumb_dir / f"{asset_id}.jpg"
-                    if not p.exists():
-                        thumb_bytes = client.download_bytes(
-                            f"/api/assets/{asset_id}/thumbnail"
-                            f"?size={THUMBNAIL_SIZE}"
-                        )
-                        p.write_bytes(thumb_bytes)
-                    todo_paths.append((asset_id, p, _ts))
+                    todo_items.append((asset_id, _ts))
                 # Chunked YOLO forward pass.
-                for i in range(0, len(todo_paths), batch_size):
+                for i in range(0, len(todo_items), batch_size):
                     if _stop_requested():
                         break
-                    chunk = todo_paths[i : i + batch_size]
-                    pil_images = [Image.open(p).convert("RGB") for _, p, _ in chunk]
+                    chunk = todo_items[i : i + batch_size]
+                    pil_images = []
+                    chunk_ok = []
+                    for aid, _ts in chunk:
+                        try:
+                            pil_images.append(_decode_preview(
+                                client.download_bytes(
+                                    f"/api/assets/{aid}/thumbnail"
+                                    f"?size={THUMBNAIL_SIZE}"
+                                )
+                            ))
+                            chunk_ok.append((aid, _ts))
+                        except Exception as e:
+                            _log.warning(
+                                "[person-backfill] %s: %s: %s — skipping asset",
+                                aid, type(e).__name__, e,
+                            )
+                    chunk = chunk_ok
+                    if not chunk:
+                        continue
                     detections = _yolo.detect(pil_images, conf=yolo_conf)
-                    for (asset_id, _, _ts), dets in zip(chunk, detections):
+                    for (asset_id, _ts), dets in zip(chunk, detections):
                         dets = _merge_overlapping_boxes(dets)
                         person_dets = [
                             d for d in dets
@@ -2468,8 +3026,8 @@ def run_person_backfill(
                 # waiting for the full run to finish.
                 conn.commit()
                 # Advance cursor to the last row of this page.
-                cursor_ts = todo_paths[-1][2]
-                cursor_id = todo_paths[-1][0]
+                cursor_ts = todo_items[-1][1]
+                cursor_id = todo_items[-1][0]
                 _write_status("running")
     finally:
         try:
@@ -2487,29 +3045,11 @@ def run_person_backfill(
     }
 
 
-def _run_pipeline_safe(**kwargs) -> RunResult | None:
-    """Wrapper that converts pipeline exceptions into error_state() so the
-    UI can surface them instead of just hanging the request."""
-    try:
-        return run_pipeline(**kwargs)
-    except _PipelineStop:
-        # User clicked Stop. The check_stop() raise was already at a
-        # batch boundary, so the previous chunk's writes are committed.
-        # We just need to mark the state, log it, and return so the
-        # wrapping request releases the pipeline lock.
-        _log.warning("pipeline stopped by user")
-        stopped_state("stopped by user")
-        return None
-    except Exception as e:  # noqa: BLE001 — surface anything to the UI
-        _log.exception("pipeline failed")
-        error_state(f"{type(e).__name__}: {e}")
-        return None
-
-
 class _PipelineAbort(Exception):
     """Internal exception used to unwind the pipeline cleanly after we
     have already populated error_state() with a user-facing message.
-    Caught by _run_pipeline_safe so the request returns normally."""
+    Callers (run.py CLI, pipeline_worker) catch it so the request or
+    worker exits normally instead of surfacing a raw traceback."""
 
 
 def _format_search_error(e: Exception) -> str:

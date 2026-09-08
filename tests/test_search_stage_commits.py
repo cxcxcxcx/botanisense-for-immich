@@ -74,6 +74,40 @@ class _FakeClient:
 
 
 class _FakeClassifier:
+    """Search-stage fake: encode-once path (create_image_features +
+    create_probabilities + format_grouped_probs). Kingdom rows come back
+    Plantae=0.9 so every batch clears the plantae boundary threshold."""
+
+    device = "cpu"
+
+    def get_txt_embeddings(self):
+        import torch
+        return torch.zeros(8, 5)
+
+    def get_current_txt_names(self):
+        # name_ary[0][0] = kingdom for _kingdom_bins; 4 of 5 rows
+        # Plantae so uniform softmax sums to 0.8 > PLANT_MIN_PROB.
+        names = []
+        for i in range(5):
+            kingdom = "Plantae" if i < 4 else "Fungi"
+            names.append([[kingdom, "ph", "cl", "or", "fam", "gen", "sp"], "common"])
+        return names
+
+    def create_image_features(self, pil_images, *, normalize=True):
+        import torch
+        return torch.zeros(len(pil_images), 8)
+
+    def create_probabilities(self, feats, txt_embeddings):
+        import torch
+        return torch.softmax(
+            torch.zeros(feats.shape[0], txt_embeddings.shape[1]) + 0.2, dim=1
+        )
+
+    def format_grouped_probs(self, image_key, probs, rank, min_prob=1e-9, k=5):
+        return [
+            {"file_name": str(image_key), "kingdom": "Plantae", "score": 0.9},
+        ]
+
     def predict(self, images, rank, k):
         return [
             {"file_name": str(p), "kingdom": "Plantae", "score": 0.9}
@@ -97,8 +131,6 @@ def test_search_batches_are_visible_to_other_readers(tmp_path):
 
     # Open the connection via the context manager exactly like
     # run_pipeline does (one connection spanning the whole search).
-    thumb_dir = tmp_path / "thumbs"
-    thumb_dir.mkdir(parents=True)  # run_pipeline creates it before calling
     with storage.connect(str(db_path)) as conn:
         accepted = pipeline.discover_plantae_assets(
             conn,
@@ -108,7 +140,6 @@ def test_search_batches_are_visible_to_other_readers(tmp_path):
             n_samples=100,
             base_url="http://x",
             api_key="k",
-            thumb_dir=thumb_dir,
             decision_batch_size=2,
         )
 
@@ -120,4 +151,6 @@ def test_search_batches_are_visible_to_other_readers(tmp_path):
     assert client.observed_at_page2 is not None, (
         "fake client never observed mid-run state")
     assert client.observed_at_page2["assets"] == 8
-    assert client.observed_at_page2["taxon_scores"] == 8
+    # 2 rows per asset since _score_batch_for_kingdoms persists both
+    # the Plantae and the Fungi kingdom probability.
+    assert client.observed_at_page2["taxon_scores"] == 16

@@ -22,9 +22,33 @@ from PIL import Image
 # that `bioclip/predict.py` sets `TORCH_FORCE_WEIGHTS_ONLY_LOAD=true` at
 # import time; we explicitly override both to avoid a conflict.
 import os as _os
+import tempfile as _tempfile
+from pathlib import Path as _Path
 _os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 _os.environ["TORCH_FORCE_WEIGHTS_ONLY_LOAD"] = "0"
 _os.environ.setdefault("ULTRALYTICS_SAFE_LOAD", "0")
+
+# Ultralytics resolves its settings dir at IMPORT time
+# (USER_CONFIG_DIR = get_user_config_dir() in ultralytics/utils/__init__.py)
+# and, on Linux without YOLO_CONFIG_DIR/XDG_CONFIG_HOME set, calls
+# Path.home()/".config"/Ultralytics.exists(). In a container that runs as
+# an unprivileged uid with HOME=/root (mode 700 root), Path.exists() on
+# Python 3.12 RAISES PermissionError (traversing /root fails with EACCES,
+# and exists() only swallows FileNotFoundError) — ultralytics' own
+# "/tmp fallback" lives AFTER that exists() check, so the import itself
+# crashes with "PermissionError: /root/.config/Ultralytics". Point the
+# config dir at a known-writable location BEFORE ultralytics is imported:
+# the persistent data volume when present (Docker image layout), else
+# the OS temp dir (ultralytics' own Docker fallback choice).
+if not _os.environ.get("YOLO_CONFIG_DIR"):
+    _candidate = _Path("/app/data")
+    try:
+        if _candidate.is_dir() and _os.access(_candidate, _os.W_OK):
+            _os.environ["YOLO_CONFIG_DIR"] = str(_candidate)
+        else:
+            _os.environ["YOLO_CONFIG_DIR"] = _tempfile.gettempdir()
+    except OSError:
+        _os.environ["YOLO_CONFIG_DIR"] = _tempfile.gettempdir()
 
 # Phrases tuned for the Immich dataset (a personal photo library of plants).
 # The last three ("person", "face", "human") feed the person-detection

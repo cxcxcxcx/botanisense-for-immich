@@ -160,6 +160,7 @@ export function Grid() {
     filters.page, filters.page_size,
     filters.cluster_id, filters.species, filters.genus, filters.family,
     filters.has_person, filters.plantae,
+    filters.include_non_plants,
     filters.sort,
   ]);
 
@@ -177,6 +178,12 @@ export function Grid() {
     if (nextPage >= data.pagination.total_pages) return;
     loadingMoreRef.current = true;
     setLoadingMore(true);
+    // Snapshot the request generation at start. If a filter change
+    // triggers runFetch (which bumps reqIdRef and clears the grid)
+    // while this page is in flight, the late response must NOT land —
+    // otherwise old-filter photos get appended onto the new filter's
+    // rows and the pagination/total come from the stale query.
+    const myReqId = reqIdRef.current;
     getResults({
       page: nextPage,
       page_size: filters.page_size,
@@ -190,10 +197,12 @@ export function Grid() {
       sort: serverSort,
     })
       .then(r => {
+        if (reqIdRef.current !== myReqId) return;
         setData(r);
         setAccumulated(prev => [...prev, ...r.results]);
       })
       .catch(e => {
+        if (reqIdRef.current !== myReqId) return;
         if (e instanceof ApiError && e.status >= 500) {
           push({
             kind: 'error',
@@ -228,10 +237,6 @@ export function Grid() {
   const sortedRows = useMemo(() => {
     return sortRows(accumulated, filters.sort);
   }, [accumulated, filters.sort]);
-
-  const handleRowUpdated = async (assetId: string) => {
-    void assetId;
-  };
 
   const filtersActive = filters.plantae != null || filters.has_person != null;
 
@@ -346,7 +351,7 @@ export function Grid() {
           <div className="p-0.5 sm:p-2">
             <div className="grid grid-cols-2 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 2xl:grid-cols-8 gap-0.5 sm:gap-2">
               {sortedRows.map(r => (
-                <Card key={r.asset_id} row={r} onUpdated={handleRowUpdated} />
+                <Card key={r.asset_id} row={r} />
               ))}
             </div>
             {/* Infinite-scroll sentinel — observed by useIntersectionObserver.

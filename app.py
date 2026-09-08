@@ -44,7 +44,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import storage
-from immich_client import ImmichClient
+from immich_client import ImmichClient, ImmichProbeError
 import clusters
 import pipeline  # full module — the SSE generator reads pipeline._log_file_path
 from pipeline import (
@@ -388,8 +388,8 @@ def _results_cache_get(key: str) -> dict | None:
     species stages commit new rows per batch, and this cache used to
     pin the pre-run (often empty) grid for the whole multi-hour run —
     the classic "ran for hours and every page is still empty". Idle
-    entries keep the previous never-expire behavior; the run-end
-    invalidation in _run_and_store is unchanged."""
+    entries keep the previous never-expire behavior; run-end
+    invalidation happens in the reaper (_invalidate_post_run_caches)."""
     running = _get_active_job() is not None
     with _results_lock:
         if key in _results_cache:
@@ -452,33 +452,104 @@ def _invalidate_results_cache(prefix: str = "all:") -> None:
 # a tiny registry of the active job; concurrent runs are prevented by
 # checking the registry under a short-lived mutex.
 #
-# There is NO long-lived lock and NO reaper thread. Each POST /api/run
-# checks `proc.is_alive()` while holding the registry mutex for a few
-# microseconds. If the previous child died without cleanup, the
-# next POST cleans up the stale entry before proceeding. There is no
-# way for uvicorn to wedge on this state — the only failure mode is
-# "two clicks within microseconds of each other both start a run",
-# which is acceptable (and even then, the second one will see the
-# first's proc alive and return 409).
+# There is NO long-lived lock and NO reaper thread. Each reader that
+# touches the registry checks `proc.poll()` under the registry mutex;
+# if the previous child died without cleanup, the reader reaps the
+# stale entry (and invalidates run-derived caches) before proceeding.
+# POST /api/run checks AND spawns inside the same critical section, so
+# a concurrent click sees the first child alive and gets a 409 — the
+# spawn never leaks an untracked worker.
 _pipeline_jobs_lock = threading.Lock()
-_pipeline_active_job: dict | None = None  # {"proc", "job_id", "status_path", "stop_event", "log_path"}
+_pipeline_active_job: dict | None = None  # {"proc", "job_id", "status_path", "log_path"}
+# Holds the last worker's terminal state when it ended in anything
+# other than a clean "done" — either "error" (crash/OOM, or the worker's
+# own error_state) or "stopped" (user clicked Stop and the run unwound
+# cleanly at a batch boundary). Preferred over the "last completed run"
+# fallback by the status snapshots until the next run starts, so a
+# killed or stopped run never masquerades as a successful one.
+_last_worker_outcome: dict | None = None
+
+
+def _invalidate_post_run_caches() -> None:
+    """Drop every in-process cache derived from the pipeline's DB
+    writes. The worker is a separate process, so it cannot clear the
+    parent uvicorn's caches itself — this runs exactly once, when the
+    reaper notices the child has exited."""
+    _invalidate_results_cache("all:")
+    _invalidate_clusters_cache()
+    # The near-dup sibling map is computed from all embeddings at
+    # startup/warm; new photos from the run would otherwise show as
+    # singletons (and stale sibling links persist) for the whole
+    # process lifetime. Invalidated here; recomputed lazily on the
+    # next /api/results call.
+    storage.invalidate_global_near_dup_cache()
+
+
+def _get_active_job_locked() -> dict | None:
+    """Same as _get_active_job, but called WITH _pipeline_jobs_lock
+    held (so _start_run can check-and-register atomically)."""
+    global _pipeline_active_job
+    active = _pipeline_active_job
+    if active is None:
+        return None
+    if active["proc"].poll() is not None:
+        # The worker exited. Trust whatever terminal state it
+        # managed to write to its status file:
+        #   "stopped" — user clicked Stop; the worker unwound at a
+        #     batch boundary and called stopped_state(). NOT an
+        #     error: the UI shows a neutral "stopped" badge.
+        #   "error"   — the worker caught an exception and wrote
+        #     error_state() itself.
+        # Only when the file STILL says "running" did the worker
+        # die without writing anything (SIGKILL / OOM hard-kill) —
+        # that is the genuine "died unexpectedly" case.
+        global _last_worker_outcome
+        try:
+            import json as _json
+
+            status_file = Path(active["status_path"])
+            snap = _json.loads(status_file.read_text())
+            term = snap.get("status")
+            if term == "running":
+                snap["status"] = "error"
+                snap["last_error"] = (
+                    "worker process died unexpectedly "
+                    "(crash or OOM) — see the job log"
+                )
+                status_file.write_text(_json.dumps(snap))
+                term = "error"
+            if term in ("error", "stopped"):
+                _last_worker_outcome = {
+                    "status": term,
+                    "stage": snap.get("stage", ""),
+                    "query": snap.get("query", ""),
+                    "n_requested": snap.get("n_requested"),
+                    "started_at": snap.get("started_at"),
+                    "finished_at": snap.get("finished_at"),
+                    "last_error": snap.get(
+                        "last_error",
+                        "worker process died unexpectedly"
+                        if term == "error" else "stopped by user",
+                    ),
+                }
+        except Exception:
+            pass
+        _pipeline_active_job = None
+        # The child committed new rows per batch but, being a separate
+        # process, cannot invalidate THIS process's caches. Do it here,
+        # once, at the live→dead transition (done/error/stopped alike).
+        _invalidate_post_run_caches()
+        return None
+    return active
 
 
 def _get_active_job() -> dict | None:
     """Return the active job if its child is still alive; otherwise
     clear the registry entry and return None. Lazy cleanup — the next
-    reader is the cleanup point. Cheap (`is_alive` is a single os.kill
-    probe) so we call this from every endpoint that reads the
-    registry."""
-    global _pipeline_active_job
+    reader is the cleanup point. Cheap (`poll` is a waitpid) so we call
+    this from every endpoint that reads the registry."""
     with _pipeline_jobs_lock:
-        active = _pipeline_active_job
-        if active is None:
-            return None
-        if not active["proc"].is_alive():
-            _pipeline_active_job = None
-            return None
-        return active
+        return _get_active_job_locked()
 
 
 def _last_completed_run() -> dict | None:
@@ -594,7 +665,9 @@ def _knn_status_dict() -> dict:
     shows progress, and showing "missing" alongside an active build is
     confusing — looks like the build did nothing)."""
     out: dict = {
-        "inventory_dir": str(KNN_INVENTORY_DIR()),
+        # "" when unset — str(Path("")) is "." and the UI would print
+        # that verbatim ("Looks for an index at: .").
+        "inventory_dir": os.environ.get("KNN_INVENTORY_DIR", ""),
         "index_built": False,
         "building": any(
             j.get("status") == "running" for j in _knn_build_jobs.values()
@@ -681,134 +754,6 @@ def _serialize_global(
         "taxonomy": taxonomy,
     }
 
-
-def _run_and_store(*, query: str, n_samples: int, top_k: int,
-                   batch_size: int) -> dict:
-    # Pass `classifier=None` so the BioCLIP model isn't loaded unless a
-    # run actually has BioCLIP work to do. The pipeline resolves the
-    # singleton lazily on first predict() — for fully-cached runs (n_new
-    # == 0 across kingdom, species, and bbox-bioclip) the model never
-    # loads, saving ~5.5 GB of resident memory.
-    base_url, api_key = _require_immich_connection()
-    out = run_pipeline(
-        base_url=base_url,
-        api_key=api_key,
-        query=query,
-        n_samples=n_samples,
-        top_k=top_k,
-        db_path=DB_PATH,
-        classifier=None,
-        batch_size=batch_size,
-    )
-    if out is None:
-        # run_pipeline failed; the shared state will be in "error".
-        return {}
-    payload = {
-        "run_id": out.run_id,
-        "query": out.query,
-        "n_new": out.n_new,
-        "n_cached": out.n_cached,
-        "n_requested": out.n_requested,
-        "n_clusters": out.n_clusters,
-        "started_at": None,
-        "finished_at": None,
-        "results": [
-            {
-                "asset_id": r.asset_id,
-                "original_file_name": r.original_file_name,
-                "original_url": r.original_url,
-                "thumbnail_url": r.thumbnail_url,
-                "cluster_id": r.cluster_id,
-                "top_predictions": [
-                    {
-                        "species": p.species,
-                        "common_name": p.common_name,
-                        "score": p.score,
-                        "kingdom": p.kingdom,
-                        "family": p.family,
-                        "genus": p.genus,
-                    }
-                    for p in r.top_predictions
-                ],
-                "detections": r.detections,
-                "taxon_scores": r.taxon_scores,
-                # Slim attribution for the run payload — same shape as
-                # the grid row, uses the whole-image top-K plus
-                # taxon_scores. The YOLO bbox-bioclip join is too
-                # expensive to ship with every run result; the asset
-                # detail endpoint already carries the full version.
-                "plant_attribution": storage.compute_plant_attribution(
-                    taxon_scores=r.taxon_scores,
-                    top_predictions=[
-                        {
-                            "species": p.species,
-                            "common_name": p.common_name,
-                            "score": p.score,
-                            "kingdom": p.kingdom,
-                            "family": p.family,
-                            "genus": p.genus,
-                        }
-                        for p in r.top_predictions
-                    ],
-                    detections=r.detections,
-                ) if r.detections else storage.compute_plant_attribution(
-                    taxon_scores=r.taxon_scores,
-                    top_predictions=[
-                        {
-                            "species": p.species,
-                            "common_name": p.common_name,
-                            "score": p.score,
-                            "kingdom": p.kingdom,
-                            "family": p.family,
-                            "genus": p.genus,
-                        }
-                        for p in r.top_predictions
-                    ],
-                ),
-            }
-            for r in out.results
-        ],
-        "plantae_green": PLANTAE_GREEN,
-        "plantae_yellow": PLANTAE_YELLOW,
-    }
-    # Drop cache entries: the global "all" view (the run may have added
-    # new photos) and any per-run entry (kept for backwards compat with
-    # the old /api/results?run=... path). Also invalidate the cluster
-    # names cache — HDBSCAN may reassign cluster_ids.
-    #
-    # _invalidate_results_cache takes _results_lock itself, so it must
-    # NOT be called with the lock already held — threading.Lock is not
-    # reentrant and doing so deadlocks the event loop permanently.
-    _invalidate_results_cache("all:")
-    with _results_lock:
-        _results_cache.pop(str(out.run_id), None)
-    _invalidate_clusters_cache()
-    # Precompute the near-dup map so the user's first /api/results after
-    # the pipeline finishes hits the cache. compute_near_dup_groups is
-    # ~3.6s with 19k assets (chunked matmul); we run it here, in the
-    # pipeline thread, instead of making the first page load pay it.
-    # The on-disk cache is invalidated first so the next save reflects
-    # the post-pipeline embeddings. Wrapped in try/except so a warm
-    # failure doesn't break the pipeline response — the cache just
-    # stays cold.
-    t0 = time.perf_counter()
-    try:
-        storage.invalidate_global_near_dup_cache()
-        storage.delete_near_dup_cache(NEAR_DUP_CACHE_PATH)
-        with storage.connect(DB_PATH) as conn:
-            storage.get_global_near_dup_groups(conn)
-        storage.save_near_dup_cache(NEAR_DUP_CACHE_PATH)
-        _log.info(
-            "near-dup cache rewarmed after pipeline run in %.1fs",
-            time.perf_counter() - t0,
-        )
-    except Exception:
-        _log.exception("near-dup cache warm failed; cache stays cold")
-    with storage.connect(DB_PATH) as conn:
-        storage.invalidate_cluster_names(conn)
-    return payload
-
-
 async def _start_run(query: str, n_samples: int, top_k: int,
                      batch_size: int,
                      stop_criteria_pct: float | None = None) -> dict:
@@ -821,49 +766,76 @@ async def _start_run(query: str, n_samples: int, top_k: int,
 
     409 Conflict if a run is already in progress.
     """
-    import multiprocessing as _mp
+    import subprocess
 
-    # Fail fast with a clear message before forking — the child would
+    # Fail fast with a clear message before spawning — the child would
     # only discover the missing connection at its first Immich call.
     _require_immich_connection()
 
+    # The run child is a plain exec'd subprocess (`python -m
+    # pipeline_worker`), NOT multiprocessing. Children born through
+    # multiprocessing — fork or spawn — run the BioCLIP encode pinned
+    # to ~1 core (~2.0 s/img, OpenMP pool never engaging); the
+    # identical encode in a freshly exec'd interpreter gets full torch
+    # parallelism (~0.33 s/img on 8 threads). pipeline_worker.py has
+    # the diagnosis trail. Stops arrive as SIGTERM (see /api/run/stop).
     job_id = uuid.uuid4().hex[:8]
     status_path = Path(DB_PATH).parent / f"pipeline-{job_id}.status.json"
     log_path = Path(DB_PATH).parent / f"pipeline-{job_id}.log"
-    stop_event = _mp.Event()
-
-    # If a previous run died without cleaning up its registry entry,
-    # _get_active_job drops it and returns None here. The single-run
-    # invariant is checked via the helper instead of holding the
-    # mutex across the spawn.
-    if _get_active_job() is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="pipeline is already running — see /api/status",
-        )
-
-    # Fork outside any lock so concurrent /api/run/stop requests are
-    # never blocked by spawn latency.
-    proc = _mp.Process(
-        target=_pipeline_child_entry,
-        args=(query, n_samples, top_k, batch_size,
-              stop_criteria_pct,
-              str(status_path), str(log_path), stop_event),
-        daemon=True,
-        name=f"pipeline-{job_id}",
-    )
-    proc.start()
-
+    worker_args = json.dumps({
+        "base_url": immich_base_url(),
+        "api_key": immich_api_key(),
+        "query": query,
+        "n_samples": n_samples,
+        "top_k": top_k,
+        "db_path": DB_PATH,
+        "batch_size": batch_size,
+        "stop_criteria_pct": stop_criteria_pct,
+        "status_path": str(status_path),
+        "log_path": str(log_path),
+    })
+    # Check-and-spawn atomically under the registry mutex. Spawning
+    # first and checking afterwards orphaned the losing child on a 409
+    # (a full BioCLIP worker running untracked, writing to the same
+    # SQLite DB) and let two near-simultaneous clicks both register.
+    # Popen is a few-ms fork/exec, so holding the lock across it never
+    # noticeably blocks /api/run/stop.
     with _pipeline_jobs_lock:
-        global _pipeline_active_job
+        # Reap a dead previous run in the same critical section so a
+        # stale entry can't race the new registration.
+        if _get_active_job_locked() is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="pipeline is already running — see /api/status",
+            )
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "pipeline_worker"],
+            cwd=Path(__file__).parent,
+            env={
+                **os.environ,
+                # Worker args (incl. the Immich API key) ride in the
+                # environment, not argv — argv is world-readable via
+                # /proc/<pid>/cmdline.
+                "PIPELINE_WORKER_ARGS": worker_args,
+                # MKL_DYNAMIC=true (its default) lets MKL downgrade to its
+                # sequential `def` kernel path per call; pin thread counts
+                # explicitly so BLAS never loses its pool. (The stage that
+                # actually dominated search was full-resolution PIL decode
+                # — see pipeline._open_rgb_small.)
+                "MKL_DYNAMIC": "FALSE",
+                "MKL_NUM_THREADS": str(min(8, os.cpu_count() or 8)),
+                "OMP_NUM_THREADS": str(min(8, os.cpu_count() or 8)),
+            },
+        )
+        global _pipeline_active_job, _last_worker_outcome
         _pipeline_active_job = {
             "proc": proc,
             "job_id": job_id,
             "status_path": status_path,
             "log_path": log_path,
-            "stop_event": stop_event,
             "started_at": time.time(),
         }
+        _last_worker_outcome = None
     _log.info("[pipeline] child started pid=%d job_id=%s", proc.pid, job_id)
 
     return {
@@ -874,76 +846,40 @@ async def _start_run(query: str, n_samples: int, top_k: int,
     }
 
 
-def _pipeline_child_entry(query: str, n_samples: int, top_k: int,
-                          batch_size: int,
-                          stop_criteria_pct: float | None,
-                          status_path: str,
-                          log_path: str, stop_event) -> None:
-    """Body of the child process. Mirrors the pipeline state to a JSON
-    file the parent polls, runs `run_pipeline` (which can hit ~5.85 GB
-    RSS at species-rank predict), invalidates cluster names in SQLite
-    so the next reader sees fresh data, and exits. The kernel
-    reclaims all child pages when we return.
-
-    Imports BioCLIP / open_clip / torch here in the child only — the
-    parent (uvicorn) never sees them, so its RSS stays at ~640 MB.
-    """
-    import logging as _logging
-    log = _logging.getLogger(__name__)
-    handler = None
-    try:
-        # Mirror pipeline state to status_path so the parent's
-        # /api/status and /api/events can render live progress
-        # without sharing memory.
-        import pipeline as _pipeline
-        _pipeline.set_status_file(Path(status_path))
-
-        # Per-job file log.
-        handler = _logging.FileHandler(Path(log_path), mode="w")
-        handler.setFormatter(_logging.Formatter("%(asctime)s %(message)s"))
-        log.addHandler(handler)
-        log.setLevel(_logging.INFO)
-
-        _pipeline.run_pipeline(
-            base_url=immich_base_url(),
-            api_key=immich_api_key(),
-            query=query,
-            n_samples=n_samples,
-            top_k=top_k,
-            db_path=DB_PATH,
-            classifier=None,
-            batch_size=batch_size,
-            stop_criteria_pct=stop_criteria_pct,
-            stop_event=stop_event,
-        )
-        # Cluster names may have changed (HDBSCAN re-assigns cluster_ids
-        # on incremental new points). Drop the cached names in SQLite
-        # so the next /api/clusters call rebuilds them. The child has
-        # the DB connection already; doing it here keeps uvicorn out
-        # of the post-run path entirely.
+@asynccontextmanager
+def _terminate_worker_children() -> None:
+    """SIGTERM any running worker subprocess (pipeline run, KNN build,
+    person backfill) at shutdown. Without this, a host/dev uvicorn
+    restart leaves the child alive invisibly — doing ML work and
+    per-batch DB writes alongside the new server, which will happily
+    spawn a second concurrent run. (Docker stop kills the whole cgroup
+    so containers don't need this; host restarts do.) We don't wait or
+    escalate — the process is exiting, and a worker that ignores
+    SIGTERM unwinds at its next batch boundary regardless."""
+    procs = []
+    with _pipeline_jobs_lock:
+        active = _pipeline_active_job
+        if active is not None and active["proc"].poll() is None:
+            procs.append(active["proc"])
+    for job in _knn_build_jobs.values():
+        proc = job.get("proc")
+        if proc is not None and proc.poll() is None:
+            procs.append(proc)
+    for job in _person_backfill_jobs.values():
+        proc = job.get("_proc")
+        if proc is not None and proc.poll() is None:
+            procs.append(proc)
+    for proc in procs:
         try:
-            with storage.connect(DB_PATH) as conn:
-                storage.invalidate_cluster_names(conn)
-        except Exception:
-            log.exception("[pipeline] cluster-name invalidation failed")
-        log.info("[pipeline] child finished cleanly")
-    except Exception as e:
-        log.exception("[pipeline] child crashed: %s", e)
-        try:
-            import pipeline as _pipeline
-            _pipeline.error_state(f"{type(e).__name__}: {e}")
+            proc.terminate()
         except Exception:
             pass
-    finally:
-        if handler is not None:
-            try:
-                handler.close()
-                log.removeHandler(handler)
-            except Exception:
-                pass
+    if procs:
+        _log.warning(
+            "[shutdown] sent SIGTERM to %d worker child(ren)", len(procs)
+        )
 
 
-@asynccontextmanager
 async def lifespan(_app: FastAPI):
     # One shared httpx.AsyncClient for /thumb/* across the whole process
     # — see _thumb_client docstring. Keeping keepalive_connections at 20
@@ -955,6 +891,7 @@ async def lifespan(_app: FastAPI):
         await _lifespan_inner()
         yield
     finally:
+        _terminate_worker_children()
         client, _thumb_client = _thumb_client, None
         if client is not None:
             await client.aclose()
@@ -969,10 +906,10 @@ async def _scheduler_loop(cron: str) -> None:
     expression can run an external `crontab` line (documented in
     README.md → Known limits) until a richer scheduler ships.
 
-    Loop: compute seconds-until-next HH:MM, sleep, call run_pipeline
-    with default params, repeat. The /api/status endpoint exposes
-    the next scheduled time via _next_run_at_iso so the UI can
-    show "Next run at: …".
+    Loop: compute seconds-until-next HH:MM, sleep, kick off a run via
+    _start_run (the subprocess worker — never in-process), repeat. The
+    /api/status endpoint exposes the next scheduled time via
+    _next_run_at_iso so the UI can show "Next run at: …".
     """
     global _next_run_at_iso
     try:
@@ -985,12 +922,15 @@ async def _scheduler_loop(cron: str) -> None:
         return
 
     while True:
-        # Seconds from now until the next HH:MM. If that time is in
-        # the past today, roll forward to tomorrow.
-        now = datetime.now(timezone.utc)
+        # Seconds from now until the next HH:MM, in the container's
+        # local zone (TZ env / mounted /etc/localtime — README documents
+        # PIPELINE_CRON as a local HH:MM). If that time is past today,
+        # roll forward to tomorrow.
+        from datetime import timedelta
+        now = datetime.now().astimezone()
         target = now.replace(hour=hh_i, minute=mm_i, second=0, microsecond=0)
         if target <= now:
-            target = target.replace(day=target.day + 1)
+            target = target + timedelta(days=1)
         sleep_seconds = max(1.0, (target - now).total_seconds())
         _next_run_at_iso = target.isoformat()
         _log.info("scheduler: next run at %s (in %.0fs)", _next_run_at_iso, sleep_seconds)
@@ -1000,33 +940,85 @@ async def _scheduler_loop(cron: str) -> None:
             _next_run_at_iso = None
             raise
 
-        # Run the pipeline with default params. Same call site as
-        # POST /api/run, but invoked in-process (no HTTP hop).
+        # Kick off the same subprocess worker as POST /api/run — never
+        # run_pipeline in this process (BioCLIP in uvicorn = ~6 GB and no
+        # job registry). A run already in progress makes _start_run raise
+        # 409; that's the expected "skip today" case.
         try:
-            from pipeline import run_pipeline  # local import: torch/bioclip is heavy
             if not immich_base_url() or not immich_api_key():
                 _log.warning(
                     "scheduler: skipping run — Immich is not configured yet"
                 )
                 continue
-            await asyncio.to_thread(
-                run_pipeline,
-                base_url=immich_base_url(),
-                api_key=immich_api_key(),
+            await _start_run(
                 query=QUERY,
                 n_samples=N_SAMPLES,
                 top_k=TOP_K,
                 batch_size=BATCH_SIZE,
             )
-            _log.info("scheduler: scheduled run completed")
+            _log.info("scheduler: scheduled run started")
+        except HTTPException as e:
+            if e.status_code == 409:
+                _log.info("scheduler: a run is already active — skipping")
+            else:
+                _log.warning("scheduler: scheduled run failed: %s", e.detail)
         except Exception as e:  # noqa: BLE001
             _log.warning("scheduler: scheduled run failed: %s", e)
+
+
+def _sweep_old_job_files(max_age_days: float = 7.0) -> None:
+    """Per-job logs/status files accumulate in the data dir forever —
+    pipeline-<job>.log/.status.json, knn-build-*.log, backfill-exif-*.log,
+    person-backfill-*.log/.status.json — one pair per run/job for the
+    process's lifetime. Sweep files older than the retention window at
+    boot (the UI only tails the active/recent job). Also removes
+    atomic-write *.tmp leftovers from processes that died mid-rename.
+    /tmp scratch dirs are swept separately by the pipeline worker
+    (pipeline._sweep_stale_scratch)."""
+    data_dir = Path(DB_PATH).parent
+    now = time.time()
+    cutoff = now - max_age_days * 86400.0
+    tmp_cutoff = now - 86400.0
+    patterns = (
+        "pipeline-*.log", "pipeline-*.status.json",
+        "knn-build-*.log",
+        "backfill-exif-*.log",
+        "person-backfill-*.log", "person-backfill-*.status.json",
+    )
+    removed = 0
+    try:
+        for pat in patterns:
+            for f in data_dir.glob(pat):
+                try:
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    continue
+        # Atomic-write leftovers (status JSON / near-dup pickle). A live
+        # write holds its .tmp for milliseconds, so the 1-day gate only
+        # ever matches crashed writes.
+        for f in data_dir.glob("*.tmp"):
+            try:
+                if f.is_file() and f.stat().st_mtime < tmp_cutoff:
+                    f.unlink()
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            _log.info(
+                "[cleanup] removed %d old job/log file(s) from %s",
+                removed, data_dir,
+            )
+    except OSError:
+        pass
 
 
 async def _lifespan_inner() -> None:
     """Existing startup work (near-dup warm + optional auto-run +
     optional in-app scheduler), pulled out so lifespan() stays focused
     on the shared HTTP client."""
+    _sweep_old_job_files()
     # Spawn the in-app scheduler task if PIPELINE_CRON is set. We
     # use a simple HH:MM daily schedule (e.g. "02:00") rather than a
     # full cron parser to avoid pulling in croniter/apscheduler for
@@ -1042,9 +1034,9 @@ async def _lifespan_inner() -> None:
         sched_task = None
 
     # NOTE: do NOT eagerly warm BioCLIP / YOLO here — browse-only mode
-    # (~200 MB) is the default and we don't want to pay the ~3 GB cost
-    # of model weights until the user actually hits POST /api/run.
-    # The classifier is lazily constructed on first _run_and_store().
+    # (~200 MB) is the default and we don't want to pay the ~6 GB cost
+    # of model weights until the user actually hits POST /api/run (the
+    # classifier lives in the worker process, never here).
     #
     # The near-dup map (compute_near_dup_groups) is persisted to
     # `data/near_dup_cache.pkl` (1 MB for 19k assets) at the end of
@@ -1110,19 +1102,23 @@ app = FastAPI(title="BotaniSense for Immich", lifespan=lifespan)
 # would otherwise get buffered by Vite). That makes the dev case a
 # cross-origin request and CORS becomes load-bearing.
 #
-# Default: allow any origin. This is fine for a single-user LAN app
-# (the server isn't reachable from the public internet by default),
-# but it's the wrong default for a hardened deployment. To narrow,
+# Default: allow the Vite dev origin only (see the block below).
+# To widen (e.g. phone on LAN hitting uvicorn directly),
 # set CORS_ORIGINS (comma-separated, e.g. "https://a.example.com,
 # https://b.example.com"). An empty value means same-origin only —
 # stricter, and distinct from leaving it unset. Allow_credentials
-# stays False, so we can safely use "*" (browsers reject wildcard +
-# credentials; we don't use cookies).
+# stays False.
+#
+# Default: the Vite dev-server origin only. The old default ("*" = any
+# origin) let any web page open in the user's browser read the API
+# cross-origin (photo library, cluster data) and get JSON POSTs
+# preflighted through. Production is same-origin (uvicorn serves the
+# SPA), so only dev needs an entry.
 _cors_env = os.environ.get("CORS_ORIGINS")
 _cors_origins = (
     [o.strip() for o in _cors_env.split(",") if o.strip()]
     if _cors_env is not None
-    else ["*"]
+    else ["http://localhost:5173", "http://127.0.0.1:5173"]
 )
 app.add_middleware(
     CORSMiddleware,
@@ -1464,6 +1460,19 @@ async def set_immich_connection(params: ImmichConnectionParams) -> dict:
         )
 
     env_key = os.environ.get("IMMICH_API_KEY", "")
+    # A blank key means "keep the existing key" — but ONLY when the URL
+    # is unchanged. Blank key + new URL would point the thumb client (and
+    # the /api/health poll below) at the new host while attaching the
+    # current Immich key to every request: any page that can reach this
+    # unauthenticated endpoint could exfiltrate the stored key to a host
+    # it controls. Require a fresh key whenever the host changes.
+    current_url = (immich_base_url() or "").rstrip("/")
+    key_blank = not params.api_key.strip()
+    if key_blank and url != current_url and not env_key:
+        raise HTTPException(
+            status_code=422,
+            detail="API key is required when changing the Immich URL",
+        )
     api_key = params.api_key.strip() or env_key or immich_api_key()
     if not api_key:
         raise HTTPException(
@@ -1553,21 +1562,59 @@ def _build_event_snapshot() -> dict:
     pipeline_state: dict
     if active is not None:
         sp = active["status_path"]
+        file_state: dict | None = None
         if sp.exists():
             try:
-                pipeline_state = json.loads(sp.read_text())
-                pipeline_state["job_id"] = active["job_id"]
+                file_state = json.loads(sp.read_text())
             except (json.JSONDecodeError, OSError):
-                pipeline_state = get_state()
+                file_state = None
+        if file_state is not None:
+            file_state["job_id"] = active["job_id"]
+            pipeline_state = file_state
         else:
-            pipeline_state = get_state()
+            # Child spawned but hasn't written its first status yet —
+            # interpreter boot + torch import take a few seconds. Report
+            # an explicit "starting" state instead of get_state(): the
+            # parent's module state still holds the PREVIOUS run's
+            # terminal snapshot here, which made the SSE tell clients
+            # "done" seconds after they had just started a run (and the
+            # Run button re-enabled itself mid-boot). Field shape mirrors
+            # pipeline._state's initial dict so the UI can render it
+            # unchanged; started_at is the child's spawn time (same
+            # wall-clock float the status file carries).
+            pipeline_state = {
+                "status": "running",
+                "stage": "starting",
+                "chunk_idx": 0,
+                "chunk_total": 0,
+                "rate": 0.0,
+                "eta_seconds": 0.0,
+                "current_run_id": None,
+                "query": "",
+                "n_new": 0,
+                "n_cached": 0,
+                "n_requested": 0,
+                "started_at": active["started_at"],
+                "finished_at": None,
+                "last_error": None,
+                "stage_times": {},
+                "stage_t0": None,
+                "job_id": active["job_id"],
+            }
     else:
         # No live child — show the last completed run, or the
         # empty idle state if nothing has ever run. The UI needs
         # this to show the user that the previous run finished
         # and what it produced.
-        last = _last_completed_run()
-        pipeline_state = last if last is not None else get_state()
+        if _last_worker_outcome is not None:
+            # The last worker ended in error OR was stopped by the
+            # user — both outrank the last successful run. A red
+            # "error" or neutral "stopped" must not masquerade as a
+            # green "done" from yesterday.
+            pipeline_state = _last_worker_outcome
+        else:
+            last = _last_completed_run()
+            pipeline_state = last if last is not None else get_state()
     return {
         "pipeline": pipeline_state,
         "cluster_album_jobs": _snapshot_jobs(
@@ -2019,27 +2066,77 @@ async def stop_run() -> dict:
       - 200 with `{stopped: false, reason: "no run in progress"}` if
         nothing was running (no-op)
 
-    With the child-process refactor, the worker lives in a separate
-    process — its threading.Event is invisible from here. We set the
-    multiprocessing.Event shared with the child instead. The pipeline
-    module also sets the threading.Event on its own when it sees the
-    multiprocessing one set, so any in-process callers (tests) also
-    see the stop.
+    With the worker being a plain subprocess (see _start_run), there is
+    no shared Event — we SIGTERM it. The worker's handler arms
+    pipeline.request_stop(), so the run still unwinds at the next
+    batch boundary with per-batch commits intact. We also set the
+    threading.Event in the parent so any in-process callers (rare;
+    only tests really) observe the stop.
+
+    Escalation: SIGTERM only works if the worker reaches a batch
+    boundary. If it is wedged somewhere with no stop check (a model
+    load thrashing in swap, a hung download), it will never exit. A
+    second click — or the 45s watchdog armed by the first — escalates
+    to SIGKILL. The parent writes the terminal "stopped" state itself
+    in that case (a SIGKILLed worker cannot), so the dead-process
+    reaper reports a neutral stop rather than "died unexpectedly".
     """
+    import json as _json
     import logging
     _log = logging.getLogger(__name__)
     active = _get_active_job()
     if active is None:
         return {"stopped": False, "reason": "no run in progress"}
-    active["stop_event"].set()
+    proc = active["proc"]
+
+    def _force_kill(reason: str) -> None:
+        # A SIGKILLed process cannot write its own status file — write
+        # the terminal "stopped" state for it, otherwise the reaper
+        # would brand a forced stop as an unexpected crash.
+        try:
+            status_file = Path(active["status_path"])
+            snap = (
+                _json.loads(status_file.read_text())
+                if status_file.exists() else {}
+            )
+            snap["status"] = "stopped"
+            snap["last_error"] = reason
+            snap["finished_at"] = time.time()
+            status_file.write_text(_json.dumps(snap))
+        except Exception:
+            pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        _log.warning("[pipeline] child pid=%s force-killed (%s)", proc.pid, reason)
+
+    if active.get("terminated_at"):
+        # Second click while the first SIGTERM is still pending —
+        # escalate immediately instead of waiting for the watchdog.
+        _force_kill("stopped by user (forced — worker did not unwind)")
+        return {"stopped": True, "escalated": True}
+
+    proc.terminate()
+    active["terminated_at"] = time.time()
     # Also set the threading.Event in the parent so any in-process
     # callers (rare; only tests really) observe the stop too.
     import pipeline as _pipeline
     _pipeline.request_stop()
     _log.info(
         "[pipeline] stop requested by user; child pid=%s will unwind at next batch boundary",
-        active["proc"].pid,
+        proc.pid,
     )
+
+    def _stop_watchdog() -> None:
+        # Grace period: one batch is ~10-15s of encode plus downloads;
+        # a healthy worker unwinds well within this. Still alive after
+        # 45s means it is wedged where no stop check runs.
+        time.sleep(45)
+        if proc.poll() is None:
+            _force_kill("stopped by user (forced — worker did not unwind in 45s)")
+
+    threading.Thread(target=_stop_watchdog, daemon=True).start()
     return {"stopped": True}
 
 
@@ -2055,8 +2152,14 @@ class ReclassifyParams(BaseModel):
 @app.get("/api/knn-status")
 async def knn_status() -> dict:
     """Cheap: returns whether the FAISS index is loaded + cache stats.
-    UI polls this once on page load to render the KNN status pill."""
-    return _knn_status_dict()
+    UI polls this once on page load to render the KNN status pill.
+
+    Runs in a worker thread: on first call this loads the index
+    (mmap ~1 GB + labels metadata), which must not block the event
+    loop — it would freeze every concurrent request including the SSE
+    ticks for seconds. Subsequent calls hit the in-memory cache and
+    are fast either way."""
+    return await asyncio.to_thread(_knn_status_dict)
 
 
 # ---- Build KNN index (FAISS) -------------------------------------------
@@ -2315,7 +2418,9 @@ async def reclassify(params: ReclassifyParams) -> dict:
     cached for (version, k). Returns the new rows so the UI can refresh
     inline without another /api/results fetch."""
     k = params.k or KNN_K
-    if _get_knn_index() is None:
+    # to_thread: first call mmaps the ~1 GB index and must not block
+    # the event loop.
+    if await asyncio.to_thread(_get_knn_index) is None:
         raise HTTPException(
             status_code=503,
             detail=(
@@ -3525,10 +3630,9 @@ async def put_sync_defaults(payload: SyncDefaultsPayload) -> dict:
 
 def _clustering_refit_worker(job_id: str, threshold_pct: float | None) -> None:
     """Body of the cluster-refit job. Calls clusters.refit_with_remap
-    under a single connection. Caches invalidation is handled by
-    `_run_and_store` when a pipeline run finishes; for a standalone
-    refit we just clear the in-process `_results_cache` so the next
-    /api/results call sees fresh data."""
+    under a single connection. This runs in-process (HDBSCAN refit is
+    CPU-bound but not BioCLIP), so it invalidates the in-process
+    /api/results and /api/clusters caches itself when it finishes."""
     try:
         # The refit is a long DB-bound op (HDBSCAN fit + Hungarian on
         # ~N points). Hold no global lock — callers are expected to
@@ -3547,6 +3651,12 @@ def _clustering_refit_worker(job_id: str, threshold_pct: float | None) -> None:
             j["finished_at"] = time.monotonic()
             j["n_clusters"] = n_clusters
             j["n_assets"] = len(asset_to_cluster)
+        # Refit reassigns cluster_ids — cached results/clusters payloads
+        # and the DB-side cluster-name cache are all stale now.
+        _invalidate_results_cache("all:")
+        _invalidate_clusters_cache()
+        with storage.connect(DB_PATH) as conn:
+            storage.invalidate_cluster_names(conn)
     except Exception as e:
         with _clustering_jobs_lock:
             j = _clustering_jobs.get(job_id)
@@ -3899,12 +4009,23 @@ async def reclassify_bbox(params: ReclassifyBboxParams) -> dict:
             status_code=503,
             detail=f"No KNN index found in {KNN_INVENTORY_DIR()} — set inventory_dir to a directory with either tol200m_bioclip2.faiss + INDEX_VERSION.txt (custom) or faiss/index.index + duckdb/metadata.duckdb (imageomics official)",
         )
+    # This call transiently loads BioCLIP INSIDE uvicorn (~6 GB, freed
+    # immediately after via _unload_classifier). Refuse while a pipeline
+    # run is active: the worker's resident copy plus ours would coexist.
+    if _get_active_job() is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="a pipeline run is active — retry after it finishes",
+        )
+    _require_immich_connection()
     try:
         return await asyncio.to_thread(
             pipeline.run_knn_reclassify_bbox,
-            None,
             detection_id=params.detection_id,
             index_dir=Path(KNN_INVENTORY_DIR()),
+            db_path=DB_PATH,
+            base_url=immich_base_url(),
+            api_key=immich_api_key(),
             k=KNN_K,
         )
     except FileNotFoundError as e:
@@ -3946,25 +4067,36 @@ async def reclassify_visible(params: ReclassifyVisibleParams) -> dict:
         ids = [r["asset_id"] for r in rows]
     if not ids:
         return {"queued": 0}
+    if await asyncio.to_thread(_get_knn_index) is None:
+        raise HTTPException(
+            status_code=503,
+            detail="KNN index not built — see the KNN panel to build one.",
+        )
     import threading
     import logging
     _worker_log = logging.getLogger("reclassify_sample")
+    ids_for_worker = list(ids)
+
     def _worker():
-        for aid in ids:
-            try:
-                # KNN reclassify runs via the existing pipeline helper.
-                from pipeline import run_knn_reclassify
-                run_knn_reclassify([aid])
-            except Exception:
-                # The HTTP response has already returned; we cannot
-                # bubble this to the caller. Log it so a per-asset
-                # failure (e.g. a missing embedding row) is visible
-                # instead of vanishing into a daemon thread.
-                _worker_log.warning(
-                    "reclassify-sample failed for %s", aid, exc_info=True
-                )
+        # run_knn_reclassify_sync opens its own connection and passes
+        # the correct (conn, asset_ids=, index_dir=) signature — the
+        # previous code called run_knn_reclassify([aid]), which passed
+        # the id list as the connection and TypeError'd on every asset.
+        try:
+            run_knn_reclassify_sync(ids_for_worker, KNN_K, force=True)
+        except Exception:
+            # The HTTP response has already returned; log so a failure
+            # (e.g. missing embeddings) is visible instead of vanishing.
+            _worker_log.warning(
+                "reclassify-visible failed", exc_info=True
+            )
+            return
+        # New KNN rows change the species shown on cards.
+        _invalidate_results_cache("all:")
+        _invalidate_clusters_cache()
+
     threading.Thread(target=_worker, daemon=True).start()
-    return {"queued": len(ids)}
+    return {"queued": len(ids_for_worker)}
 
 
 # ---- purge assets deleted from Immich -----------------------------------
@@ -4235,11 +4367,35 @@ async def get_backfill_exif_logs(job_id: str, tail: int = 50) -> dict:
 # and /logs for the live tail.
 
 _person_backfill_jobs: dict[str, dict] = {}
-# Stop signals per job_id, used to ask a running child process to
-# unwind at the next batch boundary. multiprocessing.Event is shared
-# with the child by reference (it's a sync primitive that crosses the
-# fork/spawn boundary cleanly).
-_person_backfill_stops: dict[str, "multiprocessing.Event"] = {}
+
+
+class _SigtermFlag:
+    """Stands in for the old shared mp.Event: SIGTERM flips it, and the
+    backfill loop's existing stop_event.is_set() checks pick it up at
+    the next batch boundary."""
+
+    def __init__(self) -> None:
+        self._flag = False
+
+    def is_set(self) -> bool:
+        return self._flag
+
+
+def _person_backfill_worker_main(args: dict) -> None:
+    """Body of the exec'd backfill subprocess — see the Popen call in
+    the backfill start endpoint for why this is not multiprocessing."""
+    import signal
+
+    flag = _SigtermFlag()
+
+    def _on_sigterm(signum, frame):  # noqa: ANN001
+        flag._flag = True  # noqa: SLF001 — same module
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    _person_backfill_child_entry(
+        args["base_url"], args["api_key"], args["db_path"],
+        args["log_path"], args["status_path"], flag,
+    )
 
 
 def _person_backfill_child_entry(
@@ -4332,6 +4488,44 @@ def _person_backfill_child_entry(
         logger.removeHandler(handler)
 
 
+def _person_backfill_reap() -> None:
+    """Lazy reaper: reconcile jobs whose child process has exited. A
+    child that died without writing a terminal status (SIGKILL/OOM)
+    would otherwise stay 'running' forever and the start guard below
+    would refuse every future backfill until restart. Mirrors the
+    pipeline-run reaper — the next reader (start guard / poll) is the
+    cleanup point."""
+    import json as _json
+
+    term_map = {"stopped": "stopped", "error": "error", "finished": "done"}
+    for job in _person_backfill_jobs.values():
+        if job["status"] != "running":
+            continue
+        proc = job.get("_proc")
+        if proc is None or proc.poll() is None:
+            continue
+        term = None
+        try:
+            snap = _json.loads(Path(job["status_path"]).read_text())
+            term = term_map.get(snap.get("stage"))
+        except Exception:
+            term = None
+        if term is None:
+            # Exited with no terminal status: crash or hard kill.
+            term = "error"
+            job["error"] = (
+                "backfill worker died unexpectedly (crash or OOM) "
+                "— see the job log"
+            )
+        job["status"] = term
+        if job.get("finished_at") is None:
+            job["finished_at"] = datetime.now(timezone.utc).isoformat()
+        if term == "done" and not job.get("_cache_invalidated"):
+            _invalidate_results_cache("all:")
+            _invalidate_clusters_cache()
+            job["_cache_invalidated"] = True
+
+
 @app.post("/api/person/backfill")
 async def start_person_backfill() -> dict:
     """Spawn the standalone person-backfill process. Returns
@@ -4343,10 +4537,13 @@ async def start_person_backfill() -> dict:
     FastAPI event loop. The child writes progress to a JSON status
     file; the parent reads it on each /job poll — no shared memory.
     """
-    import multiprocessing as _mp
+    import subprocess
     # Concurrent-job guard. Even though each job is now in its own
     # process, two concurrent jobs would still contend on the SQLite
-    # write lock. Refuse the second until the first finishes.
+    # write lock. Refuse the second until the first finishes. The
+    # reaper runs first so a crashed previous job doesn't block here
+    # forever.
+    _person_backfill_reap()
     running = [
         j for j in _person_backfill_jobs.values()
         if j["status"] == "running"
@@ -4370,8 +4567,6 @@ async def start_person_backfill() -> dict:
     job_id = uuid.uuid4().hex[:8]
     log_path = Path(DB_PATH).parent / f"person-backfill-{job_id}.log"
     status_path = Path(DB_PATH).parent / f"person-backfill-{job_id}.status.json"
-    stop_event = _mp.Event()
-    _person_backfill_stops[job_id] = stop_event
     _person_backfill_jobs[job_id] = {
         "job_id": job_id,
         "status": "running",
@@ -4390,14 +4585,29 @@ async def start_person_backfill() -> dict:
     ic = _immich_client()
     base_url = ic.base_url
     api_key = ic._client.headers["x-api-key"]
-    proc = _mp.Process(
-        target=_person_backfill_child_entry,
-        args=(base_url, api_key, DB_PATH, str(log_path),
-              str(status_path), stop_event),
-        daemon=True,
-        name=f"person-backfill-{job_id}",
+    # Plain exec'd subprocess, same rationale as the pipeline run child
+    # in _start_run: multiprocessing children (any start method) run
+    # torch inference pinned to ~1 core; a fresh interpreter doesn't.
+    # Stops arrive as SIGTERM; _person_backfill_worker_main's handler
+    # sets the flag the entry already polls.
+    proc = subprocess.Popen(
+        [sys.executable, "-c",
+         "import json,os,app; "
+         "app._person_backfill_worker_main(json.loads(os.environ['PERSON_BACKFILL_ARGS']))"],
+        cwd=Path(__file__).parent,
+        env={
+            **os.environ,
+            # Args (incl. the Immich API key) via env, not argv — see
+            # _start_run.
+            "PERSON_BACKFILL_ARGS": json.dumps({
+                "base_url": base_url,
+                "api_key": api_key,
+                "db_path": DB_PATH,
+                "log_path": str(log_path),
+                "status_path": str(status_path),
+            }),
+        },
     )
-    proc.start()
     _person_backfill_jobs[job_id]["_proc"] = proc
     return {"job_id": job_id, "n_to_scan": n_to_scan, "noop": False, "already_running": False}
 
@@ -4405,17 +4615,40 @@ async def start_person_backfill() -> dict:
 @app.post("/api/person/backfill/stop/{job_id}")
 async def stop_person_backfill(job_id: str) -> dict:
     """Ask a running backfill to unwind at the next batch boundary.
-    The child process checks the stop Event we share with it; the
-    loop exits and marks the job as 'stopped' in its JSON status
-    file. The poll endpoint then surfaces that."""
+    The child's SIGTERM handler flips the stop flag its loop polls;
+    the loop exits and marks the job 'stopped' in its JSON status
+    file, which the poll endpoint surfaces. A second click while the
+    first SIGTERM is still pending escalates to SIGKILL immediately,
+    and a watchdog escalates after 45 s (same contract as the pipeline
+    run stop) so a wedged child can't stay 'running' forever."""
     job = _person_backfill_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="unknown person-backfill job")
     if job["status"] != "running":
         return {"stopped": False, "reason": "job not running"}
-    stop_event = _person_backfill_stops.get(job_id)
-    if stop_event is not None:
-        stop_event.set()
+    proc = job.get("_proc")
+    if proc is not None and proc.poll() is None:
+        if job.get("_terminated_at"):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return {"stopped": True, "escalated": True, "job_id": job_id}
+        job["_terminated_at"] = time.monotonic()
+        proc.terminate()
+
+        def _kill_watchdog(proc=proc) -> None:
+            time.sleep(45)
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                _log.warning(
+                    "[person-backfill] child force-killed (did not unwind in 45s)"
+                )
+
+        threading.Thread(target=_kill_watchdog, daemon=True).start()
     return {"stopped": True, "job_id": job_id}
 
 
@@ -4424,6 +4657,9 @@ async def poll_person_backfill_job(job_id: str) -> dict:
     job = _person_backfill_jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="unknown person-backfill job")
+    # Reap a dead child first so a crash is surfaced even if the start
+    # guard is never hit again.
+    _person_backfill_reap()
     # The child writes JSON status to `status_path`. Read it here so
     # progress is visible across processes. Falls back to the
     # in-memory dict (init values) before the child has had time to
@@ -4566,10 +4802,14 @@ async def purge_missing_assets(
             return {"missing_count": 0, "sample": []}
 
         # Probe each DB asset against Immich's /api/assets/{id}; 200
-        # means it still exists, anything else (404 / network error) is
-        # treated as missing. Bounded at ~50 concurrent requests so we
-        # don't overwhelm the Immich server.
-        existing_ids = await client.probe_existing_async(db_ids)
+        # means it still exists, 404 means missing. A 401/403/429/5xx
+        # (or a network error) raises ImmichProbeError — we must NOT
+        # treat those as missing, or every asset would look deleted and
+        # the confirmed purge would wipe the whole local DB.
+        try:
+            existing_ids = await client.probe_existing_async(db_ids)
+        except ImmichProbeError as e:
+            raise HTTPException(status_code=502, detail=str(e)) from e
         missing_ids = [aid for aid in db_ids if aid not in existing_ids]
 
         # Build a small preview sample: at most 5 entries, each with the
@@ -4598,9 +4838,11 @@ async def purge_missing_assets(
         with storage.connect(DB_PATH) as conn:
             deleted = storage.delete_assets_by_ids(conn, missing_ids)
         payload["deleted_count"] = deleted
-        # Invalidate caches that snapshot /api/results, cluster counts,
-        # and kingdom summaries — purges can drop totals.
-        _results_cache.clear()
+        # Invalidate every cache derived from the asset set: results,
+        # cluster counts/names, and the near-dup sibling map.
+        _invalidate_results_cache("all:")
+        _invalidate_clusters_cache()
+        storage.invalidate_global_near_dup_cache()
         return payload
     finally:
         client.close()

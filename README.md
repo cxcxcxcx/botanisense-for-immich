@@ -35,9 +35,10 @@ convention.
 - **HDBSCAN clustering** of BioCLIP embeddings for browse-level
   organisation; auto-refit on library growth.
 - **Optional KNN reclassification** against a FAISS index over
-  TreeOfLife-200M (~867k species labels) — download the official
-  imageomics index or build your own; see
-  [KNN reclassification](#knn-reclassification-optional).
+  TreeOfLife-200M (~867k species labels) — a debugging /
+  understanding tool, not recommended over zero-shot (it is less
+  accurate in the current setup and memory-hungry); see
+  [KNN reclassification](#knn-reclassification-debug-tool-not-recommended).
 - **Immich album sync.** Sync photos matching a Plantae or Fungi
   threshold as smart albums; per-cluster album sync (beta); bulk
   remove.
@@ -181,17 +182,21 @@ We surface the top-K (default 5) along with the full taxonomy
 hierarchy (kingdom → family → genus → species) and a Plantae-tier
 confidence score that drives the per-image green/yellow/red overlay.
 
-### KNN reclassification (optional)
+### KNN reclassification (debug tool — not recommended)
 
-Zero-shot gets a photo to the right genus most of the time but can
-miss the species. KNN mode closes that gap: each asset is matched
-against a FAISS index of ~234M BioCLIP-2 reference embeddings, and the
-species labels of the nearest neighbours vote on the answer —
-dramatically more accurate for out-of-distribution photos.
+KNN mode matches each asset against a FAISS index of ~234M BioCLIP-2
+reference embeddings and lets the species labels of the nearest
+neighbours vote on the answer. In the current setup it is **less
+accurate than plain zero-shot**, and keeping the index resident costs
+several GB of RAM — so it is not recommended. Zero-shot predictions
+are what the pipeline uses.
 
-Two ways to get an index:
+The KNN paths exist for debugging and understanding only: inspecting
+which reference photos a given image's embedding lands next to, and
+where that disagrees with zero-shot. If you want that, two ways to
+get an index:
 
-1. **Download the official imageomics index (recommended).**
+1. **Download the official imageomics index.**
 
    ```bash
    # Run inside the container (huggingface_hub is already installed
@@ -212,9 +217,9 @@ Two ways to get an index:
    (see `knn_io.py`).
 
 Without an index the feature is simply absent: the UI shows zero-shot
-predictions only, and the KNN code paths never load. The Data tools
-card on the Run page shows a short note when no index is configured —
-zero-shot species accuracy is noticeably weaker than KNN.
+predictions only, and the KNN code paths never load — that is the
+recommended configuration. The Data tools card on the Run page shows
+a short note saying as much.
 
 [paper]: https://arxiv.org/abs/2311.18803
 

@@ -16,6 +16,13 @@ dependencies = [
     "hdbscan>=0.8.33",
     "scikit-learn>=1.7.2",
     "ultralytics>=8.4.113",
+    # YOLO-World bakes its open-vocab text embeddings through OpenAI's
+    # CLIP (import name `clip`); ultralytics only auto-installs it on
+    # first set_classes() via `pip install git+...ultralytics/CLIP`,
+    # which fails in the unprivileged container. Pin the source directly
+    # — a tarball so slim images don't need git. (The PyPI project named
+    # `clip` is an unrelated squat; this MUST stay a direct URL.)
+    "clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/master.tar.gz",
     "faiss-cpu>=1.8",
     "duckdb>=1.0",
     "pyarrow>=25.0.0",
