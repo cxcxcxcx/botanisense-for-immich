@@ -1931,10 +1931,13 @@ def has_real_person(detections: list[dict]) -> bool:
        `person` box (containment ≥ HAND_CONTAINMENT) is the signature
        of a hand-silhouette false positive — YOLO labeled the same
        arm region as both, producing a tight hand-shaped box that
-       fits entirely inside the looser person silhouette. In that
-       case, the photo is hand-only and does NOT count as has_person
-       UNLESS there's a separate face box ≥ PERSON_MIN_CONF OR a
-       person box that DOESN'T have a hand contained in it.
+       fits entirely inside the looser person silhouette. Only hands
+       with area ≥ HAND_MIN_AREA count as suppression signals (the
+       hand silhouette fills 4-12% of the frame; an incidental hand
+       inside a real body silhouette is ~0.2%). In that case, the
+       photo is hand-only and does NOT count as has_person UNLESS
+       there's a separate face box ≥ PERSON_MIN_CONF OR a person box
+       that DOESN'T have a hand contained in it.
 
     Why containment-based:
       - Real person photos may have small incidental hand boxes
@@ -1959,12 +1962,19 @@ def has_real_person(detections: list[dict]) -> bool:
         d for d in detections
         if d["label"] == HAND_LABEL
         and d["score"] >= HAND_MIN_CONF
+        # HAND_MIN_AREA: a hand INSIDE a real body silhouette is a
+        # sliver (d844f1f6: 0.61%/0.13% of frame) — the hand-silhouette
+        # false positive this rule targets fills 4-12% of the frame.
+        # Without this floor, two people each with a hand in frame
+        # defeat the has_separate_person hatch (every person box
+        # contains its own hand) and the photo is suppressed.
+        and d["w"] * d["h"] >= HAND_MIN_AREA
     ]
     if not hand_boxes:
         return True
-    # Hand detected. The hand is a suppression signal only if it's
-    # mostly contained in some person box — otherwise it's incidental
-    # (a hand holding a price tag, pointing at a leaf, etc.).
+    # Suppression-grade hand detected. It is a suppression signal only
+    # if it's mostly contained in some person box — otherwise it's
+    # incidental (a hand holding a price tag, pointing at a leaf, etc.).
     contained_pairs = [
         (h, p) for h in hand_boxes for p in person_boxes
         if _box_containment(h, p) >= HAND_CONTAINMENT

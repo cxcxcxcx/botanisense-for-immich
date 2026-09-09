@@ -542,7 +542,9 @@ def test_yolo_stage_persists_person_boxes_and_has_person():
                  mock.patch.object(pipeline, "TreeOfLifeClassifier", lambda: clf), \
                  mock.patch.object(pipeline.yolo, "detect", yolo_calls), \
                  mock.patch.object(pipeline.yolo, "get_model", lambda: None), \
-                 mock.patch.object(pipeline.yolo, "unload_model", lambda: None):
+                 mock.patch.object(pipeline.yolo, "unload_model", lambda: None), \
+                 mock.patch.object(pipeline.face, "detect_faces",
+                                   lambda img, **k: []):
                 pipeline.run_pipeline(
                     base_url="http://fake", api_key="fake", query="q",
                     n_samples=5, top_k=3, db_path=db, batch_size=2,
@@ -609,6 +611,79 @@ def test_yolo_stage_persists_person_boxes_and_has_person():
                     )
                 assert second.n_cached == 5, second
                 assert yolo_calls.images == 0, yolo_calls.images
+        finally:
+            pipeline._clf_cache = None
+
+
+def _person_yolo_big_contained_hand(images, *, conf):
+    """Every photo: person + hand-silhouette (4% of frame, fully
+    contained) — has_real_person() suppresses, so every asset is a
+    YuNet-rescue candidate."""
+    return [
+        [
+            {"label": "plant", "score": 0.42, "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.4},
+            {"label": "person", "score": 0.8, "x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0},
+            {"label": "hand", "score": 0.6, "x": 0.1, "y": 0.1, "w": 0.2, "h": 0.2},
+        ]
+        for _img in images
+    ]
+
+
+def _face_inside(img, **k):
+    return [{"label": "face", "score": 0.91,
+             "x": 0.4, "y": 0.4, "w": 0.2, "h": 0.2}]
+
+
+def test_yolo_stage_yunet_rescue_flips_suppressed_photo():
+    """A photo whose hand suppression fired (person box exists, hand
+    fully contained, no YOLO face) must flip to has_person=1 when YuNet
+    finds a face inside the person box — and the rescued `face` row must
+    be persisted alongside the other tiers, while the bbox stage still
+    classifies only the plant crop."""
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "state.db")
+        pipeline._clf_cache = None
+        clf = _FakeClassifier()
+        yolo_calls = _CountingYolo(inner=_person_yolo_big_contained_hand)
+        try:
+            with mock.patch.object(pipeline, "ImmichClient", _FakeImmichClient), \
+                 mock.patch.object(pipeline, "TreeOfLifeClassifier", lambda: clf), \
+                 mock.patch.object(pipeline.yolo, "detect", yolo_calls), \
+                 mock.patch.object(pipeline.yolo, "get_model", lambda: None), \
+                 mock.patch.object(pipeline.yolo, "unload_model", lambda: None), \
+                 mock.patch.object(pipeline.face, "detect_faces", _face_inside):
+                pipeline.run_pipeline(
+                    base_url="http://fake", api_key="fake", query="q",
+                    n_samples=5, top_k=3, db_path=db, batch_size=2,
+                )
+
+                with storage.connect(db) as conn:
+                    rows = conn.execute(
+                        "SELECT has_person, COUNT(*) AS n FROM assets "
+                        "WHERE yolo_scanned_at IS NOT NULL "
+                        "GROUP BY has_person"
+                    ).fetchall()
+                    assert {r["has_person"]: r["n"] for r in rows} == {1: 5}, rows
+
+                    for aid in ("id-0", "id-1", "id-4"):
+                        counts = {
+                            row["label"]: row["n"]
+                            for row in conn.execute(
+                                "SELECT label, COUNT(*) AS n FROM detections "
+                                "WHERE asset_id=? GROUP BY label",
+                                (aid,),
+                            ).fetchall()
+                        }
+                        # Exactly one face row per asset — the face tier
+                        # must not double-persist via the person tier
+                        # ("face" is a PERSON_LABELS member).
+                        assert counts == {
+                            "plant": 1, "person": 1, "hand": 1, "face": 1,
+                        }, (aid, counts)
+
+                # bbox stage classifies only the plant crop — face is a
+                # PERSON_LABELS member and is excluded like person/hand.
+                assert clf.predict_images == 5, clf.predict_images
         finally:
             pipeline._clf_cache = None
 

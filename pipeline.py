@@ -46,7 +46,7 @@ from immich_client import ImmichAsset, ImmichClient
 # `pipeline.TreeOfLifeClassifier`, `pipeline.clusters`, `pipeline.yolo`,
 # `pipeline.Rank` to work for both test patches (mock.patch.object) and
 # the deferred body of run_pipeline().
-_LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo", "knn")
+_LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo", "knn", "face")
 
 
 def __getattr__(name: str):  # PEP 562
@@ -66,6 +66,10 @@ def __getattr__(name: str):  # PEP 562
         import yolo as _yolo
         globals()["yolo"] = _yolo
         return _yolo
+    if name == "face":
+        import face as _face
+        globals()["face"] = _face
+        return _face
     if name == "knn":
         import knn_io as _knn
         globals()["knn"] = _knn
@@ -2372,7 +2376,9 @@ def run_pipeline(
                         )
                         n_dets = 0
                         n_merged = 0
-                        for (_k, asset), dets in zip(todo, detections):
+                        for (_k, asset), dets, pil_img in zip(
+                            todo, detections, pil_images
+                        ):
                             # Class-agnostic IoU merge: when YOLO returns
                             # multiple boxes for the same region under
                             # different classes (e.g. "plant" + "leaf"),
@@ -2381,12 +2387,17 @@ def run_pipeline(
                             before = len(dets)
                             dets = _merge_overlapping_boxes(dets)
                             n_merged += before - len(dets)
+                            # YuNet rescue before the tier split — see
+                            # the helper. Appends `face` rows only when
+                            # YOLO found a person box but the
+                            # hand-suppression rule stamped it down.
+                            dets = _augment_with_yunet_faces(dets, pil_img)
                             # ONE forward pass feeds everything: this
                             # model's label table already includes
                             # person/face/human/hand, so the boxes the
                             # person stage used to re-scan the same
                             # images for are right here. Persist all
-                            # three tiers from this pass:
+                            # tiers from this pass:
                             #   plant  — every box; bbox-bioclip
                             #            re-verifies at BBOX_BIOCLIP_MIN
                             #   person — only >= PERSON_MIN_CONF, because
@@ -2395,6 +2406,9 @@ def run_pipeline(
                             #   hand   — >= HAND_MIN_CONF; feeds the
                             #            has_real_person() suppression
                             #            rule below
+                            #   face   — YuNet rescue rows only (YOLO's
+                            #            face prompt never fires); feeds
+                            #            has_real_person()'s face hatch
                             # Below-threshold person/hand boxes are
                             # dropped entirely (not lumped into plants).
                             plant_dets = [
@@ -2405,12 +2419,16 @@ def run_pipeline(
                             person_dets = [
                                 d for d in dets
                                 if d["label"] in PERSON_LABELS
+                                and d["label"] != "face"
                                 and d["score"] >= PERSON_MIN_CONF
                             ]
                             hand_dets = [
                                 d for d in dets
                                 if d["label"] == HAND_LABEL
                                 and d["score"] >= HAND_MIN_CONF
+                            ]
+                            face_dets = [
+                                d for d in dets if d["label"] == "face"
                             ]
                             # Unscoped replace: this pass produced fresh
                             # boxes for EVERY label, so any earlier rows
@@ -2421,7 +2439,8 @@ def run_pipeline(
                             # detection_ids no longer exist.
                             new_ids = storage.replace_detections(
                                 conn, asset_id=asset.id,
-                                detections=plant_dets + person_dets + hand_dets,
+                                detections=plant_dets + person_dets
+                                + hand_dets + face_dets,
                             )
                             n_dets += len(new_ids)
                             # Scan markers — set even when the asset had
@@ -2538,11 +2557,17 @@ def run_pipeline(
                         if not chunk:
                             continue
                         detections = _yolo.detect(pil_images, conf=yolo_conf)
-                        for (asset_id, _ts), dets in zip(chunk, detections):
+                        for (asset_id, _ts), dets, pil_img in zip(
+                            chunk, detections, pil_images
+                        ):
                             # Class-agnostic IoU merge — same as yolo
                             # stage. A photo with overlapping person +
                             # face boxes collapses to one detection.
                             dets = _merge_overlapping_boxes(dets)
+                            # YuNet rescue — see the helper. Fires when
+                            # this pass found a person box but the
+                            # hand-suppression rule would stamp it down.
+                            dets = _augment_with_yunet_faces(dets, pil_img)
                             # Keep ONLY person/face/human/hand boxes —
                             # plant boxes for these assets, if any, were
                             # persisted by an earlier run's yolo stage,
@@ -2550,9 +2575,12 @@ def run_pipeline(
                             # duplicate those rows. Hand is kept because
                             # has_real_person() cross-checks it to
                             # suppress hand-silhouette false positives.
+                            # `face` rows are YuNet rescue output only
+                            # (YOLO's face prompt never fires).
                             person_dets = [
                                 d for d in dets
                                 if d["label"] in PERSON_LABELS
+                                and d["label"] != "face"
                                 and d["score"] >= PERSON_MIN_CONF
                             ]
                             hand_dets = [
@@ -2560,14 +2588,18 @@ def run_pipeline(
                                 if d["label"] == HAND_LABEL
                                 and d["score"] >= HAND_MIN_CONF
                             ]
-                            if person_dets or hand_dets:
+                            face_dets = [
+                                d for d in dets if d["label"] == "face"
+                            ]
+                            if person_dets or hand_dets or face_dets:
                                 # Append (no delete) — preserves any
                                 # existing plant detections and keeps
                                 # their bbox_predictions cache intact
                                 # via FK CASCADE.
                                 storage.append_detections(
                                     conn, asset_id=asset_id,
-                                    detections=person_dets + hand_dets,
+                                    detections=person_dets + hand_dets
+                                    + face_dets,
                                 )
                             # has_real_person applies the hand-suppression
                             # rule — see storage.has_real_person().
@@ -2983,11 +3015,18 @@ def run_person_backfill(
                     if not chunk:
                         continue
                     detections = _yolo.detect(pil_images, conf=yolo_conf)
-                    for (asset_id, _ts), dets in zip(chunk, detections):
+                    for (asset_id, _ts), dets, pil_img in zip(
+                        chunk, detections, pil_images
+                    ):
                         dets = _merge_overlapping_boxes(dets)
+                        # YuNet rescue — see the helper. Fires when this
+                        # pass found a person box but the hand-suppression
+                        # rule would stamp it down.
+                        dets = _augment_with_yunet_faces(dets, pil_img)
                         person_dets = [
                             d for d in dets
                             if d["label"] in PERSON_LABELS
+                            and d["label"] != "face"
                             and d["score"] >= PERSON_MIN_CONF
                         ]
                         hand_dets = [
@@ -2995,10 +3034,13 @@ def run_person_backfill(
                             if d["label"] == HAND_LABEL
                             and d["score"] >= HAND_MIN_CONF
                         ]
-                        if person_dets or hand_dets:
+                        face_dets = [
+                            d for d in dets if d["label"] == "face"
+                        ]
+                        if person_dets or hand_dets or face_dets:
                             storage.append_detections(
                                 conn, asset_id=asset_id,
-                                detections=person_dets + hand_dets,
+                                detections=person_dets + hand_dets + face_dets,
                             )
                         # has_real_person applies the hand-suppression
                         # rule — see storage.has_real_person().
@@ -3174,6 +3216,57 @@ def _merge_overlapping_boxes(
             }
         )
     return out
+
+
+def _augment_with_yunet_faces(
+    dets: list[dict], pil_img: Image.Image
+) -> list[dict]:
+    """YuNet rescue for hand-suppressed person photos.
+
+    YOLO-World's "face" prompt never fires in practice, so a photo where
+    every person box contains its own hand defeats has_real_person()'s
+    has_separate_person hatch and gets suppressed as a hand silhouette —
+    even when faces are clearly visible (d844f1f6: three people, zero
+    face boxes). YuNet (face.py) finds those faces in ~3 ms at the same
+    448px decode this pipeline already holds.
+
+    Gating (both required — keeps YuNet off every other photo and makes
+    foliage false positives structurally impossible):
+      1. A person box >= PERSON_MIN_CONF already exists, AND
+      2. has_real_person() is False (suppression fired, not absence).
+    Kept faces must have their CENTER inside a person box — a face floats
+    inside its body silhouette in every real-person photo we sampled.
+
+    Returns dets with rescued `face` rows appended (input not mutated).
+    `face` is a PERSON_LABELS member, so the appended rows (a) flip
+    has_real_person() via its existing has_face hatch and (b) are skipped
+    by the bbox-bioclip stage, which excludes PERSON_LABELS crops.
+    """
+    person_boxes = [
+        d for d in dets
+        if d["label"] in PERSON_LABELS and d["score"] >= PERSON_MIN_CONF
+    ]
+    if not person_boxes or has_real_person(dets):
+        return dets
+    from face import detect_faces
+
+    face_dets = []
+    for f in detect_faces(pil_img):
+        cx = f["x"] + f["w"] / 2
+        cy = f["y"] + f["h"] / 2
+        if any(
+            p["x"] <= cx <= p["x"] + p["w"]
+            and p["y"] <= cy <= p["y"] + p["h"]
+            for p in person_boxes
+        ):
+            face_dets.append(f)
+    if not face_dets:
+        return dets
+    _log.info(
+        "[person] yunet rescue: %d face(s) inside person box(es)",
+        len(face_dets),
+    )
+    return dets + face_dets
 
 
 def _rows_for_image(
