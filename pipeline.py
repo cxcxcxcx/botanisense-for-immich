@@ -79,6 +79,70 @@ def __getattr__(name: str):  # PEP 562
 
 THUMBNAIL_SIZE = "preview"
 DEFAULT_BATCH_SIZE = 16
+
+# Person-flag classifier veto (2026-09-10, docs/person_flag_review_2026-09.md).
+# The box heuristics + YuNet rescue decide "is there person evidence",
+# but YOLO-World reads hand-holding-X photos (ubiquitous in a plant
+# library) as a big `person` box and never emits `hand` — the shape
+# mimicry PERSON_CLASSIFIER.md documents. The BioCLIP whole-image
+# classifier separates exactly that class: in the review's disagreement
+# sample, every hand-holding-X photo scored p < 0.05 (12/12) while every
+# visually-confirmed real person scored p >= 0.055 (all 19 YuNet-rescued
+# rows >= 0.11). So a confident low p vetoes the flag; a missing
+# embedding or missing model file disables the veto (falls back to the
+# box stack, which is right on the no-embedding population too).
+PERSON_VETO_P = 0.05
+_PERSON_CLF: dict | None = None  # cached {"coef", "intercept"}; {} = unavailable
+
+
+def _load_person_clf() -> dict:
+    """Lazy-load the BioCLIP person-flag logistic regression (trained by
+    scripts/person_classifier_retrain.py, artifact
+    data/person_classifier.joblib — gitignored; a fresh checkout without
+    it simply runs veto-disabled)."""
+    global _PERSON_CLF
+    if _PERSON_CLF is None:
+        path = Path(os.environ.get("PERSON_CLF_PATH",
+                                   "data/person_classifier.joblib"))
+        try:
+            import joblib
+
+            blob = joblib.load(path)
+            _PERSON_CLF = {
+                "coef": np.asarray(blob["coef"], dtype=np.float32).ravel(),
+                "intercept": float(blob["intercept"]),
+            }
+            _log.info("[person] classifier veto loaded from %s", path)
+        except Exception as e:
+            _log.info("[person] classifier veto unavailable (%s: %s) — "
+                      "disabled", type(e).__name__, e)
+            _PERSON_CLF = {}
+    return _PERSON_CLF
+
+
+def _person_clf_p(conn: sqlite3.Connection, asset_id: str) -> float | None:
+    """Classifier p for one asset, computed from its PERSISTED embedding
+    (encode-once: the species stage stored it earlier in the run — no
+    image decode or re-encode here). None when the asset has no
+    embedding or the model is unavailable."""
+    clf = _load_person_clf()
+    if not clf:
+        return None
+    row = conn.execute(
+        "SELECT vector FROM embeddings WHERE asset_id=?", (asset_id,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    vec = np.frombuffer(row[0], dtype="<f4")
+    return float(1.0 / (1.0 + np.exp(-(vec @ clf["coef"] + clf["intercept"]))))
+
+
+def apply_person_veto(has_person: bool, clf_p: float | None) -> bool:
+    """The veto rule: a confident classifier negative beats person-box
+    evidence. `clf_p is None` (no embedding / no model) never vetoes."""
+    if has_person and clf_p is not None and clf_p < PERSON_VETO_P:
+        return False
+    return has_person
 # Fractional growth in the embedded-asset count that triggers a full
 # HDBSCAN refit (vs. incremental assignment for new points only).
 # 0.10 = "refit when N grows by 10% since the last fit". Override with
@@ -2452,9 +2516,15 @@ def run_pipeline(
                             # has_real_person), which is what lets the
                             # person stage below skip every asset this
                             # stage has seen.
+                            # Classifier veto — confident hand-only photos
+                            # (p < PERSON_VETO_P) beat person-box evidence.
+                            hp = apply_person_veto(
+                                has_real_person(dets),
+                                _person_clf_p(conn, asset.id),
+                            )
                             storage.mark_yolo_scanned(
                                 conn, asset_id=asset.id,
-                                has_person=has_real_person(dets),
+                                has_person=hp,
                             )
                         for im in pil_images:
                             _close_image(im)
@@ -2602,11 +2672,16 @@ def run_pipeline(
                                     + face_dets,
                                 )
                             # has_real_person applies the hand-suppression
-                            # rule — see storage.has_real_person().
+                            # rule — see storage.has_real_person(); the
+                            # classifier veto then overrides confident
+                            # hand-only photos (p < PERSON_VETO_P).
                             storage.mark_person_scanned(
                                 conn,
                                 asset_id=asset_id,
-                                has_person=has_real_person(dets),
+                                has_person=apply_person_veto(
+                                    has_real_person(dets),
+                                    _person_clf_p(conn, asset_id),
+                                ),
                             )
                         for im in pil_images:
                             _close_image(im)
@@ -3043,8 +3118,13 @@ def run_person_backfill(
                                 detections=person_dets + hand_dets + face_dets,
                             )
                         # has_real_person applies the hand-suppression
-                        # rule — see storage.has_real_person().
-                        has_p = has_real_person(dets)
+                        # rule — see storage.has_real_person(); the
+                        # classifier veto then overrides confident
+                        # hand-only photos (p < PERSON_VETO_P).
+                        has_p = apply_person_veto(
+                            has_real_person(dets),
+                            _person_clf_p(conn, asset_id),
+                        )
                         storage.mark_person_scanned(
                             conn, asset_id=asset_id, has_person=has_p
                         )
