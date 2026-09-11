@@ -8,6 +8,7 @@ import type {
   BulkClusterRemoveParams,
   BulkClusterRemoveResponse,
   ClusterAlbumMapping,
+  ClusterGroupsResponse,
   ClustersResponse,
   Health,
   ImmichConnectionParams,
@@ -43,6 +44,11 @@ export const getAsset     = (id: string) =>
 
 export const getClusters  = (plantae?: 'plant' | 'non_plant' | 'uncertain') =>
   fetchJson<ClustersResponse>('/api/clusters', { query: { plantae } });
+
+// Super-groups of clusters (the hierarchy level above clusters). Same
+// cached pipeline as /api/clusters server-side, so counts reconcile.
+export const getClusterGroups = () =>
+  fetchJson<ClusterGroupsResponse>('/api/cluster-groups');
 
 // Clusters nearest to `cluster_id` in embedding space (centroid cosine).
 // Rendered as the chip strip under the back-bar when a cluster is open.

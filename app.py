@@ -1306,6 +1306,138 @@ async def related_clusters_endpoint(
     return {"related": related, "cluster_id": cluster_id}
 
 
+# cluster super-groups (the hierarchy level ABOVE clusters). group_id 0
+# is the "Ungrouped" bucket (clusters with no close siblings); real
+# families are numbered from 1 in the families list's (stable) order.
+UNGROUPED_GROUP_ID = 0
+
+
+async def _cluster_group_index() -> tuple[list[list[int]], list[int]]:
+    """(member-cluster lists per group, ungrouped list), cached.
+
+    The member lists ARE the group-id contract: group_id N (1-based) is
+    `index[N - 1]`, group_id 0 is the ungrouped list. Families are
+    sorted by photo count desc BEFORE numbering so both /api/cluster-groups
+    cards and /api/results?cluster_group=N resolve through this exact
+    list — one structure, no id/sort drift. Photo counts come from the
+    same cached /api/clusters payload the cards use; all caches drop
+    together on refit.
+    """
+    with _clusters_cache_lock:
+        cached = _cluster_sim_cache.get("groups", _CLUSTER_SIM_UNSET)
+    if cached is not _CLUSTER_SIM_UNSET:
+        return cached
+
+    cluster_ids, centroids = await _cluster_similarity_index()
+
+    def _build():
+        return clusters.build_cluster_groups(cluster_ids, centroids)
+
+    families, solo = await asyncio.to_thread(_build)
+    meta_by_id = {r["cluster_id"]: r for r in (await _clusters_payload(None)).get("clusters", [])}
+    n_of = lambda member_ids: sum(
+        int((meta_by_id.get(cid) or {}).get("n") or 0) for cid in member_ids
+    )
+    families_sorted = sorted(families, key=lambda m: (-n_of(m), m[0]))
+    index = (families_sorted, solo)
+    with _clusters_cache_lock:
+        _cluster_sim_cache["groups"] = index
+    return index
+
+
+def _resolve_group_clusters(
+    group_id: int, group_members: list[list[int]], ungrouped: list[int]
+) -> list[int]:
+    """Cluster-id list for a super-group id (0 = Ungrouped bucket)."""
+    if group_id == UNGROUPED_GROUP_ID:
+        return ungrouped
+    if 1 <= group_id <= len(group_members):
+        return group_members[group_id - 1]
+    return []
+
+
+def _group_card(group_id: int, member_ids: list[int], meta_by_id: dict) -> dict | None:
+    """Card payload for one super-group: name from a genus vote across
+    member clusters (weighted by their top-genus counts, same ≥40% noise
+    rule as storage.compute_cluster_names), counts/thumbnail from the
+    largest member's row. None when no member carries metadata.
+
+    `members` carries per-cluster display rows (id/name/n, biggest
+    first) for the GroupMembersStrip — capped at 12: for the Ungrouped
+    bucket the full list would be hundreds of chips, and the strip is a
+    browse affordance, not an exhaustive index.
+    """
+    n = 0
+    votes: dict[str, int] = {}
+    vote_total = 0
+    sample_meta: dict | None = None
+    member_rows: list[dict] = []
+    for cid in member_ids:
+        meta = meta_by_id.get(cid)
+        if meta is None:
+            continue
+        n += int(meta.get("n") or 0)
+        member_rows.append({
+            "cluster_id": cid,
+            "name": meta.get("name", "") or f"cluster #{cid}",
+            "n": int(meta.get("n") or 0),
+        })
+        for g in (meta.get("top_genus") or [])[:2]:
+            votes[g["genus"]] = votes.get(g["genus"], 0) + int(g.get("count") or 0)
+            vote_total += int(g.get("count") or 0)
+        if sample_meta is None or int(meta.get("n") or 0) > int(sample_meta.get("n") or 0):
+            sample_meta = meta
+    if sample_meta is None:
+        return None
+    member_rows.sort(key=lambda m: (-m["n"], m["cluster_id"]))
+    top_genus, top_count = (max(votes.items(), key=lambda kv: kv[1]) if votes else ("", 0))
+    share = (top_count / vote_total) if vote_total else 0.0
+    name = top_genus if share >= 0.40 else "Mixed"
+    return {
+        "group_id": group_id,
+        "name": name,
+        "n": n,
+        "n_clusters": len(member_ids),
+        "sample_asset_id": sample_meta.get("sample_asset_id"),
+        "sample_thumbnail_url": sample_meta.get("sample_thumbnail_url"),
+        "cluster_ids": member_ids,
+        "members": member_rows[:12],
+    }
+
+
+@app.get("/api/cluster-groups")
+async def cluster_groups_endpoint() -> dict:
+    """Super-groups of clusters (the hierarchy level above clusters).
+
+    Built by complete-linkage agglomerative clustering over the cluster
+    centroids, cut at a cosine-distance threshold
+    (clusters.CLUSTER_GROUP_DISTANCE, default 0.15) — a threshold, not a
+    fixed K, so only genuinely-close clusters merge and the long tail
+    lands in the Ungrouped bucket (group_id 0) instead of a meaningless
+    mega-group. Families are sorted by photo count desc; group ids are
+    their 1-based position in that list (stable within a cache
+    generation; the cache drops on refit).
+
+    `?cluster_group=N` on /api/results filters the photo grid to a
+    group's member clusters, so these ids are the URL-stable contract
+    between the two endpoints.
+    """
+    families, solo = await _cluster_group_index()
+    payload = await _clusters_payload(None)
+    meta_by_id = {r["cluster_id"]: r for r in payload.get("clusters", [])}
+    groups = []
+    for idx, member_ids in enumerate(families, start=1):
+        card = _group_card(idx, member_ids, meta_by_id)
+        if card is not None:
+            groups.append(card)
+    ungrouped = _group_card(UNGROUPED_GROUP_ID, solo, meta_by_id) if solo else None
+    if ungrouped is not None:
+        # The bucket's genus vote is meaningless by construction (its
+        # members failed the family cut) — label it for what it is.
+        ungrouped["name"] = "Ungrouped"
+    return {"groups": groups, "ungrouped": ungrouped}
+
+
 def _invalidate_clusters_cache() -> None:
     """Drop the /api/clusters cache. Called after a pipeline run
     (HDBSCAN may have reassigned cluster_ids) and on demand."""
@@ -1824,6 +1956,10 @@ async def get_results(
     page: int = Query(default=0, ge=0),
     page_size: int = Query(default=60, ge=1, le=300),
     cluster_id: int | None = Query(default=None),
+    # Super-group filter (/api/cluster-groups id). Resolved server-side
+    # to the member cluster list, so group membership stays consistent
+    # with the cards and the URL stays short.
+    cluster_group: int | None = Query(default=None, ge=0),
     species: str | None = Query(default=None),
     genus: str | None = Query(default=None),
     family: str | None = Query(default=None),
@@ -1876,9 +2012,9 @@ async def get_results(
     # include_non_plants are included so each value gets its own cached
     # slice — flipping the toggle on the same filter combination MUST
     # bust the cache, otherwise stale results leak across toggles.
-    has_filter = any(v is not None for v in (cluster_id, species, genus, family, has_person, plantae))
+    has_filter = any(v is not None for v in (cluster_id, cluster_group, species, genus, family, has_person, plantae))
     cache_key = (
-        f"all:cid={cluster_id}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
+        f"all:cid={cluster_id}:cg={cluster_group}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
         if has_filter else f"all:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
     )
 
@@ -1899,6 +2035,26 @@ async def get_results(
         }
         return payload
 
+    # Resolve the super-group to its member cluster ids (cache-miss path
+    # only — the cache key already distinguishes groups). An unknown or
+    # empty group id means "nothing matches", never "no filter".
+    cluster_ids_filter: list[int] | None = None
+    if cluster_group is not None:
+        group_members, ungrouped = await _cluster_group_index()
+        cluster_ids_filter = _resolve_group_clusters(cluster_group, group_members, ungrouped)
+        if not cluster_ids_filter:
+            return {
+                "error": "no assets match this filter",
+                "results": [],
+                "taxonomy": {},
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": 0,
+                    "total_pages": 0,
+                },
+            }
+
     # Cache miss → build from SQLite. The query asks for ALL matching
     # rows (page_size=10M) so we can sort/filter in Python once, then
     # slice per-page. For a 19k-row DB this is ~500ms of sync work —
@@ -1911,6 +2067,7 @@ async def get_results(
                 page=0,
                 page_size=10_000_000,  # fetch all matching, slice in memory
                 cluster_id=cluster_id,
+                cluster_ids=cluster_ids_filter,
                 species=species,
                 genus=genus,
                 family=family,

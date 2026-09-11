@@ -3544,6 +3544,7 @@ def get_all_results(
     page: int = 0,
     page_size: int = 60,
     cluster_id: int | None = None,
+    cluster_ids: list[int] | None = None,
     species: str | None = None,
     genus: str | None = None,
     family: str | None = None,
@@ -3575,6 +3576,8 @@ def get_all_results(
 
     Optional filters narrow both the page slice and the `total` count:
     - cluster_id: assets.cluster_id == cluster_id
+    - cluster_ids: assets.cluster_id IN (set) — super-group filtering;
+      ignored when empty
     - species/genus/family: predictions.position=0 (rank='species') has
       matching label. These are applied via JOIN so the filter is on the
       same prediction row used by the taxonomy pills.
@@ -3606,6 +3609,19 @@ def get_all_results(
     if cluster_id is not None:
         where.append("a.cluster_id = ?")
         params.append(cluster_id)
+    if cluster_ids:
+        # Multi-cluster filter (cluster super-groups — /api/results
+        # cluster_group resolves to this list). Chunked OR'd IN clauses:
+        # SQLITE_MAX_VARIABLE_NUMBER is 999 on older SQLite builds and
+        # the Ungrouped bucket can carry hundreds of cluster ids.
+        chunks = [
+            cluster_ids[i : i + 500] for i in range(0, len(cluster_ids), 500)
+        ]
+        clause = " OR ".join(
+            f"a.cluster_id IN ({','.join('?' for _ in c)})" for c in chunks
+        )
+        where.append(f"({clause})")
+        params.extend(v for c in chunks for v in c)
     if species is not None:
         joins += " JOIN predictions p_species ON p_species.asset_id = a.asset_id AND p_species.rank = 'species' AND p_species.position = 0"
         where.append("p_species.species = ?")

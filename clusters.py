@@ -42,6 +42,7 @@ Public surface (used by pipeline.py / app.py):
   - `get_min_cluster_size(n) -> int`  (utility, also exposed)
   - `cluster_centroids(conn) -> tuple[list[int], np.ndarray]`
   - `nearest_clusters(cluster_ids, centroids, *, cluster_id, k=8) -> list[dict]`
+  - `build_cluster_groups(cluster_ids, centroids, *, max_distance) -> tuple`
 """
 
 from __future__ import annotations
@@ -660,3 +661,75 @@ def nearest_clusters(
     # re-sorting on (similarity desc, id asc).
     out.sort(key=lambda d: (-d["similarity"], d["cluster_id"]))
     return out[:k]
+
+
+# ---------- hierarchy over clusters --------------------------------------
+#
+# The related-clusters strip answers "what's NEAR this cluster"; the
+# grouping below answers "which clusters belong to the same FAMILY" —
+# super-groups that make Level 1 browsable when the corpus has hundreds
+# of clusters. We run agglomerative clustering over the centroids (not
+# the assets — 655 centroids vs tens of thousands of photos) and cut the
+# dendrogram at a fixed cosine-DISTANCE threshold.
+#
+# Why a distance threshold instead of "K groups": measured on the real
+# library, K-way cuts (maxclust) always fuse hundreds of loose clusters
+# into a couple of "everything" mega-groups, because much of the
+# embedding blob is genuinely continuous. A threshold only merges
+# clusters that are actually close (sim >= 1 - max_distance) and leaves
+# the long tail solo — the solo bucket is the honest answer for clusters
+# with no family. Complete linkage (not average/single) avoids chaining,
+# which is what keeps "Rosa, Rosa, China rose, China rose" from picking
+# up unrelated strays.
+#
+# Tuned on the production library (655 clusters): 0.15 yields 164
+# families covering 441 clusters + 214 solo, with top families reading
+# as Prunus / cherry / Narcissus / Rosa / Acer / Dahlia. Override via
+# CLUSTER_GROUP_DISTANCE env var.
+CLUSTER_GROUP_DISTANCE = float(os.environ.get("CLUSTER_GROUP_DISTANCE", "0.15"))
+
+
+def build_cluster_groups(
+    cluster_ids: list[int],
+    centroids: "np.ndarray",
+    *,
+    max_distance: float = CLUSTER_GROUP_DISTANCE,
+) -> tuple[list[list[int]], list[int]]:
+    """Group clusters whose centroids are mutually close.
+
+    Returns (families, solo): `families` is a list of member-cluster-id
+    lists (each ≥ 2 members), sorted size-desc (member ids ascending
+    within a family) so the browse UI's default size-sort is stable;
+    `solo` holds clusters that belong to no family. Every input cluster
+    appears exactly once across the two.
+
+    Deterministic given (cluster_ids, centroids): scipy's linkage on a
+    fixed matrix is deterministic, and the family ordering is a total
+    sort. A refit changes centroids, so callers must invalidate any
+    cached result alongside the centroid index.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+
+    n = len(cluster_ids)
+    if n == 0:
+        return [], []
+    if n == 1 or centroids.size == 0:
+        return [], list(cluster_ids)
+
+    dist = 1.0 - centroids @ centroids.T  # cosine distance
+    # Zero the diagonal BEFORE symmetrizing: (1 - x@x.T) is already
+    # symmetric up to float error, but squareform(checks=False) trusts us.
+    np.fill_diagonal(dist, 0.0)
+    np.clip(dist, 0.0, 2.0, out=dist)
+    Z = linkage(squareform(dist, checks=False), method="complete")
+    labels = fcluster(Z, t=max_distance, criterion="distance")
+
+    groups: dict[int, list[int]] = {}
+    for cid, lab in zip(cluster_ids, labels):
+        groups.setdefault(int(lab), []).append(int(cid))
+
+    families = [sorted(m) for m in groups.values() if len(m) >= 2]
+    families.sort(key=lambda m: (-len(m), m[0]))
+    solo = sorted(m[0] for m in groups.values() if len(m) == 1)
+    return families, solo

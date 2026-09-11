@@ -18,7 +18,7 @@ import type { PublicConfig, SyncDefaults } from '../api/types';
 
 // ---- Types ---------------------------------------------------------------
 
-export type GroupBy = 'cluster' | 'species' | 'genus' | 'family';
+export type GroupBy = 'supergroup' | 'cluster' | 'species' | 'genus' | 'family';
 // `time` = newest captured_at first (EXIF dateTimeOriginal, falling
 // back to fileCreatedAt). Photos without captured_at sort last.
 // 'rank'  — server-defined order (Immich rank then cluster_id tiebreak)
@@ -36,6 +36,9 @@ export interface Filters {
   page_size: number;
   // At most one of these is set, dictated by group_by:
   cluster_id?: number | undefined;
+  // /api/cluster-groups id (0 = the Ungrouped bucket). Grouped view of
+  // clusters — /api/results resolves it to the member cluster list.
+  supergroup?: number | undefined;
   species?: string | undefined;
   genus?: string | undefined;
   family?: string | undefined;
@@ -179,13 +182,22 @@ const INITIAL: AppState = {
 
 // ---- Reducer -------------------------------------------------------------
 
-function clearTaxonomyFilter(f: Filters): Partial<Filters> {
-  return {
+// Wipes every group-scoped filter on a group_by switch. Keys explicitly
+// present in the patch win — so {group_by:'cluster', cluster_id:5} in
+// ONE patch lands on cluster 5 instead of having its cluster_id wiped
+// by the switch (that same-patch wipe bit the member-chip navigation).
+function clearTaxonomyFilter(f: Filters, patch: Partial<Filters>): Partial<Filters> {
+  const cleared: Partial<Filters> = {
     cluster_id: undefined,
+    supergroup: undefined,
     species: undefined,
     genus: undefined,
     family: undefined,
   };
+  for (const k of Object.keys(cleared) as (keyof Filters)[]) {
+    if (k in patch) (cleared as Record<string, unknown>)[k] = patch[k];
+  }
+  return cleared;
 }
 
 function reducer(state: AppState, action: Action): AppState {
@@ -195,7 +207,7 @@ function reducer(state: AppState, action: Action): AppState {
       // Switching group_by must atomically clear the stale taxonomy filter
       // and reset the page. The hook handles the URL push separately.
       if (action.patch.group_by && action.patch.group_by !== state.filters.group_by) {
-        Object.assign(next, clearTaxonomyFilter(state.filters), { group_by: action.patch.group_by, page: 0 });
+        Object.assign(next, clearTaxonomyFilter(state.filters, action.patch), { group_by: action.patch.group_by, page: 0 });
       }
       return { ...state, filters: next };
     }

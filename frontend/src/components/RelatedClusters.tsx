@@ -1,20 +1,61 @@
-// RelatedClusters — chip strip under the Level-2 back-bar, shown only
-// while a cluster filter is active. Each chip is a cluster whose BioCLIP
-// centroid is close to the open cluster's (cosine similarity — see
-// /api/clusters/related); clicking one swaps the cluster filter in place,
-// so browse "sideways" through embedding space without going back to the
-// card grid.
+// RelatedClusters — chip strip under the Level-2 back-bar. Two variants
+// share the same chip UI:
 //
-// Deliberately NOT rendered for species/genus/family views — the
-// similarity is defined over HDBSCAN cluster centroids, so a "related
-// species" strip would be a different (undefined) metric.
+//   <RelatedClusters />     — nearest clusters by centroid cosine
+//                             (/api/clusters/related), shown while a
+//                             CLUSTER filter is active: browse "sideways"
+//                             through embedding space.
+//   <GroupMembersStrip />   — member clusters of the active SUPER-GROUP
+//                             (data fetched by Grid, passed as a prop):
+//                             browse DOWN the hierarchy into a family.
+//
+// Both swap the filter in place, so neither navigation round-trips
+// through the Level-1 card grid.
 
 import { useEffect, useState } from 'react';
 import { getRelatedClusters } from '../api/endpoints';
-import type { RelatedCluster } from '../api/types';
+import type { ClusterGroup, RelatedCluster } from '../api/types';
 import { useFilters } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { thumbUrl } from '../lib/thumb';
+
+// Presentational chip row. `chips` carry display data only — selection
+// behavior is decided by the variant wrapper below.
+interface Chip {
+  key: string;
+  label: string;
+  meta: string;
+  title: string;
+  assetId: string | null;
+  onClick: () => void;
+}
+
+function ClusterChipStrip({ label, chips, loading }: { label: string; chips: Chip[]; loading?: boolean }) {
+  return (
+    <div className="related-bar" data-testid="related-clusters">
+      <span className="related-bar-label">{label}</span>
+      {loading
+        ? Array.from({ length: 4 }, (_, i) => (
+            <div key={i} className="related-chip" aria-hidden="true">
+              <span className="related-chip-thumb shimmer" />
+              <span className="py-1.5 space-y-1">
+                <span className="related-chip-name block w-16 h-2 rounded bg-bg-2" />
+                <span className="block w-10 h-2 rounded bg-bg-2" />
+              </span>
+            </div>
+          ))
+        : chips.map(c => (
+            <button key={c.key} type="button" className="related-chip group" title={c.title} onClick={c.onClick}>
+              <ChipThumb assetId={c.assetId} fallback={c.label} />
+              <span className="min-w-0 py-1">
+                <span className="related-chip-name block group-hover:text-accent">{c.label}</span>
+                <span className="related-chip-meta block">{c.meta}</span>
+              </span>
+            </button>
+          ))}
+    </div>
+  );
+}
 
 export function RelatedClusters() {
   const filters = useFilters();
@@ -60,50 +101,60 @@ export function RelatedClusters() {
   if (!loading && related.length === 0) return null;
 
   return (
-    <div className="related-bar" data-testid="related-clusters">
-      <span className="related-bar-label">Related</span>
-      {loading ? (
-        Array.from({ length: 4 }, (_, i) => (
-          <div key={i} className="related-chip" aria-hidden="true">
-            <span className="related-chip-thumb shimmer" />
-            <span className="py-1.5 space-y-1">
-              <span className="related-chip-name block w-16 h-2 rounded bg-bg-2" />
-              <span className="block w-10 h-2 rounded bg-bg-2" />
-            </span>
-          </div>
-        ))
-      ) : (
-        related.map(c => (
-          <button
-            key={c.cluster_id}
-            type="button"
-            className="related-chip group"
-            title={`${c.name || `cluster #${c.cluster_id}`} · ${c.n.toLocaleString()} photos · similarity ${(c.similarity * 100).toFixed(0)}%`}
-            onClick={() => setFilters({ cluster_id: c.cluster_id, page: 0 })}
-          >
-            <RelatedChipThumb clusterId={c.cluster_id} assetId={c.sample_asset_id} name={c.name} />
-            <span className="min-w-0 py-1">
-              <span className="related-chip-name block group-hover:text-accent">
-                {c.name || `cluster #${c.cluster_id}`}
-              </span>
-              <span className="related-chip-meta block">
-                {c.n.toLocaleString()} · {(c.similarity * 100).toFixed(0)}%
-              </span>
-            </span>
-          </button>
-        ))
-      )}
-    </div>
+    <ClusterChipStrip
+      label="Related"
+      loading={loading}
+      chips={loading ? [] : related.map(c => ({
+        key: String(c.cluster_id),
+        label: c.name || `cluster #${c.cluster_id}`,
+        meta: `${c.n.toLocaleString()} · ${(c.similarity * 100).toFixed(0)}%`,
+        title: `${c.name || `cluster #${c.cluster_id}`} · ${c.n.toLocaleString()} photos · similarity ${(c.similarity * 100).toFixed(0)}%`,
+        assetId: c.sample_asset_id,
+        onClick: () => setFilters({ cluster_id: c.cluster_id, page: 0 }),
+      }))}
+    />
+  );
+}
+
+// Member clusters of the active super-group. Grid owns the
+// /api/cluster-groups fetch (it needs the family name for the back-bar)
+// and hands the resolved group down. Renders nothing until Grid has both
+// the group data AND a matching active supergroup filter — so a filter
+// change can't show the previous family's members. `members` is capped
+// server-side (the Ungrouped bucket holds hundreds of clusters).
+export function GroupMembersStrip({ group }: { group: ClusterGroup | null }) {
+  const setFilters = useUrlFilters();
+  if (!group) return null;
+  const capped = group.n_clusters > group.members.length;
+  return (
+    <ClusterChipStrip
+      label="Members"
+      chips={group.members.map(m => ({
+        key: String(m.cluster_id),
+        label: m.name || `cluster #${m.cluster_id}`,
+        meta: m.n.toLocaleString(),
+        title: `${m.name || `cluster #${m.cluster_id}`} · ${m.n.toLocaleString()} photos (member of ${group.name})`,
+        assetId: null,
+        onClick: () => setFilters({ group_by: 'cluster', cluster_id: m.cluster_id, page: 0 }),
+      })).concat(capped ? [{
+        key: 'more',
+        label: `+${group.n_clusters - group.members.length} more`,
+        meta: `${group.n.toLocaleString()} photos total`,
+        title: `${group.n_clusters - group.members.length} more clusters in ${group.name} — all their photos are shown in this grid`,
+        assetId: null,
+        onClick: () => { /* informational — the grid already shows the whole group */ },
+      }] : [])}
+    />
   );
 }
 
 // Thumb with the same imgError fallback pattern as FilterCards'
 // ClusterCardOverlay — Immich thumbs can 404 for purged assets and a
 // broken <img> icon inside a tiny pill looks worse than a letter.
-function RelatedChipThumb({ clusterId, assetId, name }: { clusterId: number; assetId: string | null; name: string }) {
+function ChipThumb({ assetId, fallback }: { assetId: string | null; fallback: string }) {
   const [imgError, setImgError] = useState(false);
   const showImg = assetId && !imgError;
-  const fallbackChar = (name || String(clusterId)).charAt(0).toUpperCase() || '·';
+  const fallbackChar = (fallback || '·').replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
   return showImg ? (
     <img
       src={thumbUrl(assetId)}

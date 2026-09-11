@@ -54,6 +54,7 @@ export function parseUrlFilters(search: string = window.location.search): Filter
     page_size: 60,
   };
   if (group_by === 'cluster')  f.cluster_id = num(sp.get('cluster_id'));
+  if (group_by === 'supergroup') f.supergroup = num(sp.get('supergroup'));
   if (group_by === 'species')  { const v = sp.get('species');  if (v !== null) f.species  = v; }
   if (group_by === 'genus')    { const v = sp.get('genus');    if (v !== null) f.genus    = v; }
   if (group_by === 'family')   { const v = sp.get('family');   if (v !== null) f.family   = v; }
@@ -83,6 +84,8 @@ export function buildUrl(f: Filters): string {
   if (f.sort !== DEFAULT_FILTERS.sort) sp.set('sort', f.sort);
   if (f.q) sp.set('q', f.q);
   if (f.group_by === 'cluster' && f.cluster_id != null) sp.set('cluster_id', String(f.cluster_id));
+  // group_id 0 (Ungrouped) is a real filter — `!= null` is the gate.
+  if (f.group_by === 'supergroup' && f.supergroup != null) sp.set('supergroup', String(f.supergroup));
   if (f.group_by === 'species' && f.species) sp.set('species', f.species);
   if (f.group_by === 'genus'   && f.genus)   sp.set('genus',   f.genus);
   if (f.group_by === 'family'  && f.family)  sp.set('family',  f.family);
@@ -107,7 +110,8 @@ export function initialFilters(): Filters {
   if (fromUrl.group_by === 'cluster'
       && fromUrl.sort === DEFAULT_FILTERS.sort
       && !fromUrl.q && fromUrl.page === 0
-      && fromUrl.cluster_id == null && !fromUrl.species && !fromUrl.genus && !fromUrl.family
+      && fromUrl.cluster_id == null && fromUrl.supergroup == null
+      && !fromUrl.species && !fromUrl.genus && !fromUrl.family
       && fromUrl.has_person == null && fromUrl.plantae == null
       && !fromUrl.include_non_plants) {
     return readPersisted(DEFAULT_FILTERS);
@@ -127,8 +131,15 @@ export function useUrlFilters() {
     // window.location.search and apply the patch.
     const next = { ...parseUrlFilters(), ...patch };
     if (patch.group_by && patch.group_by !== parseUrlFilters().group_by) {
-      next.cluster_id = undefined; next.species = undefined;
-      next.genus = undefined; next.family = undefined; next.page = 0;
+      // Keys explicitly present in the patch survive the switch (mirrors
+      // the reducer's clearTaxonomyFilter) — one setFilters call can
+      // switch group_by AND set the new group's filter.
+      if (!('cluster_id' in patch)) next.cluster_id = undefined;
+      if (!('supergroup' in patch)) next.supergroup = undefined;
+      if (!('species' in patch)) next.species = undefined;
+      if (!('genus' in patch)) next.genus = undefined;
+      if (!('family' in patch)) next.family = undefined;
+      next.page = 0;
     }
     // has_person changes (including toggling off) re-paginate to 0 so
     // the user lands on page 1 of the new result set.

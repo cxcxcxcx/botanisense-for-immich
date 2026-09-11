@@ -228,6 +228,28 @@ export interface RelatedClustersResponse {
   related: RelatedCluster[];
 }
 
+// One entry of /api/cluster-groups — a super-group of HDBSCAN clusters
+// (complete-linkage over cluster centroids, cosine-distance cut). The
+// Ungrouped bucket (clusters with no close siblings) uses group_id 0.
+export interface ClusterGroup {
+  group_id: number;
+  name: string;
+  // Photos across all member clusters.
+  n: number;
+  n_clusters: number;
+  sample_asset_id: string | null;
+  sample_thumbnail_url: string | null;
+  cluster_ids: number[];
+  // Display rows for the member strip — biggest clusters first, capped
+  // at 12 server-side (the Ungrouped bucket has hundreds of members).
+  members: { cluster_id: number; name: string; n: number }[];
+}
+
+export interface ClusterGroupsResponse {
+  groups: ClusterGroup[];
+  ungrouped: ClusterGroup | null;
+}
+
 export interface KnnStatus {
   inventory_dir: string;
   index_built: boolean;
@@ -430,6 +452,9 @@ export interface ResultsQuery {
   page?: number;
   page_size?: number;
   cluster_id?: number | undefined;
+  // /api/cluster-groups id — server resolves it to the member cluster
+  // list (keeps group membership consistent with the cards).
+  cluster_group?: number | undefined;
   species?: string | undefined;
   genus?: string | undefined;
   family?: string | undefined;

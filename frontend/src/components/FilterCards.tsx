@@ -13,7 +13,7 @@
 // filtered when the user arrives on Level 1 with plantae= in the URL.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { getClusters, getResults } from '../api/endpoints';
+import { getClusterGroups, getClusters, getResults } from '../api/endpoints';
 import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
 import { useFilters, type GroupBy } from '../state/AppContext';
 import { useDebounce } from '../hooks/useDebounce';
@@ -29,11 +29,14 @@ const SORTS: { value: CardSort; label: string }[] = [
   { value: 'id',     label: 'ID' },
 ];
 
+// Coarsest first: super-groups (hierarchy level above clusters) →
+// HDBSCAN clusters → taxonomy.
 const GROUP_BY_CHIPS: Array<{ v: GroupBy; label: string }> = [
-  { v: 'cluster', label: 'Cluster' },
-  { v: 'species', label: 'Species' },
-  { v: 'genus',   label: 'Genus' },
-  { v: 'family',  label: 'Family' },
+  { v: 'supergroup', label: 'Super' },
+  { v: 'cluster',    label: 'Cluster' },
+  { v: 'species',    label: 'Species' },
+  { v: 'genus',      label: 'Genus' },
+  { v: 'family',     label: 'Family' },
 ];
 
 interface Card {
@@ -57,6 +60,7 @@ export function FilterCards() {
   const view = useRoute();
 
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
+  const [groupData, setGroupData] = useState<{ id: number; name: string; count: number; sample: string | null }[] | null>(null);
   const [resultsData, setResultsData] = useState<ResultsResponse | null>(null);
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
   const [searchInput, setSearchInput] = useState(filters.q);
@@ -97,6 +101,22 @@ export function FilterCards() {
     return () => { cancelled = true; };
   }, [filters.group_by, filters.plantae]);
 
+  // Super-group list — same trigger shape as the cluster list. The
+  // Ungrouped bucket (group_id 0) rides at the end of the families.
+  useEffect(() => {
+    if (filters.group_by !== 'supergroup') return;
+    let cancelled = false;
+    getClusterGroups()
+      .then(j => {
+        if (cancelled) return;
+        const cards = j.groups.map(g => ({ id: g.group_id, name: g.name, count: g.n, sample: g.sample_asset_id }));
+        if (j.ungrouped) cards.push({ id: j.ungrouped.group_id, name: j.ungrouped.name, count: j.ungrouped.n, sample: j.ungrouped.sample_asset_id });
+        setGroupData(cards);
+      })
+      .catch(() => { if (!cancelled) setGroupData([]); });
+    return () => { cancelled = true; };
+  }, [filters.group_by]);
+
   // /api/results is fetched for the "all" tile total. We need it on
   // BOTH the cluster view AND the taxonomy view (the previous behavior
   // only fetched it for taxonomy, which made the cluster "all" tile
@@ -110,6 +130,16 @@ export function FilterCards() {
   }, [filters.group_by, filters.plantae]);
 
   const allCards = useMemo<Card[]>(() => {
+    if (filters.group_by === 'supergroup') {
+      if (!groupData) return [];
+      return groupData.map(g => ({
+        key: String(g.id),
+        label: g.name,
+        count: g.count,
+        latest: null,
+        sampleAssetId: g.sample,
+      }));
+    }
     if (filters.group_by === 'cluster') {
       if (!clusterData) return [];
       return clusterData.map(c => ({
@@ -134,7 +164,7 @@ export function FilterCards() {
       latest: t.latest_captured_at ?? null,
       sampleAssetId: t.sample_asset_id,
     }));
-  }, [filters.group_by, clusterData, resultsData]);
+  }, [filters.group_by, clusterData, groupData, resultsData]);
 
   const sortedCards = useMemo<Card[]>(() => {
     const arr = [...allCards];
@@ -147,7 +177,7 @@ export function FilterCards() {
         if (!a.latest && !b.latest) return b.count - a.count || a.label.localeCompare(b.label);
         return b.latest!.localeCompare(a.latest!);
       });
-    } else if (sortMode === 'id' && filters.group_by === 'cluster') {
+    } else if (sortMode === 'id' && (filters.group_by === 'cluster' || filters.group_by === 'supergroup')) {
       arr.sort((a, b) => Number(a.key) - Number(b.key));
     } else {
       arr.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
@@ -162,12 +192,13 @@ export function FilterCards() {
   }, [sortedCards, filters.q]);
 
   const activeKey = useMemo<string | null>(() => {
+    if (filters.group_by === 'supergroup') return filters.supergroup != null ? String(filters.supergroup) : null;
     if (filters.group_by === 'cluster') return filters.cluster_id != null ? String(filters.cluster_id) : null;
     if (filters.group_by === 'species') return filters.species ?? null;
     if (filters.group_by === 'genus') return filters.genus ?? null;
     if (filters.group_by === 'family') return filters.family ?? null;
     return null;
-  }, [filters.group_by, filters.cluster_id, filters.species, filters.genus, filters.family]);
+  }, [filters.group_by, filters.supergroup, filters.cluster_id, filters.species, filters.genus, filters.family]);
 
   const activeCard = useMemo<Card | null>(() => {
     if (activeKey == null) return null;
@@ -180,8 +211,9 @@ export function FilterCards() {
     return allCards.find(c => c.key === activeKey) ?? null;
   }, [activeKey, visibleCards, allCards]);
 
-  const activeParamKey: 'cluster_id' | 'species' | 'genus' | 'family' =
-    filters.group_by === 'cluster' ? 'cluster_id'
+  const activeParamKey: 'supergroup' | 'cluster_id' | 'species' | 'genus' | 'family' =
+    filters.group_by === 'supergroup' ? 'supergroup'
+    : filters.group_by === 'cluster' ? 'cluster_id'
     : filters.group_by === 'species' ? 'species'
     : filters.group_by === 'genus' ? 'genus'
     : 'family';
@@ -192,7 +224,9 @@ export function FilterCards() {
 
   const handleClick = (card: Card) => {
     if (card.key === activeKey) { clearFilter(); navigate('browse-list'); return; }
-    const v = activeParamKey === 'cluster_id' ? Number(card.key) : card.key;
+    const v = activeParamKey === 'cluster_id' || activeParamKey === 'supergroup'
+      ? Number(card.key)
+      : card.key;
     setFilters({ [activeParamKey]: v, page: 0 } as Partial<typeof filters>);
   };
 
@@ -207,7 +241,8 @@ export function FilterCards() {
   const totalAll = resultsData?.pagination?.total ?? allCards.reduce((a, b) => a + b.count, 0);
   const isLoading =
     (filters.group_by === 'cluster' && !clusterData) ||
-    (filters.group_by !== 'cluster' && !resultsData);
+    (filters.group_by === 'supergroup' && !groupData) ||
+    (filters.group_by !== 'cluster' && filters.group_by !== 'supergroup' && !resultsData);
 
   // FilterCards is Level-1 only now (Toolbar mounts it on browse-list;
   // Grid owns its own Filter button on browse-content). Kept the

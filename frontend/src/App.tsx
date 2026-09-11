@@ -55,6 +55,7 @@ export function App() {
   // (filter cards, full-height) to the content view (photo grid).
   const hasActiveFilter =
     filters.cluster_id != null ||
+    filters.supergroup != null ||
     !!filters.species ||
     !!filters.genus ||
     !!filters.family;

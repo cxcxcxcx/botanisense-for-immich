@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { getResults } from '../api/endpoints';
+import { getClusterGroups, getResults } from '../api/endpoints';
 import { ApiError } from '../api/client';
-import type { Pagination as PaginationType, ResultRow, ResultsResponse } from '../api/types';
+import type { ClusterGroup, Pagination as PaginationType, ResultRow, ResultsResponse } from '../api/types';
 import { useFilters, type SortMode } from '../state/AppContext';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { navigate } from '../hooks/useRoute';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 import { FilterModal } from './FilterModal';
-import { RelatedClusters } from './RelatedClusters';
+import { GroupMembersStrip, RelatedClusters } from './RelatedClusters';
 import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
 import { useToasts } from './ToastProvider';
 
@@ -80,8 +80,33 @@ export function Grid() {
   const loadingMoreRef = useRef(false);
   const reqIdRef = useRef(0);
 
+  // Super-group browse: Grid owns the /api/cluster-groups fetch — the
+  // back-bar needs the family NAME (not just "#4"), and the member strip
+  // below consumes the same payload. Server caches it, so this is cheap
+  // and never refetches per navigation within a cache generation.
+  const [groupsData, setGroupsData] = useState<ClusterGroup[] | null>(null);
+  useEffect(() => {
+    if (filters.group_by !== 'supergroup') { setGroupsData(null); return; }
+    let cancelled = false;
+    getClusterGroups()
+      .then(j => {
+        if (cancelled) return;
+        setGroupsData(j.ungrouped ? [...j.groups, j.ungrouped] : j.groups);
+      })
+      .catch(() => { if (!cancelled) setGroupsData([]); });
+    return () => { cancelled = true; };
+  }, [filters.group_by]);
+  const activeGroup = useMemo<ClusterGroup | null>(() => {
+    if (filters.group_by !== 'supergroup' || filters.supergroup == null) return null;
+    return groupsData?.find(g => g.group_id === filters.supergroup) ?? null;
+  }, [groupsData, filters.group_by, filters.supergroup]);
+
   const activeFilterLabel: string | null = (() => {
     const g = filters.group_by;
+    if (g === 'supergroup') {
+      if (activeGroup) return activeGroup.name;
+      return filters.supergroup != null ? `super-group #${filters.supergroup}` : null;
+    }
     if (g === 'cluster') return filters.cluster_id != null ? `cluster #${filters.cluster_id}` : null;
     if (g === 'species') return filters.species ?? null;
     if (g === 'genus') return filters.genus ?? null;
@@ -89,7 +114,8 @@ export function Grid() {
     return null;
   })();
   const clearActiveFilter = () => {
-    if (filters.group_by === 'cluster') setFilters({ cluster_id: undefined, page: 0 });
+    if (filters.group_by === 'supergroup') setFilters({ supergroup: undefined, page: 0 });
+    else if (filters.group_by === 'cluster') setFilters({ cluster_id: undefined, page: 0 });
     else if (filters.group_by === 'species') setFilters({ species: undefined, page: 0 });
     else if (filters.group_by === 'genus') setFilters({ genus: undefined, page: 0 });
     else if (filters.group_by === 'family') setFilters({ family: undefined, page: 0 });
@@ -114,6 +140,7 @@ export function Grid() {
       page: filters.page,
       page_size: filters.page_size,
       cluster_id: filters.cluster_id,
+      cluster_group: filters.supergroup,
       species: filters.species,
       genus: filters.genus,
       family: filters.family,
@@ -159,7 +186,7 @@ export function Grid() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     filters.page, filters.page_size,
-    filters.cluster_id, filters.species, filters.genus, filters.family,
+    filters.cluster_id, filters.supergroup, filters.species, filters.genus, filters.family,
     filters.has_person, filters.plantae,
     filters.include_non_plants,
     filters.sort,
@@ -189,6 +216,7 @@ export function Grid() {
       page: nextPage,
       page_size: filters.page_size,
       cluster_id: filters.cluster_id,
+      cluster_group: filters.supergroup,
       species: filters.species,
       genus: filters.genus,
       family: filters.family,
@@ -217,7 +245,7 @@ export function Grid() {
         setLoadingMore(false);
       });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, filters.page, filters.page_size, filters.cluster_id, filters.species, filters.genus, filters.family, filters.has_person, filters.plantae, filters.include_non_plants, filters.sort]);
+  }, [data, filters.page, filters.page_size, filters.cluster_id, filters.supergroup, filters.species, filters.genus, filters.family, filters.has_person, filters.plantae, filters.include_non_plants, filters.sort]);
 
   useEffect(() => {
     runFetch();
@@ -296,10 +324,13 @@ export function Grid() {
         </div>
       </div>
 
-      {/* Cluster browse-sideways strip — nearest clusters by embedding
-          centroid similarity. Renders nothing unless a cluster filter
-          is active (the component owns that gate). */}
+      {/* Cluster browse-sideways strip (nearest clusters by embedding
+          centroid similarity) — active while a CLUSTER filter is set.
+          The super-group variant (member clusters of the active family)
+          replaces it while a SUPER-GROUP filter is set. Each owns its
+          own gate; exactly one can render at a time. */}
       <RelatedClusters />
+      {filters.group_by === 'supergroup' && <GroupMembersStrip group={activeGroup} />}
 
       {loading && !data ? (
         <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">Loading…</div>
@@ -337,6 +368,7 @@ export function Grid() {
           onClearFilters={() => {
             setFilters({
               cluster_id: undefined,
+              supergroup: undefined,
               species: undefined,
               genus: undefined,
               family: undefined,
