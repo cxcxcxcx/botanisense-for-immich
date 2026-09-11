@@ -128,20 +128,46 @@ def _seed(app, cluster_id: int, vectors: list[list[float]], names_all: dict[int,
         conn.commit()
 
 
-def test_group_card_votes_genus_and_noise_falls_back_to_mixed():
+def test_group_card_names_dominant_member_else_genus_vote():
     import app as app_mod  # noqa: E402
+
+    def m(n, name, genera):
+        return {"n": n, "name": name, "top_genus": genera}
+
     meta = {
-        1: {"n": 10, "top_genus": [{"genus": "Rosa", "count": 3}]},
-        2: {"n": 4, "top_genus": [{"genus": "Rosa", "count": 3}]},
-        3: {"n": 2, "top_genus": [{"genus": "Cirsium", "count": 3},
-                                   {"genus": "Malus", "count": 3}]},
+        1: m(10, "Rosa", [{"genus": "Rosa", "count": 2}]),
+        2: m(4, "China rose", [{"genus": "Rosa", "count": 2}]),
+        3: m(3, "Cirsium", [{"genus": "Cirsium", "count": 3}]),
+        4: m(4, "Malus sp", [{"genus": "Malus", "count": 2},
+                              {"genus": "Cirsium", "count": 2}]),
     }
-    card = app_mod._group_card(1, [1, 2, 3], meta)
-    assert card["name"] == "Rosa"       # 6/12 ≥ 40%
-    assert card["n"] == 16 and card["n_clusters"] == 3
-    mixed = app_mod._group_card(2, [1, 3], {1: meta[1], 3: meta[3]})
-    assert mixed["name"] == "Mixed"     # top genus 3/9 < 40%
-    assert app_mod._group_card(3, [1], {}) is None  # no metadata at all
+    # Dominant member: 10/17 = 59%… not enough; bump to make the split
+    # between the two regimes explicit:
+    dominant_meta = {1: m(12, "Rosa", meta[1]["top_genus"]),
+                     2: meta[2], 3: meta[3]}
+    card = app_mod._group_card(1, [1, 2, 3], dominant_meta)
+    assert card["name"] == "Rosa"       # 12/19 = 63% ≥ 60% → member name
+    assert card["n"] == 19 and card["n_clusters"] == 3
+
+    # Peer group (largest 5/12 = 42% < 60%) → genus vote: Rosa 4/7 ≥ 40%.
+    peers_meta = {
+        1: m(5, "Rosa", [{"genus": "Rosa", "count": 2}]),
+        2: m(4, "China rose", [{"genus": "Rosa", "count": 2}]),
+        3: m(3, "Cirsium", [{"genus": "Cirsium", "count": 3}]),
+    }
+    peers = app_mod._group_card(2, [1, 2, 3], peers_meta)
+    assert peers["name"] == "Rosa"
+
+    # Peer group with a three-way vote split → top < 40% → "Mixed".
+    split_meta = {
+        1: m(5, "Rosa", [{"genus": "Rosa", "count": 2}]),
+        4: m(4, "Malus sp", [{"genus": "Malus", "count": 2},
+                              {"genus": "Cirsium", "count": 2}]),
+    }
+    split = app_mod._group_card(3, [1, 4], split_meta)
+    assert split["name"] == "Mixed"     # top genus 2/6 = 33% < 40%
+
+    assert app_mod._group_card(4, [1], {}) is None  # no metadata at all
 
 
 def test_cluster_groups_endpoint_and_results_filter_agree(app_module):

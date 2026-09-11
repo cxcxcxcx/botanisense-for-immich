@@ -1390,9 +1390,21 @@ def _group_card(group_id: int, member_ids: list[int], meta_by_id: dict) -> dict 
     if sample_meta is None:
         return None
     member_rows.sort(key=lambda m: (-m["n"], m["cluster_id"]))
-    top_genus, top_count = (max(votes.items(), key=lambda kv: kv[1]) if votes else ("", 0))
-    share = (top_count / vote_total) if vote_total else 0.0
-    name = top_genus if share >= 0.40 else "Mixed"
+    # Naming, two regimes:
+    #   - One member dominates the family (≥60% of photos): the family
+    #     IS that cluster's identity — use its name. Without this, the
+    #     giant "Mixed" cluster (8.6k photos on prod) joined a small
+    #     hortensia family and its dominant genus voted the whole family
+    #     "Prunus" — technically the vote winner, practically a lie.
+    #   - Otherwise (a genuine peer group): genus vote, same ≥40% noise
+    #     rule as storage.compute_cluster_names.
+    largest = member_rows[0]
+    if n and largest["n"] / n >= 0.60:
+        name = largest["name"] or "Mixed"
+    else:
+        top_genus, top_count = (max(votes.items(), key=lambda kv: kv[1]) if votes else ("", 0))
+        share = (top_count / vote_total) if vote_total else 0.0
+        name = top_genus if share >= 0.40 else "Mixed"
     return {
         "group_id": group_id,
         "name": name,
