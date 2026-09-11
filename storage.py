@@ -584,6 +584,19 @@ def all_embeddings(conn: sqlite3.Connection) -> tuple[list[str], np.ndarray]:
     return ids, matrix
 
 
+def asset_cluster_map(conn: sqlite3.Connection) -> dict[str, int]:
+    """asset_id -> cluster_id for every asset that carries a cluster_id.
+
+    Clusters are plant-only (clusters.py clears non-plant cluster_ids on
+    every refit), so no kingdom filter is needed here — a NULL cluster_id
+    is the only "not in a cluster" state.
+    """
+    rows = conn.execute(
+        "SELECT asset_id, cluster_id FROM assets WHERE cluster_id IS NOT NULL"
+    ).fetchall()
+    return {r["asset_id"]: int(r["cluster_id"]) for r in rows}
+
+
 def find_library_neighbors(
     conn: sqlite3.Connection, *, asset_id: str, k: int = 12
 ) -> list[dict]:

@@ -343,6 +343,17 @@
   .back-bar-name     { @apply text-sm font-semibold italic text-fg truncate; }
   .back-bar-count    { @apply text-[10px] text-fg-1; }
 
+  /* Related-clusters strip — sits directly under the back-bar on Level 2
+     while a cluster filter is active. Horizontally scrollable pill row;
+     each pill jumps to that cluster's photo grid (filters.cluster_id
+     swap, no trip back through the card grid). */
+  .related-bar        { @apply border-b border-line bg-bg/90 px-2 py-1.5 flex items-center gap-1.5 overflow-x-auto; }
+  .related-bar-label  { @apply shrink-0 text-[10px] uppercase tracking-wider text-fg-1 mr-0.5; }
+  .related-chip       { @apply shrink-0 flex items-center gap-1.5 pr-2.5 rounded-full border border-line bg-bg-1 hover:border-accent transition-colors text-left overflow-hidden; }
+  .related-chip-thumb { @apply w-8 h-8 rounded-full object-cover shrink-0 bg-bg-2; }
+  .related-chip-name  { @apply block max-w-[10rem] truncate text-[11px] font-medium leading-tight text-fg; }
+  .related-chip-meta  { @apply block text-[10px] leading-tight text-fg-1; }
+
   /* Photo card — aspect-square, rounded-lg (sm+), only a confidence
      pill at the bottom-right corner. No species name, no tier
      swatch, no top badges. */

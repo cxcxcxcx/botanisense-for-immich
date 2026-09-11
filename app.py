@@ -34,6 +34,7 @@ from collections import deque, OrderedDict
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 from dotenv import load_dotenv
@@ -46,6 +47,8 @@ from pydantic import BaseModel
 import storage
 from immich_client import ImmichClient, ImmichProbeError
 import clusters
+if TYPE_CHECKING:
+    import numpy as np
 import pipeline  # full module — the SSE generator reads pipeline._log_file_path
 from pipeline import (
     attach_log_file,
@@ -297,6 +300,13 @@ _results_lock = threading.Lock()
 # pattern. Invalidated when a pipeline run completes.
 _clusters_cache: dict[tuple, dict] = {}
 _clusters_cache_lock = threading.Lock()
+
+# Centroid vectors per cluster (see clusters.cluster_centroids) backing
+# /api/clusters/related. One global entry — like the payload cache above
+# it depends only on the cluster assignment + embeddings, so it's
+# invalidated at exactly the same moments (run completes, refit).
+_cluster_sim_cache: dict[str, object] = {}
+_CLUSTER_SIM_UNSET = object()
 
 
 # ---- /thumb pipeline ----------------------------------------------------
@@ -1188,6 +1198,10 @@ async def list_runs() -> dict:
 async def clusters_endpoint(
     plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
 ) -> dict:
+    return await _clusters_payload(plantae)
+
+
+async def _clusters_payload(plantae: str | None) -> dict:
     # cluster_summary walks every (cluster_id, top-1 prediction) pair
     # with 3 nested sub-queries per cluster — ~450 ms for ~700 clusters.
     # The result is cacheable across requests because it depends only
@@ -1230,11 +1244,74 @@ async def clusters_endpoint(
     return payload
 
 
+async def _cluster_similarity_index() -> tuple[list[int], "np.ndarray"]:
+    """(cluster_ids, centroid matrix) for /api/clusters/related, cached.
+
+    Loading every embedding costs the same O(N) read as a refit, so the
+    result is memoized in _cluster_sim_cache and dropped by
+    _invalidate_clusters_cache (a refit can renumber clusters AND shift
+    membership, and new embeddings move the centroids).
+    """
+    with _clusters_cache_lock:
+        cached = _cluster_sim_cache.get("index", _CLUSTER_SIM_UNSET)
+    if cached is not _CLUSTER_SIM_UNSET:
+        return cached
+
+    def _build():
+        with storage.connect(DB_PATH) as conn:
+            return clusters.cluster_centroids(conn)
+
+    index = await asyncio.to_thread(_build)
+    with _clusters_cache_lock:
+        _cluster_sim_cache["index"] = index
+    return index
+
+
+@app.get("/api/clusters/related")
+async def related_clusters_endpoint(
+    cluster_id: int = Query(...),
+    limit: int = Query(default=8, ge=1, le=24),
+) -> dict:
+    """Clusters closest in embedding space to `cluster_id`.
+
+    Similarity = cosine between cluster centroids (mean of member
+    embeddings, L2-normalized — see clusters.cluster_centroids). The
+    queried cluster itself is excluded. Display fields ride along from
+    the same cached payload /api/clusters serves (unfiltered tier, so
+    counts match the cluster cards' default view), which also means a
+    name-less/Mixed cluster shows up with exactly the label the cards
+    grid uses.
+    """
+    cluster_ids, centroids = await _cluster_similarity_index()
+    neighbors = clusters.nearest_clusters(
+        cluster_ids, centroids, cluster_id=cluster_id, k=limit
+    )
+    if not neighbors:
+        return {"related": [], "cluster_id": cluster_id}
+
+    payload = await _clusters_payload(None)
+    by_id = {r["cluster_id"]: r for r in payload.get("clusters", [])}
+    related = []
+    for nb in neighbors:
+        meta = by_id.get(nb["cluster_id"], {})
+        related.append({
+            "cluster_id": nb["cluster_id"],
+            "similarity": nb["similarity"],
+            "name": meta.get("name", ""),
+            "n": meta.get("n", 0),
+            "sample_asset_id": meta.get("sample_asset_id"),
+            "sample_thumbnail_url": meta.get("sample_thumbnail_url"),
+            "top_genus": meta.get("top_genus", []),
+        })
+    return {"related": related, "cluster_id": cluster_id}
+
+
 def _invalidate_clusters_cache() -> None:
     """Drop the /api/clusters cache. Called after a pipeline run
     (HDBSCAN may have reassigned cluster_ids) and on demand."""
     with _clusters_cache_lock:
         _clusters_cache.clear()
+        _cluster_sim_cache.clear()
 
 
 @app.post("/api/clusters/recompute")

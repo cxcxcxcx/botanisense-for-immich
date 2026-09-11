@@ -40,6 +40,8 @@ Public surface (used by pipeline.py / app.py):
   - `save_clusterer(conn, clusterer, *, ...) -> None`
   - `load_clusterer(conn) -> tuple[hdbscan.HDBSCAN, dict] | None`
   - `get_min_cluster_size(n) -> int`  (utility, also exposed)
+  - `cluster_centroids(conn) -> tuple[list[int], np.ndarray]`
+  - `nearest_clusters(cluster_ids, centroids, *, cluster_id, k=8) -> list[dict]`
 """
 
 from __future__ import annotations
@@ -567,3 +569,94 @@ def refit_with_remap(
     )
 
     return final_mapping, n_real_clusters, remap
+
+
+# ---------- cluster-to-cluster similarity --------------------------------
+#
+# HDBSCAN gives us membership but nothing about how clusters relate to
+# each other — two clusters can be siblings in embedding space even
+# though every point landed firmly in one or the other. For the browse
+# UI ("open a cluster → show related clusters") we score each cluster by
+# its centroid: the mean of its member embeddings, re-normalized. With
+# unit-length embeddings the centroid mean is a decent direction
+# estimate, and cosine(centroid_i, centroid_j) is a single dot product.
+
+
+def cluster_centroids(conn: sqlite3.Connection) -> tuple[list[int], "np.ndarray"]:
+    """Compute one L2-normalized centroid vector per cluster.
+
+    Returns (cluster_ids_asc, centroids) where centroids is (C, D)
+    float32 with rows aligned to cluster_ids (sorted ascending for
+    determinism). Clusters with no embedded assets are skipped — a
+    centroid of nothing is undefined, and the row simply can't be
+    compared against anything.
+
+    O(N) over every embedding in the DB (same load the refit uses);
+    callers should cache the result and invalidate it whenever
+    cluster_ids or embeddings change.
+    """
+    ids_all, matrix_all = storage.all_embeddings(conn)
+    cluster_map = storage.asset_cluster_map(conn)
+    if matrix_all.size == 0 or not cluster_map:
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    keep_mask = np.array([aid in cluster_map for aid in ids_all], dtype=bool)
+    ids = [aid for aid, k in zip(ids_all, keep_mask) if k]
+    matrix = matrix_all[keep_mask]
+    if not ids:
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    labels = np.array([cluster_map[aid] for aid in ids], dtype=np.int64)
+    cluster_ids = sorted(set(labels.tolist()))
+    id_to_row = {cid: i for i, cid in enumerate(cluster_ids)}
+    dim = matrix.shape[1]
+    centroids = np.zeros((len(cluster_ids), dim), dtype=np.float32)
+    # np.add.at accumulates rows into their cluster's slot in one pass
+    # (a plain `centroids[idx] += ...` would drop duplicate indices).
+    np.add.at(centroids, np.array([id_to_row[int(l)] for l in labels]), matrix)
+
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    # A zero-norm centroid (all member vectors exactly cancelled) can't
+    # be normalized — leave it at zero so every similarity vs it is 0
+    # rather than NaN.
+    safe = np.where(norms > 0, norms, 1.0)
+    centroids = centroids / safe.astype(np.float32)
+    return cluster_ids, centroids
+
+
+def nearest_clusters(
+    cluster_ids: list[int],
+    centroids: "np.ndarray",
+    *,
+    cluster_id: int,
+    k: int = 8,
+) -> list[dict]:
+    """Top-K most-similar OTHER clusters to `cluster_id`, by centroid
+    cosine similarity.
+
+    Returns [{cluster_id, similarity}, ...] sorted similarity-desc
+    (ties broken by cluster_id ASC so the order is stable across
+    refits). The queried cluster itself is always excluded. Clusters
+    missing from `cluster_ids` (no embedded assets) can't appear.
+    """
+    if cluster_id not in cluster_ids or centroids.size == 0:
+        return []
+    self_idx = cluster_ids.index(cluster_id)
+    sims = centroids @ centroids[self_idx]  # (C,), cosine — rows are unit
+    sims[self_idx] = -2.0  # mask self out of the top-K
+    n = sims.shape[0]
+    take = min(k, n - 1)
+    if take <= 0:
+        return []
+    # Same argpartition trick as storage.find_library_neighbors.
+    top = np.argpartition(-sims, take - 1)[:take]
+    top = top[np.argsort(-sims[top], kind="stable")]
+    out = [
+        {"cluster_id": int(cluster_ids[i]), "similarity": round(float(sims[i]), 4)}
+        for i in top
+    ]
+    # argpartition+sort preserves the -2.0 mask only for self; drop any
+    # other cluster that lost the tie-break ordering guarantee by
+    # re-sorting on (similarity desc, id asc).
+    out.sort(key=lambda d: (-d["similarity"], d["cluster_id"]))
+    return out[:k]

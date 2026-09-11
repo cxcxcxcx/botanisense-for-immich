@@ -210,6 +210,24 @@ export interface ClustersResponse {
   clusters: ClusterSummary[];
 }
 
+// One entry of /api/clusters/related — a cluster whose BioCLIP centroid
+// sits close to the one being viewed. `similarity` is centroid cosine
+// similarity in [−1, 1]; anything the UI shows is typically > 0.7.
+export interface RelatedCluster {
+  cluster_id: number;
+  similarity: number;
+  name: string;
+  n: number;
+  sample_asset_id: string | null;
+  sample_thumbnail_url: string | null;
+  top_genus: { genus: string; count: number }[];
+}
+
+export interface RelatedClustersResponse {
+  cluster_id: number;
+  related: RelatedCluster[];
+}
+
 export interface KnnStatus {
   inventory_dir: string;
   index_built: boolean;

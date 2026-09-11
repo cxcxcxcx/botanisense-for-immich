@@ -24,6 +24,7 @@ import type {
   PublicConfig,
   PurgeMissingPreview,
   PurgeMissingResult,
+  RelatedClustersResponse,
   ResultsQuery,
   ResultsResponse,
   RunParams,
@@ -42,6 +43,11 @@ export const getAsset     = (id: string) =>
 
 export const getClusters  = (plantae?: 'plant' | 'non_plant' | 'uncertain') =>
   fetchJson<ClustersResponse>('/api/clusters', { query: { plantae } });
+
+// Clusters nearest to `cluster_id` in embedding space (centroid cosine).
+// Rendered as the chip strip under the back-bar when a cluster is open.
+export const getRelatedClusters = (cluster_id: number, limit = 8) =>
+  fetchJson<RelatedClustersResponse>('/api/clusters/related', { query: { cluster_id, limit } });
 
 export const getKnnStatus = () =>
   fetchJson<KnnStatus>('/api/knn-status');

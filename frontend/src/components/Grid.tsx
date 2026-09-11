@@ -8,6 +8,7 @@ import { navigate } from '../hooks/useRoute';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 import { FilterModal } from './FilterModal';
+import { RelatedClusters } from './RelatedClusters';
 import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
 import { useToasts } from './ToastProvider';
 
@@ -294,6 +295,11 @@ export function Grid() {
           </label>
         </div>
       </div>
+
+      {/* Cluster browse-sideways strip — nearest clusters by embedding
+          centroid similarity. Renders nothing unless a cluster filter
+          is active (the component owns that gate). */}
+      <RelatedClusters />
 
       {loading && !data ? (
         <div className="p-10 text-center text-fg-1 whitespace-pre-wrap">Loading…</div>
