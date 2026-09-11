@@ -29,7 +29,7 @@ convention.
   from Immich's `/api/search/smart`.
 - **BioCLIP-2 zero-shot species prediction.** Top-K (default 5) species
   per asset, with full taxonomy. Lazy-loaded in a child process — your
-  backend process never holds the ~5 GB model weights.
+  backend process never holds the ~4.3 GB model weights + label table.
 - **YOLO-World person detection.** Per-asset flag (`has_person`),
   drives both a filter and the "with/without people" album-sync toggle.
 - **HDBSCAN clustering** of BioCLIP embeddings for browse-level
@@ -63,9 +63,10 @@ Immich (REST)               React/Vite SPA
                   │             │             │
                   ▼             ▼             ▼
               state.db    BioCLIP-2      FAISS index
-              (assets,    weights        (optional;
-              embeddings, (~4.3 GB       download or
-              predictions) in child)     build)
+              (assets,    weights +      (optional;
+              embeddings, labels         download or
+              predictions) (~4.3 GB      build)
+                           on disk)
 ```
 
 A 17 000-photo library is the realistic scale at which this app
@@ -79,11 +80,14 @@ shines. Below ~1 000 photos the run-once latency dominates; above
 - **Docker** (with Compose v2) — the only install path
 - An **Immich instance** with an admin API key — see
   [Immich → Administration → Settings → API Keys][immich-keys]
-- **~5 GB free RAM** during a pipeline run (BioCLIP-2 + species
-  label table live in the child process)
-- **~5 GB free disk** for the BioCLIP-2 artifacts (~4.3 GB: model
-  weights + species label table; downloaded on first run into
-  `data/huggingface/`) plus the FastAPI thumb cache (`data/thumbs/`)
+- **~6 GB free RAM** during a pipeline run (measured ~5.9 GB: BioCLIP-2
+  weights + species label table live in the child process). The web
+  server itself stays at ~250 MB.
+- **~10 GB free disk**: ~2.5 GB for the Docker image, ~4.3 GB for the
+  BioCLIP-2 artifacts (model weights + species label table, downloaded
+  on first run into `data/huggingface/`), and the SQLite state DB
+  (hundreds of MB at ~17 000 photos). Add ~20 GB if you opt into the
+  KNN index.
 - The BioCLIP-2 model itself, from
   [`imageomics/bioclip-2`][bioclip-hf] — downloaded automatically on
   first use
@@ -120,10 +124,10 @@ Don't want to build locally? Uncomment the `image:` line in
 the web UI? Set `IMMICH_BASE_URL` / `IMMICH_API_KEY` in `compose.yml`
 or a `.env` file instead — environment variables pin the connection.
 
-The image contains the backend and the built web UI (~2 GB; CPU-only
+The image contains the backend and the built web UI (~2.5 GB; CPU-only
 torch). BioCLIP-2 downloads into `./data/` on the first pipeline run.
 To enable the optional KNN reclassification, see
-[KNN reclassification](#knn-reclassification-optional).
+[KNN reclassification](#knn-reclassification-debug-tool-not-recommended).
 
 Contributing or developing from source (Python + Node)? See
 [DEVELOPMENT.md](DEVELOPMENT.md).
@@ -182,7 +186,7 @@ We surface the top-K (default 5) along with the full taxonomy
 hierarchy (kingdom → family → genus → species) and a Plantae-tier
 confidence score that drives the per-image green/yellow/red overlay.
 
-### KNN reclassification (debug tool — not recommended)
+### KNN reclassification (debug tool, not recommended)
 
 KNN mode matches each asset against a FAISS index of ~234M BioCLIP-2
 reference embeddings and lets the species labels of the nearest
@@ -241,11 +245,11 @@ status, logs) is fetched per-component, with one SSE connection
   rename — re-sync to refresh.
 - **KNN reclassification is opt-in.** Without an index (downloaded
   official, ~20 GB, or self-built — see
-  [KNN reclassification](#knn-reclassification-optional)), only
+  [KNN reclassification](#knn-reclassification-debug-tool-not-recommended)), only
   zero-shot predictions are available.
-- **5 GB resident during a pipeline run.** The BioCLIP-2 child
-  process holds the weights + label table for the duration; uvicorn
-  itself stays at ~250 MB.
+- **~6 GB resident during a pipeline run.** The BioCLIP-2 child
+  process holds the weights + label table for the duration (measured
+  ~5.9 GB); uvicorn itself stays at ~250 MB.
 - **Tested against Immich ≥ 1.111.** Earlier versions may lack
   `/api/search/smart` and the album endpoints this app depends on.
 - **No telemetry.** The app phones home to nobody — no update checks,
