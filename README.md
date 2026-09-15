@@ -134,6 +134,24 @@ Contributing or developing from source (Python + Node)? See
 
 ---
 
+## Screenshots
+
+Browse your library as auto-named **cluster cards** — each cover is
+the most representative *person-free* photo in the group:
+
+![Cluster cards: a grid of plant groups named Camellia, Wisteria, Sunflower, Lotus, Saguaro…](docs/images/browse-clusters.jpg)
+
+Click a card for its photo grid — every image tagged with the top
+species prediction and confidence, with a strip of related clusters
+on top:
+
+![Inside a Camellia cluster: a grid of camellia photos labeled Camellia japonica with confidence scores](docs/images/cluster-grid.jpg)
+
+The same browse levels exist for **species, genus, and family**, plus
+a global search and smart-album sync back to Immich.
+
+---
+
 ## Configuration
 
 Two surfaces, both optional:
