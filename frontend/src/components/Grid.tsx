@@ -107,7 +107,12 @@ export function Grid() {
       if (activeGroup) return activeGroup.name;
       return filters.supergroup != null ? `super-group #${filters.supergroup}` : null;
     }
-    if (g === 'cluster') return filters.cluster_id != null ? `cluster #${filters.cluster_id}` : null;
+    if (g === 'cluster') {
+      if (filters.cluster_id == null) return null;
+      // Prefer the server's card name ("Camellia"); fall back to the
+      // raw id until the first results page lands.
+      return data?.cluster_name || `cluster #${filters.cluster_id}`;
+    }
     if (g === 'species') return filters.species ?? null;
     if (g === 'genus') return filters.genus ?? null;
     if (g === 'family') return filters.family ?? null;

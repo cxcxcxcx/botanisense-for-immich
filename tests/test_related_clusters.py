@@ -210,3 +210,44 @@ def test_related_endpoint_contract(seeded, monkeypatch):
     assert related[0]["n"] == 2
     assert related[0]["sample_asset_id"] == "c1-0"
     assert 0.0 < related[0]["similarity"] < 1.0
+
+
+def test_results_carries_cluster_name_only_when_cluster_filtered(seeded, monkeypatch):
+    """The grid title needs the card name ("Quercus"), not a raw
+    `cluster #1`: /api/results?cluster_id=N echoes cluster_names, and
+    the field is absent for every other filter shape."""
+    import storage  # noqa: E402
+    db = seeded
+    monkeypatch.setenv("IMMICH_API_KEY", "test-key")
+    monkeypatch.setenv("IMMICH_BASE_URL", "http://immich.test")
+    import dotenv  # noqa: E402
+    monkeypatch.setattr(dotenv, "load_dotenv", lambda *a, **k: False)
+    sys.modules.pop("app", None)
+    import app  # noqa: E402
+    app.DB_PATH = db
+    app._invalidate_clusters_cache()
+
+    with storage.connect(db) as conn:
+        for cid, name in ((1, "Quercus"), (2, "Acer"), (3, "Betula"), (4, "Mixed")):
+            conn.execute(
+                "INSERT INTO cluster_names (cluster_id, name, n_total,"
+                " top_species_json, top_genus_json) VALUES (?, ?, ?, '[]', '[]')",
+                (cid, name, 2),
+            )
+        conn.commit()
+
+    from fastapi.testclient import TestClient
+    client = TestClient(app.app)
+    r = client.get("/api/results", params={"cluster_id": 1})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["cluster_name"] == "Quercus"
+
+    # Second page rides the results cache — the name must survive the
+    # cache-hit response path too.
+    r2 = client.get("/api/results", params={"cluster_id": 1, "page": 0})
+    assert r2.json()["cluster_name"] == "Quercus"
+
+    # No cluster filter → no key (other views must not grow the field).
+    r3 = client.get("/api/results")
+    assert "cluster_name" not in r3.json()

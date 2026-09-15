@@ -1244,6 +1244,17 @@ async def _clusters_payload(plantae: str | None) -> dict:
     return payload
 
 
+async def _cluster_display_name(cluster_id: int) -> str:
+    """Cached cluster card name ("Camellia"); "" for unknown ids or
+    unnamed clusters. Backs the grid breadcrumb title, which otherwise
+    can only show the raw `cluster #N`."""
+    by_id = {
+        r["cluster_id"]: r
+        for r in (await _clusters_payload(None)).get("clusters", [])
+    }
+    return (by_id.get(cluster_id) or {}).get("name") or ""
+
+
 async def _cluster_similarity_index() -> tuple[list[int], "np.ndarray"]:
     """(cluster_ids, centroid matrix) for /api/clusters/related, cached.
 
@@ -2045,6 +2056,8 @@ async def get_results(
             "total": total_assets,
             "total_pages": (total_reps + page_size - 1) // page_size if total_reps else 0,
         }
+        if cluster_id is not None:
+            payload["cluster_name"] = await _cluster_display_name(cluster_id)
         return payload
 
     # Resolve the super-group to its member cluster ids (cache-miss path
@@ -2134,6 +2147,11 @@ async def get_results(
         return payload, results
 
     payload, results = await asyncio.to_thread(_build)
+    if cluster_id is not None:
+        # Human-readable name for the grid title ("Camellia", not
+        # "cluster #95"). Reuses the cached /api/clusters payload, so
+        # this is a dict lookup after the first browse-page load.
+        payload["cluster_name"] = await _cluster_display_name(cluster_id)
     if "results" in payload and not payload.get("error"):
         # Cache the FULL (unsliced) results so subsequent pages don't re-fetch.
         # The LRU cache (max _RESULTS_CACHE_MAX entries) bounds total memory.

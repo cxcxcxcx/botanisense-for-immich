@@ -152,6 +152,10 @@ export interface ResultsResponse {
   results: ResultRow[];
   pagination: Pagination;
   taxonomy: Taxonomy;
+  // Present only when ?cluster_id= filters the grid: the cluster's
+  // card name ("Camellia"), for the grid title. Absent/empty for
+  // unnamed clusters and other filters.
+  cluster_name?: string;
 }
 
 export interface LibraryNeighbor {
