@@ -17,6 +17,9 @@ data/label_sample/
 scripts/person_*
 scripts/PERSON_CLASSIFIER.md
 
+# Private: Colab experiment notebooks (reference a personal GCS bucket).
+colab/
+
 # Orphan SQLite files at the repo root (the `data/` directory is already
 # covered by the rule above). `data.state.db` is a real risk: a fresh
 # run drops a ~500 MB file at the root that has nothing to do with
