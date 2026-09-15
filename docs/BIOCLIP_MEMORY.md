@@ -41,6 +41,10 @@ safetensors file with `safe_open`). Token embedding shape `(49408, 768)`,
 text projection `(768, 768)`. The label table is `(768, 867455) fp32`, norms
 in the 19–93 range — **pre-projection token embeddings**, not the final
 512-D text embedding (so the projection head runs on them at query time).
+*(CORRECTION 2026-09-11: the columns ARE the final image-space text
+embeddings — `bioclip.predict.create_probabilities` does
+`img_features @ txt_features` directly with no projection. The ~800
+all-zero placeholder columns are the exception; norm-check before use.)*
 
 So the 5.1 GB of "BioCLIP" splits as:
 
