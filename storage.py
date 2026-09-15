@@ -728,11 +728,15 @@ def cluster_summary(
     most recent capture time in the cluster (lets the FilterCards UI
     sort by "latest" so clusters with recent photos bubble to the top).
 
-    The representative is the asset in the cluster with the highest top-1
-    BioCLIP score (ties broken by captured_at DESC then filename ASC).
-    The representative pool is tier-scoped — when `plantae` is set, the
-    sample comes from among the same assets counted in `n`, so a
-    non-plant thumbnail doesn't bleed into a plants-only cluster card.
+    The representative is the person-free asset in the cluster with the
+    highest top-1 BioCLIP score (ties broken by captured_at DESC then
+    filename ASC): has_person=1 photos sort LAST, so a card only ever
+    shows a people photo when the cluster has no person-free photo at
+    all. has_person IS NULL (not yet scanned) is treated as person-free,
+    same as the grid's people filter. The representative pool is
+    tier-scoped — when `plantae` is set, the sample comes from among
+    the same assets counted in `n`, so a non-plant thumbnail doesn't
+    bleed into a plants-only cluster card.
 
     `plantae` narrows both the count and the representative so card
     counts reconcile with the grid breadcrumb for the same facet.
@@ -795,7 +799,13 @@ def cluster_summary(
              AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
               AND {inner_pred}
-            ORDER BY p.score IS NULL ASC, p.score DESC,
+            -- Person-free photos first: a card thumbnail should never
+            -- be a people photo while the cluster has a plant-only one
+            -- available. has_person IS NULL (not yet scanned) counts as
+            -- person-free; only an explicit 1 is demoted, matching the
+            -- grid's people filter semantics. Fall through to score etc.
+            ORDER BY CASE WHEN a2.has_person = 1 THEN 1 ELSE 0 END ASC,
+                     p.score IS NULL ASC, p.score DESC,
                      a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_asset_id,
@@ -807,7 +817,13 @@ def cluster_summary(
              AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
               AND {inner_pred}
-            ORDER BY p.score IS NULL ASC, p.score DESC,
+            -- Person-free photos first: a card thumbnail should never
+            -- be a people photo while the cluster has a plant-only one
+            -- available. has_person IS NULL (not yet scanned) counts as
+            -- person-free; only an explicit 1 is demoted, matching the
+            -- grid's people filter semantics. Fall through to score etc.
+            ORDER BY CASE WHEN a2.has_person = 1 THEN 1 ELSE 0 END ASC,
+                     p.score IS NULL ASC, p.score DESC,
                      a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_thumbnail_url,
@@ -819,7 +835,13 @@ def cluster_summary(
              AND p.rank = 'species' AND p.position = 0
             WHERE a2.cluster_id = a.cluster_id
               AND {inner_pred}
-            ORDER BY p.score IS NULL ASC, p.score DESC,
+            -- Person-free photos first: a card thumbnail should never
+            -- be a people photo while the cluster has a plant-only one
+            -- available. has_person IS NULL (not yet scanned) counts as
+            -- person-free; only an explicit 1 is demoted, matching the
+            -- grid's people filter semantics. Fall through to score etc.
+            ORDER BY CASE WHEN a2.has_person = 1 THEN 1 ELSE 0 END ASC,
+                     p.score IS NULL ASC, p.score DESC,
                      a2.captured_at DESC, a2.original_file_name ASC
             LIMIT 1
           ) AS sample_original_file_name
@@ -3909,13 +3931,14 @@ def get_global_taxonomy_summary(
             family[r["family"]] = {"n": (family.get(r["family"]) or {"n": 0})["n"] + r["n"],
                                    "latest": _max_iso(family.get(r["family"], {}).get("latest"), r["latest_captured_at"])}
 
-    # Per (rank, name): the asset with the best (score DESC, filename ASC)
-    # top-1 prediction — used as the card thumbnail.
+    # Per (rank, name): the asset with the best (person-free first, then
+    # score DESC, filename ASC) top-1 prediction — used as the card
+    # thumbnail. Same people-demotion rule as cluster_summary.
     sample_rows = conn.execute(
         f"""
         SELECT p.species, p.genus, p.family,
                p.asset_id, p.score,
-               a.original_file_name, a.thumbnail_url
+               a.original_file_name, a.thumbnail_url, a.has_person
         FROM predictions p
         JOIN assets a ON a.asset_id = p.asset_id
         WHERE p.rank = 'species' AND p.position = 0 AND {tier_pred}
@@ -3923,19 +3946,24 @@ def get_global_taxonomy_summary(
         params,
     ).fetchall()
 
-    # best[rank][name] = (score, filename, asset_id, thumbnail_url).
-    # Pick highest score; tie-break by filename ASC for stability.
+    # best[rank][name] = sort key (has_person, -score, filename) plus
+    # payload (asset_id, thumbnail_url). Minimum key wins: person-free
+    # (0/NULL) before people (1), then highest score, filename ASC for
+    # stability — same rule as cluster_summary's SQL ORDER BY.
     best: dict[str, dict[str, tuple]] = {"species": {}, "genus": {}, "family": {}}
     for r in sample_rows:
-        entry = (r["score"], r["original_file_name"] or "",
+        entry = (1 if r["has_person"] == 1 else 0,
+                 -(r["score"] or 0.0), r["original_file_name"] or "",
                  r["asset_id"], r["thumbnail_url"])
         for rank, col in (("species", "species"), ("genus", "genus"), ("family", "family")):
             name = r[col]
             if not name:
                 continue
             prev = best[rank].get(name)
-            if prev is None or entry > prev:
+            if prev is None or entry < prev:
                 best[rank][name] = entry
+
+    _EMPTY = (None, None, None, None, None)
 
     def to_list(d: dict[str, dict], rank: str) -> list[dict]:
         return [
@@ -3943,9 +3971,9 @@ def get_global_taxonomy_summary(
                 "name": k,
                 "n": v["n"],
                 "latest_captured_at": v["latest"],
-                "sample_asset_id": (best[rank].get(k) or (None, None, None, None))[2],
-                "sample_thumbnail_url": (best[rank].get(k) or (None, None, None, None))[3],
-                "sample_original_file_name": (best[rank].get(k) or (None, None, None, None))[1],
+                "sample_asset_id": (best[rank].get(k) or _EMPTY)[3],
+                "sample_thumbnail_url": (best[rank].get(k) or _EMPTY)[4],
+                "sample_original_file_name": (best[rank].get(k) or _EMPTY)[2],
             }
             for k, v in sorted(d.items(), key=lambda kv: (-kv[1]["n"], kv[0]))
         ]
