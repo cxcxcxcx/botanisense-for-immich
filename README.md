@@ -275,6 +275,19 @@ status, logs) is fetched per-component, with one SSE connection
 
 ---
 
+## Roadmap
+
+Where BotaniSense is headed (direction, not a commitment or timeline):
+
+- **BotaniSense app and cloud sync.** An optional companion app that
+  can sync your photos to the cloud and unlock more powerful
+  cloud-side features — see [botanisense.app](https://botanisense.app).
+- **A smaller, faster model.** Plant identification without the
+  multi-gigabyte disk and memory footprint and long initial waits —
+  quicker to set up and light enough to run on phones and small devices.
+
+---
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test, and commit
