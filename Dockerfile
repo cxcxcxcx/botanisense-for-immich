@@ -70,7 +70,8 @@ RUN python -c "from ultralytics import YOLOWorld; m = YOLOWorld('yolov8s-world.p
 
 COPY --from=frontend /build/dist frontend/dist
 COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
-     knn.py knn_io.py immich_client.py run.py yolo.py face.py ./
+     knn.py knn_io.py immich_client.py run.py yolo.py face.py \
+     mobile_engine.py yolo_gemini1.py ./
 # YuNet face weights — face.py loads by bare filename from the CWD
 # (same read-only-/app constraint as yolov8s-world.pt above).
 COPY face_detection_yunet_2023mar.onnx ./

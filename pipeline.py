@@ -49,6 +49,15 @@ from immich_client import ImmichAsset, ImmichClient
 _LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo", "knn", "face")
 
 
+def _yolo_backend_module() -> str:
+    """Detection backend chosen once per process: 'world' (default) is
+    the YOLO-World open-vocab module; 'gemini1' is the trained potted-
+    plant seg model served through ONNX (yolo_gemini1). Both expose the
+    same get_model()/unload_model()/detect() interface."""
+    backend = (os.environ.get("YOLO_BACKEND") or "world").strip().lower()
+    return "yolo_gemini1" if backend == "gemini1" else "yolo"
+
+
 def __getattr__(name: str):  # PEP 562
     if name == "TreeOfLifeClassifier":
         from bioclip.predict import TreeOfLifeClassifier
@@ -63,9 +72,11 @@ def __getattr__(name: str):  # PEP 562
         globals()["clusters"] = _clusters
         return _clusters
     if name == "yolo":
-        import yolo as _yolo
-        globals()["yolo"] = _yolo
-        return _yolo
+        import importlib
+
+        module = importlib.import_module(_yolo_backend_module())
+        globals()["yolo"] = module
+        return module
     if name == "face":
         import face as _face
         globals()["face"] = _face
@@ -188,15 +199,37 @@ _clf_cache: "object | None" = None  # TreeOfLifeClassifier instance, lazily
 
 
 def _resolve_classifier() -> "object | None":
-    """Return the cached TreeOfLifeClassifier, instantiating on first
-    call. Returns the same instance for the lifetime of the process so
-    BioCLIP weights stay mmap'd and the second-onwards n_new>0 runs
-    don't pay the load cost again."""
+    """Return the cached classifier for the selected ENGINE, instantiating
+    on first call. Returns the same instance for the lifetime of the
+    process so model weights stay loaded and the second-onwards n_new>0
+    runs don't pay the load cost again.
+
+    ENGINE=teacher (default) → TreeOfLifeClassifier (BioCLIP-2, ~6 GB).
+    ENGINE=mobile-* → MobileEngine (BioCLIP-Mobile ONNX package + label
+    table, ~1.2 GB; see mobile_engine.py). Both satisfy the same
+    duck-type surface, so every stage below is engine-agnostic."""
     global _clf_cache
     if _clf_cache is not None:
         return _clf_cache
     with _clf_lock:
         if _clf_cache is None:
+            from mobile_engine import resolve_engine_name
+
+            if resolve_engine_name().startswith("mobile"):
+                from mobile_engine import MobileEngine
+
+                _t0 = time.monotonic()
+                engine = MobileEngine()
+                _log.info(
+                    "[model] ENGINE=%s  package=%s  version=%s  "
+                    "(loaded in %.1fs; session builds on first use)",
+                    resolve_engine_name(),
+                    engine.package_dir,
+                    engine.version_key(),
+                    time.monotonic() - _t0,
+                )
+                _clf_cache = engine
+                return _clf_cache
             _TreeOfLifeClassifier = globals()["TreeOfLifeClassifier"]
             # The load (and on first use ever, the ~4.3 GB download)
             # takes minutes with no callback of our own — say so, or the
@@ -743,7 +776,19 @@ def _classify_features(
 _PIL_DRAFT_SIZE = 448  # ~2x the model's 224px input — decode-cheap
 
 
-def _decode_preview(blob: bytes) -> Image.Image:
+def _yolo_decode_size() -> int:
+    """Preview decode cap for the detection stages. YOLO-World squashes
+    to 224 internally (the 448 draft decode is already generous), but
+    gemini1 letterboxes to 960 and was trained/gated at that size —
+    upsampling a 448 decode would blur small boxes away. Each backend
+    module declares its own cap; the default is the BioCLIP draft size."""
+    import importlib
+
+    mod = importlib.import_module(_yolo_backend_module())
+    return int(getattr(mod, "DECODE_PREVIEW_MAX_SIZE", _PIL_DRAFT_SIZE))
+
+
+def _decode_preview(blob: bytes, max_size: int = _PIL_DRAFT_SIZE) -> Image.Image:
     """Decode a downloaded preview for BioCLIP — in memory only; raw
     photos are never written to disk.
 
@@ -755,15 +800,18 @@ def _decode_preview(blob: bytes) -> Image.Image:
     search stage's real bottleneck, invisible in every thread/MKL
     profile. `draft` downscales during JPEG decode; `thumbnail` caps
     whatever survives (WebP ignores draft).
+
+    `max_size` lets the detection stages request a larger decode (see
+    _yolo_decode_size) — BioCLIP callers keep the cheap default.
     """
     img = Image.open(_io.BytesIO(blob))
     try:
-        img.draft("RGB", (_PIL_DRAFT_SIZE, _PIL_DRAFT_SIZE))
+        img.draft("RGB", (max_size, max_size))
     except Exception:
         pass
     img = img.convert("RGB")
-    if max(img.size) > _PIL_DRAFT_SIZE:
-        img.thumbnail((_PIL_DRAFT_SIZE, _PIL_DRAFT_SIZE), Image.BILINEAR)
+    if max(img.size) > max_size:
+        img.thumbnail((max_size, max_size), Image.BILINEAR)
     return img
 
 
@@ -2357,10 +2405,13 @@ def run_pipeline(
             del kingdom_assets
 
             # BioCLIP's stages are done (bbox-bioclip reloads it later).
-            # Free ~5-6 GB before YOLO loads so the two models never
+            # Free the encoder before YOLO loads so the two models never
             # coexist — see _unload_classifier.
             if clf is not None:
-                _log.info("[model] unloading BioCLIP (done until bbox)")
+                _log.info(
+                    "[model] unloading %s classifier (done until bbox)",
+                    type(clf).__name__,
+                )
                 _unload_classifier()
                 clf = None
 
@@ -2407,7 +2458,12 @@ def run_pipeline(
                         # Lazy: don't import YOLOWorld until we actually
                         # need it.
                         if not yolo_model_loaded:
-                            _log.info("[yolo] loading YOLOv8s-world weights")
+                            _log.info(
+                                "[yolo] loading detection backend %s "
+                                "(YOLO_BACKEND=%s)",
+                                _yolo_backend_module(),
+                                os.environ.get("YOLO_BACKEND", "world"),
+                            )
                             _yolo.get_model()
                             yolo_model_loaded = True
 
@@ -2426,7 +2482,9 @@ def run_pipeline(
                                     f"/api/assets/{asset.id}/thumbnail"
                                     f"?size={THUMBNAIL_SIZE}"
                                 )
-                                pil_images.append(_decode_preview(blob))
+                                pil_images.append(
+                                    _decode_preview(blob, _yolo_decode_size())
+                                )
                                 todo_ok.append((_k, asset))
                             except Exception as e:
                                 _log.warning(
@@ -2612,7 +2670,8 @@ def run_pipeline(
                                     client.download_bytes(
                                         f"/api/assets/{aid}/thumbnail"
                                         f"?size={THUMBNAIL_SIZE}"
-                                    )
+                                    ),
+                                    _yolo_decode_size(),
                                 ))
                                 chunk_ok.append((aid, _ts))
                             except Exception as e:
@@ -3078,7 +3137,8 @@ def run_person_backfill(
                                 client.download_bytes(
                                     f"/api/assets/{aid}/thumbnail"
                                     f"?size={THUMBNAIL_SIZE}"
-                                )
+                                ),
+                                _yolo_decode_size(),
                             ))
                             chunk_ok.append((aid, _ts))
                         except Exception as e:

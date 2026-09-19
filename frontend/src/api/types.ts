@@ -358,11 +358,23 @@ export interface HealthDb {
   path?: string;
   size_bytes?: number;
 }
+// Which inference engine this instance runs (pipeline ENGINE env).
+// 'teacher' = BioCLIP-2 (production default); 'mobile-*' = BioCLIP-Mobile
+// package (compose.s0.yml A/B instance). Only non-teacher engines get a
+// header badge so two side-by-side tabs are distinguishable.
+export interface HealthEngine {
+  id?: string;
+  yolo_backend?: string;
+  package?: string | null;
+  code_rev?: string | null;
+  error?: string | null;
+}
 export interface Health {
   immich?: HealthImmich;
   api_key?: HealthApiKey;
   knn?: HealthKnn;
   bioclip?: HealthBioclip;
+  engine?: HealthEngine;
   db?: HealthDb;
 }
 

@@ -1,5 +1,7 @@
 import { navigate, topLevel, type View } from '../hooks/useRoute';
 import { useApp } from '../state/AppContext';
+import { getHealth } from '../api/endpoints';
+import type { HealthEngine } from '../api/types';
 import { useEffect, useState } from 'react';
 
 // Inline BotaniSense brand mark — same fan-of-blades SVG used by
@@ -60,6 +62,21 @@ export function Header({ view }: Props) {
     try { localStorage.setItem('botanisense:theme', theme); } catch { /* ignore */ }
   }, [theme]);
 
+  // Engine badge (A/B instances). Fetched once — the engine is fixed
+  // for the life of the container. Teacher (production default) renders
+  // nothing; a mobile/A-B instance gets a small marker so two browser
+  // tabs (:8770 vs :8771) are distinguishable at a glance.
+  const [engine, setEngine] = useState<HealthEngine | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    getHealth().then(
+      (h) => { if (!cancelled) setEngine(h.engine ?? null); },
+      () => { /* health unreachable — badge simply stays off */ },
+    );
+    return () => { cancelled = true; };
+  }, []);
+  const isMobileEngine = !!engine?.id && engine.id.startsWith('mobile');
+
   return (
     <header className="sticky top-0 z-50 bg-bg/95 backdrop-blur flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
       {/* Brand identity: bare fan-of-blades SVG (no gradient ring).
@@ -81,10 +98,18 @@ export function Header({ view }: Props) {
         </span>
       </a>
 
-      {/* Right-side group: tab strip only.
+      {/* Right-side group: tab strip + optional engine badge.
           The KNN-unavailable indicator lives in the Run page (KnnAlert
           banner at the top), not here — keeping the header simple. */}
       <div className="flex items-center gap-2 ml-auto">
+        {isMobileEngine && (
+          <span
+            className="hidden sm:inline-flex items-center gap-1 text-[0.65rem] uppercase tracking-wider text-accent border border-accent/40 rounded px-1.5 py-[2px]"
+            title={`Engine: ${engine?.id}${engine?.package ? ` (${engine.package})` : ''} · detector: ${engine?.yolo_backend ?? 'world'}`}
+          >
+            S0 mobile
+          </span>
+        )}
         <div className="inline-flex gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
           <button
             role="tab"

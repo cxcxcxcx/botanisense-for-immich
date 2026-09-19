@@ -1621,8 +1621,37 @@ async def health() -> dict:
             "weights_present": bioclip_weights,
             "cache_path": str(bioclip_dir),
         },
+        "engine": _engine_health(),
         "db": {"ok": db_ok, "path": DB_PATH, "size_bytes": db_size},
     }
+
+
+def _yolo_backend_name() -> str:
+    """Detection backend id — mirrors pipeline._yolo_backend_module's
+    env contract without importing pipeline (cheap, read-only)."""
+    backend = (os.environ.get("YOLO_BACKEND") or "world").strip().lower()
+    return backend or "world"
+
+
+def _engine_health() -> dict:
+    """Which inference engine this instance is configured for — read
+    from env + the package manifest only, never constructing a model.
+    Lets the SPA show an engine badge so two A/B instances (teacher
+    :8770 vs mobile :8771) are distinguishable at a glance."""
+    from mobile_engine import default_package_dir, resolve_engine_name
+
+    engine = resolve_engine_name()
+    info: dict = {"id": engine, "yolo_backend": _yolo_backend_name()}
+    if engine.startswith("mobile"):
+        manifest_path = Path(default_package_dir()) / "manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            info["package"] = manifest.get("package")
+            info["code_rev"] = manifest.get("code_rev")
+        except (OSError, ValueError):
+            info["package"] = None
+            info["error"] = "manifest unreadable"
+    return info
 
 
 @app.get("/api/config")

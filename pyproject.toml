@@ -26,6 +26,11 @@ dependencies = [
     "faiss-cpu>=1.8",
     "duckdb>=1.0",
     "pyarrow>=25.0.0",
+    # ENGINE=mobile-* (mobile_engine.py) + YOLO_BACKEND=gemini1
+    # (yolo_gemini1.py). Both import it lazily — a production container
+    # with neither env var set never loads it, but it must ship so the
+    # A/B compose file (compose.s0.yml) works from the same image.
+    "onnxruntime>=1.20",
     # tomllib is stdlib in 3.11+. The 3.10 fallback is gated by the
     # python_version marker below — only installed when running 3.10.
     "tomli>=2.0; python_version < '3.11'",

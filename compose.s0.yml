@@ -1,0 +1,46 @@
+# BotaniSense for Immich — S0-engine A/B instance (EXPERIMENTAL).
+#
+# Runs a SECOND container next to production with the BioCLIP-Mobile S0
+# package as the classification engine and the trained gemini1_seg
+# detector instead of YOLO-World, against a SHADOW database
+# (data/ab/state.db — created by scripts/setup_shadow_ab.py). The
+# production container (botanisense, :8770) keeps the BioCLIP-2 teacher
+# and its own DB; this file never touches it.
+#
+#   python scripts/setup_shadow_ab.py            # build the shadow DB
+#   docker compose -f compose.s0.yml up --build -d
+#   → http://localhost:8771
+#
+# Runbook + teardown: docs/mobile_engine_ab.md. The shadow DB is
+# throwaway — NEVER copy it back over the production state.db.
+
+services:
+  botanisense-s0:
+    build: .
+    container_name: botanisense-s0
+    restart: unless-stopped
+    ports:
+      - "8771:8765"
+    environment:
+      # Whole-app DB switch: server + run worker + derived files
+      # (logs, near-dup cache) all hang off DB_PATH.parent — that's
+      # what makes the shadow database a one-env-var affair.
+      DB_PATH: /app/data/ab/state.db
+      # Engine selection (pipeline._resolve_classifier) + detection
+      # backend (pipeline._yolo_backend_module). Unset both on the
+      # production container → teacher + YOLO-World, byte-identical
+      # behavior.
+      ENGINE: mobile-v0
+      MOBILE_PACKAGE: /app/models/bioclip-mobile-v0
+      YOLO_BACKEND: gemini1
+      YOLO_GEMINI1_ONNX: /app/models/gemini1_seg_best.fp16.onnx
+      # The person-veto logistic head was trained on teacher vectors —
+      # meaningless against S0 embeddings. Point it at a missing path:
+      # _load_person_clf() degrades to "veto disabled" with a log line.
+      PERSON_CLF_PATH: /app/models/disabled-person-clf.joblib
+    volumes:
+      - ./data:/app/data
+      # Model files are gitignored (45 MB + 5 MB) — bind them
+      # read-only instead of baking them into the image.
+      - ./data/models:/app/models:ro
+      - /etc/localtime:/etc/localtime:ro
