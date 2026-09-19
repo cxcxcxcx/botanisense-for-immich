@@ -42,6 +42,7 @@ rows are overwritten on the next pass for that asset.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -3123,7 +3124,14 @@ def enrich_with_knn(
 # 0.99 is a strict threshold tuned for BioCLIP-2 768-d L2-normalized
 # vectors: identical-looking JPEGs round to ≥0.99 even when the bytes
 # differ slightly (re-encoding, EXIF, etc.).
-NEAR_DUP_THRESHOLD = 0.97  # cosine: 0.99 = exact dup, 0.97 ≈ same plant/slightly different angle
+NEAR_DUP_THRESHOLD = float(
+    os.environ.get("NEAR_DUP_THRESHOLD", "0.97")
+)  # cosine: 0.99 = exact dup, 0.97 ≈ same plant/slightly different angle.
+# 0.97 was calibrated on TEACHER (BioCLIP-2) geometry. Distilled student
+# embeddings (ENGINE=mobile-*) compress variance — more distinct photos
+# land within 0.97 — so the S0 A/B instance raises this via env (compose
+# sets NEAR_DUP_THRESHOLD=0.99) or the grid hides ~37% of photos as
+# "near-dups" vs teacher's ~9%.
 
 
 def compute_near_dup_groups(
@@ -3225,7 +3233,11 @@ def invalidate_global_near_dup_cache() -> None:
 def save_near_dup_cache(path: str | Path) -> None:
     """Pickle the current near-dup map to `path`. ~1 MB for 19k assets.
     Safe to call when the cache is populated; no-op if it's None (the
-    pipeline-end warm should populate then save)."""
+    pipeline-end warm should populate then save).
+
+    Wraps the map with the threshold it was computed at, so changing
+    NEAR_DUP_THRESHOLD (e.g. the S0 instance's env override) invalidates
+    the on-disk cache instead of silently reusing the wrong grouping."""
     if _GLOBAL_NEAR_DUP_CACHE is None:
         return
     p = Path(path)
@@ -3234,15 +3246,17 @@ def save_near_dup_cache(path: str | Path) -> None:
     # doesn't leave a half-baked pickle that the loader would reject.
     tmp = p.with_suffix(p.suffix + ".tmp")
     import pickle
+    payload = {"threshold": NEAR_DUP_THRESHOLD, "groups": _GLOBAL_NEAR_DUP_CACHE}
     with open(tmp, "wb") as f:
-        pickle.dump(_GLOBAL_NEAR_DUP_CACHE, f, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     tmp.replace(p)
 
 
 def load_near_dup_cache(path: str | Path) -> dict[str, list[str]] | None:
     """Load a previously-saved near-dup map. Returns None if the file
-    doesn't exist, is missing/wrong-version, or fails to unpickle (e.g.
-    because the embeddings table changed)."""
+    doesn't exist, was computed at a different NEAR_DUP_THRESHOLD, is
+    missing/wrong-version, or fails to unpickle (e.g. because the
+    embeddings table changed)."""
     p = Path(path)
     if not p.exists():
         return None
@@ -3250,9 +3264,21 @@ def load_near_dup_cache(path: str | Path) -> dict[str, list[str]] | None:
         import pickle
         with open(p, "rb") as f:
             cache = pickle.load(f)
-        # Sanity: dict[str, list[str]]
         if not isinstance(cache, dict):
             return None
+        # New format: {"threshold": float, "groups": {...}} — reject a
+        # map built at a different threshold, it would silently
+        # over/under-collapse.
+        if "groups" in cache:
+            if cache.get("threshold") != NEAR_DUP_THRESHOLD:
+                return None
+            cache = cache["groups"]
+        # else: legacy plain {asset_id: [siblings]} — only ever written
+        # at the 0.97 default, so it's valid whenever the threshold is
+        # still the default.
+        elif NEAR_DUP_THRESHOLD != 0.97:
+            return None
+        # Sanity: dict[str, list[str]]
         if any(not isinstance(v, list) for v in cache.values()):
             return None
         return cache
