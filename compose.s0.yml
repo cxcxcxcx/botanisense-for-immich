@@ -25,13 +25,13 @@ services:
       # Whole-app DB switch: server + run worker + derived files
       # (logs, near-dup cache) all hang off DB_PATH.parent — that's
       # what makes the shadow database a one-env-var affair.
-      DB_PATH: /app/data/ab/state.db
+      DB_PATH: /app/data/ab/state_v2.db
       # Engine selection (pipeline._resolve_classifier) + detection
       # backend (pipeline._yolo_backend_module). Unset both on the
       # production container → teacher + YOLO-World, byte-identical
       # behavior.
-      ENGINE: mobile-v0
-      MOBILE_PACKAGE: /app/models/bioclip-mobile-v0
+      ENGINE: mobile-v2
+      MOBILE_PACKAGE: /app/models/bioclip-mobile-v2
       YOLO_BACKEND: gemini1
       YOLO_GEMINI1_ONNX: /app/models/gemini1_seg_best.fp16.onnx
       # The person-veto logistic head was trained on teacher vectors —
