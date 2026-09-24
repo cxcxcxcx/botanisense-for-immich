@@ -25,6 +25,15 @@ letterbox），对着一个**影子数据库**重算全库。浏览器开 :8770 
   库里的 embeddings/predictions 全部作废——都是 768 维，pipeline 的 dim guard
   **分不出**两个模型。setup 脚本负责清空，换版本时**必须重跑 setup**，否则下一次
   run 会吃到旧版本的缓存（实测：v2 首跑只新算了 25 张、其余全走 v0 缓存）。
+- **缓存键 = 有没有 embedding，不是 kingdom 分数。** 物种阶段复用规则只有一条：
+  该资产存了向量**且**维度对上（`vec.shape[0] == expected_dim`）就直接用；没有向量
+  = cache miss，当场重下缩略图、重编码。注意 dim 对所有手机模型都是 768，
+  dim guard 是必要非充分条件——版本身份**完全**靠（一）独立 DB 文件、（二）setup
+  清掉 model 侧行（embeddings / knn_predictions / 非 kingdom taxon_scores）来保证，
+  没有第三道锁。kingdom 行是 teacher 算的、模型无关，唯一允许继承的行。
+- **日志里 `cached=` 是 kingdom 门**（已有 kingdom 分 → 跳过 EXIF 回源），不是
+  embedding 复用，更不是缩略图缓存。缩略图没有任何缓存：只要走到编码，
+  每次跑每次下。读日志时不要把 search 阶段的 `cached=32 predict=0` 当成"没干活"。
 - 预处理契约（golden 对拍实锤）：**torchvision `Resize(256, BILINEAR)` + CenterCrop(256)
   + ToTensor(/255)**。manifest 旧文案写 "bicubic" 是笔误（已改 export 脚本与两份交接
   文档）；PIL-bicubic 手写实现会把 embedding cosine 从 ~.99999 拉到 ~.9989。

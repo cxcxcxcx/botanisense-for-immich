@@ -19,6 +19,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import concurrent.futures
 import io as _io
 import tempfile
 import time
@@ -813,6 +814,44 @@ def _decode_preview(blob: bytes, max_size: int = _PIL_DRAFT_SIZE) -> Image.Image
     if max(img.size) > max_size:
         img.thumbnail((max_size, max_size), Image.BILINEAR)
     return img
+
+
+def fetch_thumbs(client, jobs, tag: str, max_size: int | None = None) -> tuple[dict, set]:
+    """Download + decode thumbnails in parallel (IO-bound threads).
+
+    `jobs`: iterable of (key, asset_id). Returns ({key: PIL}, {dead keys}).
+    Semantics match the old serial loops: per-asset containment (warn +
+    skip), no rows for dead assets. Thumbnails are uncached everywhere,
+    so every stage (kingdom/species/yolo) pays this — keep it shared.
+    """
+    jobs = list(jobs)
+    out: dict = {}
+    dead: set = set()
+
+    def _one(job):
+        key, aid = job
+        try:
+            blob = client.download_bytes(
+                f"/api/assets/{aid}/thumbnail"
+                f"?size={THUMBNAIL_SIZE}"
+            )
+            img = _decode_preview(blob) if max_size is None else _decode_preview(blob, max_size)
+            return (key, img, None)
+        except Exception as e:  # noqa: BLE001 — containment
+            return (key, None, e)
+
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(16, max(4, len(jobs)))) as ex:
+        for key, pil, err in ex.map(_one, jobs):
+            if err is not None:
+                dead.add(key)
+                _log.warning(
+                    "[%s] %s: %s: %s — skipping asset",
+                    tag, key, type(err).__name__, err,
+                )
+            else:
+                out[key] = pil
+    return out, dead
 
 
 _KINGDOM_BIN_CACHE: dict[int, tuple] = {}
@@ -2044,24 +2083,16 @@ def run_pipeline(
                     # same asset on every retry, forever. Skip the asset
                     # this chunk; no cache rows are written for it, so the
                     # next run picks it up again.
-                    dead: set[str] = set()
+                    dead: set = set()
                     pil_by_aid: dict = {}
-                    for k in range(i, j):
-                        asset = needs_bioclip[k]
-                        if asset.id in stored_vecs:
-                            continue
-                        try:
-                            blob = client.download_bytes(
-                                f"/api/assets/{asset.id}/thumbnail"
-                                f"?size={THUMBNAIL_SIZE}"
-                            )
-                            pil_by_aid[asset.id] = _decode_preview(blob)
-                        except Exception as e:
-                            dead.add(asset.id)
-                            _log.warning(
-                                "[species] %s: %s: %s — skipping asset",
-                                asset.id, type(e).__name__, e,
-                            )
+                    todo = [needs_bioclip[k] for k in range(i, j)
+                            if needs_bioclip[k].id not in stored_vecs]
+                    got, dead_ids = fetch_thumbs(
+                        client,
+                        [(a.id, a.id) for a in todo],
+                        "species")
+                    pil_by_aid.update(got)
+                    dead.update(dead_ids)
                     if dead:
                         chunk_indices = [
                             k for k in chunk_indices
@@ -2326,22 +2357,17 @@ def run_pipeline(
                     else:
                         encode_positions.append(pos)
                 if encode_positions:
-                    pil_by_pos: dict = {}
-                    for pos in list(encode_positions):
-                        try:
-                            blob = client.download_bytes(
-                                f"/api/assets/{chunk_assets[pos].id}/thumbnail"
-                                f"?size={THUMBNAIL_SIZE}"
-                            )
-                            pil_by_pos[pos] = _decode_preview(blob)
-                        except Exception as e:
-                            # Skip the asset, keep the run alive; nothing
-                            # was cached for it so the next run retries.
-                            _log.warning(
-                                "[kingdom] %s: %s: %s — skipping asset",
-                                chunk_assets[pos].id, type(e).__name__, e,
-                            )
-                            encode_positions.remove(pos)
+                    pos_of = {chunk_assets[p].id: p for p in encode_positions}
+                    got, dead_aids = fetch_thumbs(
+                        client,
+                        [(aid, aid) for aid in pos_of],
+                        "kingdom")
+                    for aid in sorted(dead_aids, key=pos_of.get):
+                        # Skip the asset, keep the run alive; nothing
+                        # was cached for it so the next run retries.
+                        encode_positions.remove(pos_of[aid])
+                    pil_by_pos = {pos_of[aid]: pil
+                                  for aid, pil in got.items()}
                     pil_images = [pil_by_pos[p] for p in encode_positions]
                 if encode_positions:
                     try:
@@ -2474,23 +2500,16 @@ def run_pipeline(
                         # decoded in memory. Per-asset errors skip just
                         # that asset (mark_yolo_scanned isn't reached,
                         # so the next run retries it).
-                        pil_images = []
-                        todo_ok = []
+                        got, dead = fetch_thumbs(
+                            client,
+                            [(asset.id, asset.id) for _, asset in todo],
+                            "yolo", max_size=_yolo_decode_size())
+                        todo_ok, pil_images = [], []
                         for _k, asset in todo:
-                            try:
-                                blob = client.download_bytes(
-                                    f"/api/assets/{asset.id}/thumbnail"
-                                    f"?size={THUMBNAIL_SIZE}"
-                                )
-                                pil_images.append(
-                                    _decode_preview(blob, _yolo_decode_size())
-                                )
-                                todo_ok.append((_k, asset))
-                            except Exception as e:
-                                _log.warning(
-                                    "[yolo] %s: %s: %s — skipping asset",
-                                    asset.id, type(e).__name__, e,
-                                )
+                            if asset.id in dead:
+                                continue
+                            todo_ok.append((_k, asset))
+                            pil_images.append(got[asset.id])
                         todo = todo_ok
                         detections = (
                             _yolo.detect(pil_images, conf=yolo_conf)

@@ -105,13 +105,21 @@ class MobileEngine:
 
     # ---------- identity -------------------------------------------------
 
+    def _encoder_path(self) -> Path:
+        """Which ONNX graph to serve. fp32 on CPU: x86 has no fast fp16
+        kernels, so the fp16 graph (needed on-device for size) runs ~30%
+        slower server-side (measured 22.3 vs 28.8 img/s batch-16 on the
+        deploy box). All shipped packages carry both graphs."""
+        fp32 = self.package_dir / "encoder.fp32.onnx"
+        return fp32 if fp32.exists() else self.package_dir / "encoder.fp16.onnx"
+
     def version_key(self) -> str:
         """Identity string for logs / album_meta markers: package +
         code_rev + encoder md5 prefix + labels md5 prefix. Changing ANY
         component invalidates every stored embedding/prediction — the
         shadow-DB setup script records this into album_meta."""
         if self._version is None:
-            enc = self.package_dir / "encoder.fp16.onnx"
+            enc = self._encoder_path()
             lab = self.package_dir / "labels.f16.npy"
 
             def _md5(p: Path) -> str:
@@ -134,7 +142,7 @@ class MobileEngine:
         if self._session is None:
             import onnxruntime as ort
 
-            model_path = self.package_dir / "encoder.fp16.onnx"
+            model_path = self._encoder_path()
             _log.info(
                 "[model] loading BioCLIP-Mobile ONNX %s (%.1f MB)",
                 model_path, model_path.stat().st_size / 1e6,
