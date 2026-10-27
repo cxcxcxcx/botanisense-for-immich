@@ -20,6 +20,10 @@ scripts/PERSON_CLASSIFIER.md
 # Private: Colab experiment notebooks (reference a personal GCS bucket).
 colab/
 
+# Private: BioTrove vs ToL-10M overlap analysis (hardcoded local cache
+# paths + a 2.5 MB derived CSV). Dev-only, not published.
+docs/biotrove_compare/
+
 # Orphan SQLite files at the repo root (the `data/` directory is already
 # covered by the rule above). `data.state.db` is a real risk: a fresh
 # run drops a ~500 MB file at the root that has nothing to do with
