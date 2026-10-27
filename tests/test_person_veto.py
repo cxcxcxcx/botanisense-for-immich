@@ -2,9 +2,8 @@
 
 The veto flips person-box evidence to has_person=0 when the BioCLIP
 whole-image classifier is CONFIDENTLY negative (p < 0.05) — the
-hand-holding-X class YOLO-World misreads as a big person box
-(docs/person_flag_review_2026-09.md). Missing embedding / missing model
-file never veto.
+hand-holding-X class YOLO-World misreads as a big person box.
+Missing embedding / missing model file never veto.
 """
 
 from __future__ import annotations

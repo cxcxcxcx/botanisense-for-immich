@@ -92,11 +92,10 @@ def __getattr__(name: str):  # PEP 562
 THUMBNAIL_SIZE = "preview"
 DEFAULT_BATCH_SIZE = 16
 
-# Person-flag classifier veto (2026-09-10, docs/person_flag_review_2026-09.md).
-# The box heuristics + YuNet rescue decide "is there person evidence",
-# but YOLO-World reads hand-holding-X photos (ubiquitous in a plant
-# library) as a big `person` box and never emits `hand` — the shape
-# mimicry PERSON_CLASSIFIER.md documents. The BioCLIP whole-image
+# Person-flag classifier veto (2026-09-10). The box heuristics + YuNet
+# rescue decide "is there person evidence", but YOLO-World reads
+# hand-holding-X photos (ubiquitous in a plant library) as a big
+# `person` box and never emits `hand`. The BioCLIP whole-image
 # classifier separates exactly that class: in the review's disagreement
 # sample, every hand-holding-X photo scored p < 0.05 (12/12) while every
 # visually-confirmed real person scored p >= 0.055 (all 19 YuNet-rescued

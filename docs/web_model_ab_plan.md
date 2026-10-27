@@ -114,7 +114,7 @@ UPDATE assets SET cluster_id = NULL;
    `/api/clusters`（簇数、簇名、簇大小）、`/api/asset/{id}`（top-K 与
    kingdom 分）。物种 top-1 的弱真值三选一：(i) 离线 G1 24 类评测（引擎级，
    不经过 app）；(ii) 与 teacher top-1 的一致率（一致性 ≠ 正确率，只测漂移）；
-   (iii) `docs/person_flag_review_2026-09.md` 的 42 条人工判定（has_person）。
+   (iii) 内部 42 条人工判定（has_person；未随仓库发布）。
 6. **对比脚本 outline**（`scripts/ab_compare.py`，只读）：
    两库各开 `file:...?mode=ro` 连接 → 按 `asset_id` 对齐 → 输出表：
    top-1/genus/family 一致率、Plantae 分差与绿/黄档翻转数、
