@@ -114,6 +114,32 @@ uv sync                                 # or: pip install -e .
 cd frontend && npm install
 ```
 
+## End-to-end tests (Playwright)
+
+`npm run e2e` (in `frontend/`) builds the SPA, boots a throwaway
+uvicorn on `:8799` with a fresh SQLite DB and **no** Immich configured,
+starts a stub Immich on `:2284` (`frontend/e2e/fake_immich.py`), and
+drives the real UI in Chromium: first-run wizard, invalid-URL rejection,
+connection save, `/api/health`, run-page routing and theme persistence.
+No model, photo library or Immich instance is needed.
+
+One-time setup: `cd frontend && npx playwright install chromium`.
+CI runs the same suite in the `e2e` job.
+
+To test a release image instead of the working tree, point the suite at
+a fresh container (the stub Immich still runs on the host):
+
+```bash
+docker build -t botanisense:rc .
+docker run --rm -d --name bs-e2e -p 8799:8765 --tmpfs /app/data \
+  --add-host=host.docker.internal:host-gateway botanisense:rc
+cd frontend
+E2E_BASE_URL=http://127.0.0.1:8799 \
+E2E_FAKE_IMMICH_URL=http://host.docker.internal:2284 \
+  npm run e2e
+docker rm -f bs-e2e
+```
+
 ## Production-ish build
 
 ```bash

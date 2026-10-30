@@ -82,6 +82,41 @@ jobs:
 
           docker rm -f smoke
 
+      # Browser e2e against the exact image that will be published.
+      # A FRESH container (tmpfs /app/data) — the first test asserts
+      # "unconfigured". The stub Immich runs on the host; the container
+      # reaches it through host.docker.internal.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Playwright
+        run: |
+          cd frontend
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Browser e2e against the image
+        run: |
+          docker run -d --name e2e -p 8799:8765 --tmpfs /app/data \
+            --add-host=host.docker.internal:host-gateway botanisense:ci
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8799/api/health > /dev/null && break
+            sleep 1
+          done
+          curl -sf http://localhost:8799/api/health > /dev/null || {
+            echo "::error::image never became healthy"
+            docker logs e2e
+            exit 1
+          }
+          cd frontend
+          E2E_BASE_URL=http://127.0.0.1:8799 \
+          E2E_FAKE_IMMICH_URL=http://host.docker.internal:2284 \
+            npx playwright test
+          docker rm -f e2e
+
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
