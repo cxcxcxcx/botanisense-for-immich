@@ -56,6 +56,22 @@ export interface Filters {
   // flips this on. Has no effect when an explicit `plantae` tier is
   // given; `/api/results?include_non_plants=true` mirrors this flag.
   include_non_plants?: boolean | undefined;
+  // Map click-through. A map place is a *geographic* grouping, not one of
+  // the semantic HDBSCAN clusters, so it gets its own filter triple
+  // instead of reusing cluster_id. All three are set together by
+  // LocationMapView; /api/results keeps only assets within `near_radius`
+  // metres of (near_lat, near_lng).
+  near_lat?: number | undefined;
+  near_lng?: number | undefined;
+  near_radius?: number | undefined;
+  // Exact membership of the clicked map place. `near_*` is only a disk and
+  // can also catch an overlapping neighbouring place's photos; the server
+  // recomputes the partition under `place_granularity` + `place_min_photos`
+  // and keeps the members of `place_id`. All four travel together in the
+  // URL so a deep link reproduces the same ids.
+  place_id?: string | undefined;
+  place_granularity?: 'fine' | 'wide' | 'region' | undefined;
+  place_min_photos?: number | undefined;
 }
 
 export interface ModalState {

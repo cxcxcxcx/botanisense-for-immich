@@ -42,6 +42,7 @@ rows are overwritten on the next pass for that asset.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 from contextlib import contextmanager
@@ -50,6 +51,8 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
+import map_clusters
 
 _log = logging.getLogger(__name__)
 
@@ -288,6 +291,30 @@ CREATE TABLE IF NOT EXISTS cluster_albums (
   created_at        TEXT NOT NULL DEFAULT (datetime('now')),
   last_synced_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- Inferred coordinates for no-GPS assets (location_guess.py). Kept apart
+-- from assets.latitude/longitude on purpose:
+--   * assets.* stays exactly what Immich/EXIF said, so a pipeline upsert
+--     (which writes latitude=excluded.latitude) can never erase a guess,
+--     and a real EXIF fix that appears later always wins via COALESCE.
+--   * dropping this table is a complete rollback.
+-- Nothing here is written back to Immich.
+CREATE TABLE IF NOT EXISTS location_guesses (
+  asset_id         TEXT PRIMARY KEY REFERENCES assets(asset_id) ON DELETE CASCADE,
+  latitude         REAL NOT NULL,
+  longitude        REAL NOT NULL,
+  method           TEXT NOT NULL DEFAULT 'interpolate',
+  confidence       TEXT NOT NULL CHECK (confidence IN ('high','medium')),
+  -- Audit trail: the two GPS-tagged photos the interpolation came from.
+  prev_asset_id    TEXT,
+  next_asset_id    TEXT,
+  prev_gap_seconds INTEGER,
+  next_gap_seconds INTEGER,
+  span_meters      REAL,
+  applied_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_location_guesses_confidence
+  ON location_guesses(confidence);
 """
 
 
@@ -3587,12 +3614,11 @@ def _plantae_score_expr(asset_alias: str = "a") -> str:
 _PLANTAE_SCORE = _plantae_score_expr("a")
 
 
-def get_all_results(
-    conn: sqlite3.Connection, *,
-    page: int = 0,
-    page_size: int = 60,
+def _asset_filter_sql(
+    *,
     cluster_id: int | None = None,
     cluster_ids: list[int] | None = None,
+    asset_ids: list[str] | None = None,
     species: str | None = None,
     genus: str | None = None,
     family: str | None = None,
@@ -3601,6 +3627,140 @@ def get_all_results(
     plantae_green: float = 0.60,
     plantae_yellow: float = 0.35,
     include_non_plants: bool = False,
+    near_lat: float | None = None,
+    near_lng: float | None = None,
+    near_radius_m: float | None = 150.0,
+) -> tuple[str, str, list, float | None]:
+    """Build the JOIN / WHERE / params shared by /api/results and the map.
+
+    Both surfaces must agree on what "matches the current filters" means,
+    so the predicate lives in exactly one place. Returns
+    `(joins, where_sql, params, near_radius)`; `near_radius` is the
+    effective click-through radius (None when the near filter is off).
+    """
+    # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
+    # need an INNER JOIN on predictions (position=0); the cluster_id
+    # filter is a plain WHERE on assets.
+    joins = ""
+    where = ["1=1"]
+    params: list = []
+    if cluster_id is not None:
+        where.append("a.cluster_id = ?")
+        params.append(cluster_id)
+    if cluster_ids:
+        # Multi-cluster filter (cluster super-groups — /api/results
+        # cluster_group resolves to this list). Chunked OR'd IN clauses:
+        # SQLITE_MAX_VARIABLE_NUMBER is 999 on older SQLite builds and
+        # the Ungrouped bucket can carry hundreds of cluster ids.
+        chunks = [
+            cluster_ids[i : i + 500] for i in range(0, len(cluster_ids), 500)
+        ]
+        clause = " OR ".join(
+            f"a.cluster_id IN ({','.join('?' for _ in c)})" for c in chunks
+        )
+        where.append(f"({clause})")
+        params.extend(v for c in chunks for v in c)
+    if asset_ids is not None:
+        # Exact set — used by the map's place click-through, where a disk
+        # around the centroid would also catch a neighbouring place's
+        # photos. Chunked for the same SQLite variable limit as above;
+        # an empty set legitimately means "nothing matches".
+        if not asset_ids:
+            where.append("0=1")
+        else:
+            chunks = [asset_ids[i : i + 500] for i in range(0, len(asset_ids), 500)]
+            clause = " OR ".join(
+                f"a.asset_id IN ({','.join('?' for _ in c)})" for c in chunks
+            )
+            where.append(f"({clause})")
+            params.extend(v for c in chunks for v in c)
+    if species is not None:
+        joins += " JOIN predictions p_species ON p_species.asset_id = a.asset_id AND p_species.rank = 'species' AND p_species.position = 0"
+        where.append("p_species.species = ?")
+        params.append(species)
+    if genus is not None:
+        joins += " JOIN predictions p_genus ON p_genus.asset_id = a.asset_id AND p_genus.rank = 'species' AND p_genus.position = 0"
+        where.append("p_genus.genus = ?")
+        params.append(genus)
+    if family is not None:
+        joins += " JOIN predictions p_family ON p_family.asset_id = a.asset_id AND p_family.rank = 'species' AND p_family.position = 0"
+        where.append("p_family.family = ?")
+        params.append(family)
+    if has_person is not None:
+        # 0 or 1 — excludes unscanned (NULL) rows in both cases.
+        where.append("a.has_person = ?")
+        params.append(has_person)
+    if plantae == "plant":
+        where.append(f"{_PLANTAE_SCORE} >= ?")
+        params.append(plantae_green)
+    elif plantae == "uncertain":
+        where.append(f"{_PLANTAE_SCORE} >= ? AND {_PLANTAE_SCORE} < ?")
+        params.append(plantae_yellow)
+        params.append(plantae_green)
+    elif plantae == "non_plant":
+        # Explicit selection always wins — even with include_non_plants
+        # off, asking for non_plant returns non_plant rows.
+        where.append(f"{_PLANTAE_SCORE} < ?")
+        params.append(plantae_yellow)
+    elif not include_non_plants:
+        # No explicit plantae filter + include_non_plants is off → the
+        # all-view scopes to plant photos (same yellow-floor boundary
+        # as clusters.CLUSTER_PLANTAE_MIN). When the user does opt in
+        # via include_non_plants=True, no Plantae WHERE is added and
+        # the all-view returns every photo as before.
+        where.append(f"{_PLANTAE_SCORE} >= ?")
+        params.append(plantae_yellow)
+
+    # Map click-through: "photos at this place". A SQL bounding box does the
+    # cheap pruning; the exact haversine cut happens in Python after the
+    # fetch (SQLite has no trig unless built with math functions). The box is
+    # widened in longitude by 1/cos(lat) so it can never under-select at
+    # high latitudes.
+    near_radius = None
+    if near_lat is not None and near_lng is not None:
+        near_radius = max(1.0, float(near_radius_m or 150.0))
+        dlat = near_radius / map_clusters.METERS_PER_DEGREE_LAT
+        cos_lat = max(0.01, math.cos(math.radians(min(abs(near_lat) + 1.0, 89.0))))
+        dlng = near_radius / (map_clusters.METERS_PER_DEGREE_LAT * cos_lat)
+        # Effective location: a real Exif fix wins; a locally inferred
+        # coordinate stands in otherwise, so a place's grid includes the
+        # same photos the map marker counted.
+        joins += " LEFT JOIN location_guesses lg ON lg.asset_id = a.asset_id"
+        where.append(
+            "COALESCE(a.latitude, lg.latitude) IS NOT NULL"
+            " AND COALESCE(a.longitude, lg.longitude) IS NOT NULL"
+            " AND COALESCE(a.latitude, lg.latitude) BETWEEN ? AND ?"
+            " AND COALESCE(a.longitude, lg.longitude) BETWEEN ? AND ?"
+        )
+        params.extend([
+            near_lat - dlat,
+            near_lat + dlat,
+            near_lng - dlng,
+            near_lng + dlng,
+        ])
+
+    where_sql = " AND ".join(where)
+    return joins, where_sql, params, near_radius
+
+
+def get_all_results(
+    conn: sqlite3.Connection, *,
+    page: int = 0,
+    page_size: int = 60,
+    cluster_id: int | None = None,
+    cluster_ids: list[int] | None = None,
+    asset_ids: list[str] | None = None,
+    species: str | None = None,
+    genus: str | None = None,
+    family: str | None = None,
+    has_person: int | None = None,
+    plantae: str | None = None,
+    plantae_green: float = 0.60,
+    plantae_yellow: float = 0.35,
+    include_non_plants: bool = False,
+    near_lat: float | None = None,
+    near_lng: float | None = None,
+    near_radius_m: float | None = 150.0,
 ) -> tuple[list[dict], int, int]:
     """Return (page_of_buckets, total_reps, total_assets).
 
@@ -3648,77 +3808,43 @@ def get_all_results(
       Set True to restore the legacy behavior of including every
       photo. Has no effect when `plantae` is given explicitly.
     """
-    # Build the WHERE / JOIN clauses dynamically. The taxonomy filters
-    # need an INNER JOIN on predictions (position=0); the cluster_id
-    # filter is a plain WHERE on assets.
-    joins = ""
-    where = ["1=1"]
-    params: list = []
-    if cluster_id is not None:
-        where.append("a.cluster_id = ?")
-        params.append(cluster_id)
-    if cluster_ids:
-        # Multi-cluster filter (cluster super-groups — /api/results
-        # cluster_group resolves to this list). Chunked OR'd IN clauses:
-        # SQLITE_MAX_VARIABLE_NUMBER is 999 on older SQLite builds and
-        # the Ungrouped bucket can carry hundreds of cluster ids.
-        chunks = [
-            cluster_ids[i : i + 500] for i in range(0, len(cluster_ids), 500)
-        ]
-        clause = " OR ".join(
-            f"a.cluster_id IN ({','.join('?' for _ in c)})" for c in chunks
-        )
-        where.append(f"({clause})")
-        params.extend(v for c in chunks for v in c)
-    if species is not None:
-        joins += " JOIN predictions p_species ON p_species.asset_id = a.asset_id AND p_species.rank = 'species' AND p_species.position = 0"
-        where.append("p_species.species = ?")
-        params.append(species)
-    if genus is not None:
-        joins += " JOIN predictions p_genus ON p_genus.asset_id = a.asset_id AND p_genus.rank = 'species' AND p_genus.position = 0"
-        where.append("p_genus.genus = ?")
-        params.append(genus)
-    if family is not None:
-        joins += " JOIN predictions p_family ON p_family.asset_id = a.asset_id AND p_family.rank = 'species' AND p_family.position = 0"
-        where.append("p_family.family = ?")
-        params.append(family)
-    if has_person is not None:
-        # 0 or 1 — excludes unscanned (NULL) rows in both cases.
-        where.append("a.has_person = ?")
-        params.append(has_person)
-    if plantae == "plant":
-        where.append(f"{_PLANTAE_SCORE} >= ?")
-        params.append(plantae_green)
-    elif plantae == "uncertain":
-        where.append(f"{_PLANTAE_SCORE} >= ? AND {_PLANTAE_SCORE} < ?")
-        params.append(plantae_yellow)
-        params.append(plantae_green)
-    elif plantae == "non_plant":
-        # Explicit selection always wins — even with include_non_plants
-        # off, asking for non_plant returns non_plant rows.
-        where.append(f"{_PLANTAE_SCORE} < ?")
-        params.append(plantae_yellow)
-    elif not include_non_plants:
-        # No explicit plantae filter + include_non_plants is off → the
-        # all-view scopes to plant photos (same yellow-floor boundary
-        # as clusters.CLUSTER_PLANTAE_MIN). When the user does opt in
-        # via include_non_plants=True, no Plantae WHERE is added and
-        # the all-view returns every photo as before.
-        where.append(f"{_PLANTAE_SCORE} >= ?")
-        params.append(plantae_yellow)
-
-    where_sql = " AND ".join(where)
+    joins, where_sql, params, near_radius = _asset_filter_sql(
+        cluster_id=cluster_id,
+        cluster_ids=cluster_ids,
+        asset_ids=asset_ids,
+        species=species,
+        genus=genus,
+        family=family,
+        has_person=has_person,
+        plantae=plantae,
+        plantae_green=plantae_green,
+        plantae_yellow=plantae_yellow,
+        include_non_plants=include_non_plants,
+        near_lat=near_lat,
+        near_lng=near_lng,
+        near_radius_m=near_radius_m,
+    )
 
     # Fetch ALL matching assets (no LIMIT/OFFSET) so we can apply
     # near-dup dedup BEFORE pagination. Pagination is done in Python
-    # below on the deduped set.
+    # below on the deduped set. When the near filter is active the helper
+    # joined location_guesses, so carry the inferred coordinates for the
+    # exact haversine cut below.
+    guess_cols = (
+        ", lg.latitude AS guess_latitude, lg.longitude AS guess_longitude"
+        if near_radius is not None else ""
+    )
     all_filtered = conn.execute(
         f"""
         SELECT a.asset_id, a.original_file_name, a.original_url,
                a.thumbnail_url, a.cluster_id,
                a.first_seen_at,
                a.captured_at, a.latitude, a.longitude,
-               a.has_person, a.plantae_override,
+               a.has_person, a.plantae_override{guess_cols},
+               CASE WHEN a.latitude IS NULL AND EXISTS (
+                 SELECT 1 FROM location_guesses lgx
+                 WHERE lgx.asset_id = a.asset_id
+               ) THEN 1 ELSE 0 END AS location_guessed,
                (SELECT sr.rank_position
                   FROM search_results sr
                   WHERE sr.asset_id = a.asset_id
@@ -3733,6 +3859,19 @@ def get_all_results(
         """,
         params,
     ).fetchall()
+
+    if near_radius is not None:
+        def _effective_coords(row):
+            if row["latitude"] is not None and row["longitude"] is not None:
+                return row["latitude"], row["longitude"]
+            return row["guess_latitude"], row["guess_longitude"]
+
+        all_filtered = [
+            r for r in all_filtered
+            if map_clusters.haversine_meters(
+                near_lat, near_lng, *_effective_coords(r)
+            ) <= near_radius
+        ]
 
     if not all_filtered:
         return [], 0, 0
@@ -3863,6 +4002,11 @@ def get_all_results(
             "captured_at": r["captured_at"],
             "latitude": r["latitude"],
             "longitude": r["longitude"],
+            # 1 when the plotted position is a local inference from
+            # location_guesses, 0 when it came from EXIF/Immich. Per-photo
+            # provenance; the map deliberately does NOT colour clusters by
+            # this because a place is a mix of individual photos.
+            "location_guessed": r["location_guessed"],
             # has_person: 0/1/NULL — drives the "has person" filter
             # chip. NULL means the person stage hasn't scanned this
             # asset yet, so it appears in no filter and is hidden by
@@ -3889,6 +4033,175 @@ def get_all_results(
     enrich_with_knn(conn, buckets)
 
     return buckets, total_reps, total_assets
+
+
+def get_geo_assets(
+    conn: sqlite3.Connection, *,
+    cluster_id: int | None = None,
+    cluster_ids: list[int] | None = None,
+    species: str | None = None,
+    genus: str | None = None,
+    family: str | None = None,
+    has_person: int | None = None,
+    plantae: str | None = None,
+    plantae_green: float = 0.60,
+    plantae_yellow: float = 0.35,
+    include_non_plants: bool = False,
+    guessed: str = "include",
+) -> list[dict]:
+    """Lightweight filtered asset coordinates for the map view.
+
+    Same predicates as `get_all_results` (via `_asset_filter_sql`), but only
+    the columns location clustering needs. Deliberately does NOT run
+    near-dup dedup: a marker's "N photos" must match the grid's
+    `pagination.total` after a click-through, and the grid's total counts
+    every file, not one representative per duplicate group. Skipping the
+    prediction/taxon joins and the embedding-based dedup also keeps the
+    first map request cheap (~50 ms vs seconds).
+
+    `guessed` controls locally inferred coordinates (location_guesses):
+      include — real Exif fix wins, otherwise the guess (default)
+      exclude — real coordinates only
+      only    — guessed coordinates only (review mode)
+    Each returned row carries `guessed` (1/0) so the map can style the
+    marker and report how many of its photos are inferred.
+
+    Rows without any coordinates are returned with NULL latitude/longitude;
+    the caller counts them as "unlocated" so the UI can say how many photos
+    cannot be plotted.
+    """
+    joins, where_sql, params, _near_radius = _asset_filter_sql(
+        cluster_id=cluster_id,
+        cluster_ids=cluster_ids,
+        species=species,
+        genus=genus,
+        family=family,
+        has_person=has_person,
+        plantae=plantae,
+        plantae_green=plantae_green,
+        plantae_yellow=plantae_yellow,
+        include_non_plants=include_non_plants,
+    )
+    if guessed not in ("include", "exclude", "only"):
+        guessed = "include"
+    if guessed == "exclude":
+        join = ""
+        extra = ""
+        columns = (
+            "a.latitude AS latitude, a.longitude AS longitude,"
+            " 0 AS guessed"
+        )
+    else:
+        join = " LEFT JOIN location_guesses lg ON lg.asset_id = a.asset_id"
+        if guessed == "only":
+            extra = " AND lg.asset_id IS NOT NULL"
+            columns = (
+                "lg.latitude AS latitude, lg.longitude AS longitude,"
+                " 1 AS guessed"
+            )
+        else:
+            extra = ""
+            columns = (
+                "COALESCE(a.latitude, lg.latitude) AS latitude,"
+                " COALESCE(a.longitude, lg.longitude) AS longitude,"
+                " CASE WHEN a.latitude IS NULL AND lg.asset_id IS NOT NULL"
+                " THEN 1 ELSE 0 END AS guessed"
+            )
+    rows = conn.execute(
+        f"""
+        SELECT a.asset_id, {columns}, a.captured_at
+        FROM assets a {joins}{join}
+        WHERE {where_sql}{extra}
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_assets_for_location_guess(conn: sqlite3.Connection) -> list[dict]:
+    """All assets with the columns the guesser needs.
+
+    Deliberately raw `assets.*` coordinates — the guesser must only look at
+    real Exif fixes as anchors, never at previous guesses (otherwise a second
+    run would chain guesses and drift).
+    """
+    rows = conn.execute(
+        "SELECT asset_id, captured_at, latitude, longitude FROM assets"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def replace_location_guesses(
+    conn: sqlite3.Connection, guesses: list[dict]
+) -> int:
+    """Replace the whole guess set atomically.
+
+    Recompute-then-swap rather than incremental updates: the partition
+    depends on the full timeline, so a partial update can leave stale
+    neighbours. DELETE + INSERT runs in the caller's transaction.
+    """
+    conn.execute("DELETE FROM location_guesses")
+    conn.executemany(
+        """
+        INSERT INTO location_guesses (
+          asset_id, latitude, longitude, method, confidence,
+          prev_asset_id, next_asset_id, prev_gap_seconds, next_gap_seconds,
+          span_meters
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                g["asset_id"],
+                g["latitude"],
+                g["longitude"],
+                g.get("method", "interpolate"),
+                g["confidence"],
+                g.get("prev_asset_id"),
+                g.get("next_asset_id"),
+                g.get("prev_gap_seconds"),
+                g.get("next_gap_seconds"),
+                g.get("span_meters"),
+            )
+            for g in guesses
+        ],
+    )
+    return len(guesses)
+
+
+def clear_location_guesses(conn: sqlite3.Connection) -> int:
+    cur = conn.execute("DELETE FROM location_guesses")
+    return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+
+
+def get_location_guess_stats(
+    conn: sqlite3.Connection, *, plantae_yellow: float = 0.35
+) -> dict:
+    """Counts for the map panel. Shadowed guesses don't count.
+
+    A guess is only effective while `assets.latitude` is still NULL; if a
+    later Immich/EXIF sync supplied the real fix, COALESCE prefers it and
+    the guess is inert.
+    """
+    row = conn.execute(
+        f"""
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN g.confidence = 'high' THEN 1 ELSE 0 END), 0) AS high,
+               COALESCE(SUM(CASE WHEN g.confidence = 'medium' THEN 1 ELSE 0 END), 0) AS medium,
+               MAX(g.applied_at) AS last_applied,
+               COALESCE(SUM(CASE WHEN {_PLANTAE_SCORE} >= ? THEN 1 ELSE 0 END), 0) AS plants
+        FROM location_guesses g
+        JOIN assets a ON a.asset_id = g.asset_id
+        WHERE a.latitude IS NULL
+        """,
+        (plantae_yellow,),
+    ).fetchone()
+    return {
+        "total": int(row["total"] or 0),
+        "high": int(row["high"] or 0),
+        "medium": int(row["medium"] or 0),
+        "plants": int(row["plants"] or 0),
+        "last_applied": row["last_applied"],
+    }
 
 
 def get_global_taxonomy_summary(

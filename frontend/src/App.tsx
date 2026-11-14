@@ -3,6 +3,7 @@ import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
+import { LocationMapView } from './components/LocationMapView';
 import { Modal } from './components/Modal';
 import { AssetDetail } from './components/AssetDetail';
 import { ParamsForm } from './components/ParamsForm';
@@ -40,6 +41,7 @@ export function App() {
   // Disabled while typing in an input (handled by the hook itself).
   useKeyboardShortcuts([
     { key: 'b', label: 'b', action: () => navigate('browse-list') },
+    { key: 'm', label: 'm', action: () => navigate('map') },
     { key: 'r', label: 'r', action: () => navigate('run') },
     { key: '?', label: '?', action: () => setShowShortcuts(s => !s) },
   ]);
@@ -58,7 +60,8 @@ export function App() {
     filters.supergroup != null ||
     !!filters.species ||
     !!filters.genus ||
-    !!filters.family;
+    !!filters.family ||
+    filters.near_lat != null;
 
   // On mount, hydrate the reducer from URL (and fall back to localStorage).
   useEffect(() => {
@@ -94,7 +97,7 @@ export function App() {
   // and the URL bar shows the current view.
   useEffect(() => {
     const h = window.location.hash.replace(/^#/, '').trim();
-    if (h !== 'browse' && h !== 'browse/content' && h !== 'run') {
+    if (h !== 'browse' && h !== 'browse/content' && h !== 'map' && h !== 'run') {
       window.location.hash = '#browse';
     }
   }, []);
@@ -182,6 +185,8 @@ export function App() {
               </div>
             </section>
           </section>
+        ) : view === 'map' ? (
+          <LocationMapView />
         ) : view === 'browse-content' ? (
           <>
             <ClusterAlbumBar />

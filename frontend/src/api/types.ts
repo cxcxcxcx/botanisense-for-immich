@@ -98,6 +98,10 @@ export interface ResultRow {
   captured_at: string | null;
   latitude: number | null;
   longitude: number | null;
+  // 1 when the effective position came from a local inference
+  // (location_guesses) rather than EXIF/Immich. Per-photo provenance;
+  // the map marks these individual thumbnails, not whole clusters.
+  location_guessed?: number | null;
   rank: number | null;
   top_predictions: Prediction[];
   taxon_scores: Record<string, number>;
@@ -482,7 +486,85 @@ export interface ResultsQuery {
   // grid scopes to Plantae >= plantae_yellow (same boundary as the
   // HDBSCAN cluster policy).
   include_non_plants?: boolean | undefined;
+  // Map click-through: keep only assets within `near_radius` metres of
+  // (near_lat, near_lng). All three must be present for the filter to
+  // apply; the map view passes a cluster's centroid + its `radius_m`.
+  near_lat?: number | undefined;
+  near_lng?: number | undefined;
+  near_radius?: number | undefined;
   [k: string]: string | number | boolean | undefined;
+}
+
+// --- Map view ------------------------------------------------------------
+// One place from /api/map/clusters: geotagged photos grouped by distance
+// alone (see map_clusters.py). `radius_m` is the farthest member from the
+// centroid (+5 m), and is what the UI sends back as `near_radius` so a
+// marker click opens exactly that place's photos.
+export interface MapCluster {
+  id: string;
+  latitude: number;
+  longitude: number;
+  count: number;
+  radius_m: number;
+  sample_asset_id: string | null;
+  // ISO capture timestamps (min/max among members), null when no member
+  // has EXIF time.
+  start: string | null;
+  end: string | null;
+  // Temporal runs (gaps > 7 days) inside this place — "3 visits".
+  visits: number;
+  // Photos in this place whose coordinate was inferred locally from
+  // temporal neighbours (location_guesses), not read from EXIF.
+  guessed_count: number;
+}
+
+export interface MapClustersResponse {
+  granularity: 'fine' | 'wide' | 'region';
+  radius_m: number;
+  // Photos currently plotted (places >= min_photos), and every photo with
+  // GPS before that cut (single-photo places are a toggle in the UI).
+  photo_count: number;
+  located_photos: number;
+  // Photos whose plotted coordinate came from location_guesses.
+  guessed_photos: number;
+  cluster_count: number;
+  singleton_places: number;
+  unlocated: number;
+  total_assets: number;
+  clusters: MapCluster[];
+}
+
+export interface MapClustersQuery {
+  granularity?: 'fine' | 'wide' | 'region';
+  min_photos?: number;
+  cluster_id?: number | undefined;
+  cluster_group?: number | undefined;
+  species?: string | undefined;
+  genus?: string | undefined;
+  family?: string | undefined;
+  has_person?: 0 | 1 | undefined;
+  plantae?: 'plant' | 'non_plant' | 'uncertain' | undefined;
+  include_non_plants?: boolean | undefined;
+  // Locally inferred coordinates: include (default), exclude, or only.
+  guessed?: 'include' | 'exclude' | 'only';
+  [k: string]: string | number | boolean | undefined;
+}
+
+export interface LocationGuessStats {
+  total: number;
+  high: number;
+  medium: number;
+  plants: number;
+  last_applied: string | null;
+}
+
+export interface LocationGuessApplyResult extends LocationGuessStats {
+  dry_run: boolean;
+  computed: number;
+  computed_high: number;
+  computed_medium: number;
+  window_minutes: number;
+  max_span_m: number;
 }
 
 export interface RunParams {

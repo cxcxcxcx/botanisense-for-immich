@@ -117,4 +117,22 @@ test.describe('first-run journey', () => {
     await page.reload();
     await expect(html).toHaveAttribute('data-theme', want);
   });
+
+  test('map tab renders with an empty library', async ({ page }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', e => pageErrors.push(e.message));
+
+    await page.goto('/');
+    await page.getByRole('tab', { name: 'Map' }).click();
+
+    await expect(
+      page.getByRole('region', { name: 'Photo map' }),
+    ).toBeVisible();
+    // The empty DB has no geotagged assets, so the map must explain that
+    // instead of rendering a blank tile sheet.
+    await expect(page.getByText('No geotagged photos')).toBeVisible({
+      timeout: 10_000,
+    });
+    expect(pageErrors).toEqual([]);
+  });
 });

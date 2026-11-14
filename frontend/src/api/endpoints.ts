@@ -21,6 +21,10 @@ import type {
   KnnRow,
   KnnStatus,
   KingdomAlbumStatus,
+  LocationGuessApplyResult,
+  LocationGuessStats,
+  MapClustersQuery,
+  MapClustersResponse,
   PipelineStatus,
   PublicConfig,
   PurgeMissingPreview,
@@ -44,6 +48,32 @@ export const getAsset     = (id: string) =>
 
 export const getClusters  = (plantae?: 'plant' | 'non_plant' | 'uncertain') =>
   fetchJson<ClustersResponse>('/api/clusters', { query: { plantae } });
+
+// Places on the map. Same filter surface as /api/results (minus
+// pagination/sort) so a filtered browse can be viewed geographically.
+// `min_photos` defaults to 2 server-side — pass 1 for the "show
+// single-photo places" toggle.
+export const getMapClusters = (q: MapClustersQuery) =>
+  fetchJson<MapClustersResponse>('/api/map/clusters', { query: q });
+
+// ---- Inferred locations (local only) ------------------------------------
+// Coordinates guessed from GPS-tagged temporal neighbours. Stored in the
+// local SQLite DB; never written back to Immich. The map reads them through
+// COALESCE(real, guess), so a real EXIF fix always wins.
+
+export const getLocationGuesses = () =>
+  fetchJson<LocationGuessStats>('/api/location/guesses');
+
+export const applyLocationGuesses = (
+  p: { dry_run?: boolean; window_minutes?: number; max_span_m?: number } = {},
+) =>
+  fetchJson<LocationGuessApplyResult>('/api/location/guesses/apply', {
+    method: 'POST',
+    query: p,
+  });
+
+export const clearLocationGuesses = () =>
+  fetchJson<{ cleared: number }>('/api/location/guesses', { method: 'DELETE' });
 
 // Super-groups of clusters (the hierarchy level above clusters). Same
 // cached pipeline as /api/clusters server-side, so counts reconcile.

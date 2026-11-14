@@ -4,6 +4,33 @@ All notable changes to BotaniSense for Immich are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project does **not** follow Semantic Versioning until v1.0.
 
+## Unreleased
+
+### Features
+
+- **Map view.** New `#map` tab plots geotagged assets on an
+  OpenStreetMap/Leaflet map, grouped into places by distance alone
+  (150 m / 1 km / 10 km, optionally including single-photo places).
+  Ported from the Solar app's location clustering. `GET /api/map/clusters`
+  returns the place partition under the same filters as `/api/results`.
+  A marker click opens a photo sheet over the map (thumbnails, "Load more",
+  "Open in grid"); "Open in grid" uses exact membership (`place_id`) so the
+  marker count and the grid total agree. Markers are uniform green sized by
+  photo count; inferred positions are shown per photo (small amber dot in
+  the place sheet), never as a cluster colour. The **Map tab is independent**
+  of the Browse filters; the new map pin in a filtered grid opens the same
+  component as a **scoped modal**. Switching
+  radius keeps the current viewport; a Fit button re-frames. `/api/results`
+  also gained `near_lat/near_lng/near_radius` disk filtering. Requires no
+  tile API key.
+- **Locally inferred locations.** For cameras without built-in GPS, the
+  map can interpolate coordinates from GPS-tagged photos within ±15
+  minutes / 1 km (`location_guesses` table; anchors recorded for audit).
+  Local only: `assets.latitude/longitude` and Immich are never modified,
+  real EXIF wins via `COALESCE`, inferred markers are amber, and the map
+  panel can recompute or clear the set. Script:
+  `scripts/guess_locations.py`.
+
 ## 0.1.0 — 2026-09-15
 
 First public release. The codebase has been under active private

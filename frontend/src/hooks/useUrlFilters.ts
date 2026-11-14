@@ -73,6 +73,24 @@ export function parseUrlFilters(search: string = window.location.search): Filter
   if (sp.get('include_non_plants') === '1' || sp.get('include_non_plants') === 'true') {
     f.include_non_plants = true;
   }
+  // Map click-through. A partial triple is meaningless (a centre without a
+  // radius would silently filter by a default box), so require lat + lng;
+  // radius defaults to the fine place radius.
+  const nearLat = num(sp.get('near_lat'));
+  const nearLng = num(sp.get('near_lng'));
+  if (nearLat != null && nearLng != null) {
+    f.near_lat = nearLat;
+    f.near_lng = nearLng;
+    f.near_radius = num(sp.get('near_radius')) ?? 150;
+  }
+  // Exact place membership; only meaningful alongside the near triple.
+  const place = sp.get('place');
+  if (place && nearLat != null && nearLng != null) {
+    f.place_id = place;
+    const pg = sp.get('place_gran');
+    f.place_granularity = pg === 'wide' ? 'wide' : pg === 'region' ? 'region' : 'fine';
+    f.place_min_photos = num(sp.get('place_min')) ?? 2;
+  }
   return f;
 }
 
@@ -94,6 +112,16 @@ export function buildUrl(f: Filters): string {
   // Only emit when true — the default-off policy shouldn't pollute the
   // URL with a redundant `include_non_plants=0`.
   if (f.include_non_plants) sp.set('include_non_plants', '1');
+  if (f.near_lat != null && f.near_lng != null) {
+    sp.set('near_lat', String(f.near_lat));
+    sp.set('near_lng', String(f.near_lng));
+    sp.set('near_radius', String(f.near_radius ?? 150));
+    if (f.place_id) {
+      sp.set('place', f.place_id);
+      sp.set('place_gran', f.place_granularity ?? 'fine');
+      sp.set('place_min', String(f.place_min_photos ?? 2));
+    }
+  }
   if (f.page) sp.set('page', String(f.page));
   return `?${sp.toString()}`;
 }
@@ -113,7 +141,9 @@ export function initialFilters(): Filters {
       && fromUrl.cluster_id == null && fromUrl.supergroup == null
       && !fromUrl.species && !fromUrl.genus && !fromUrl.family
       && fromUrl.has_person == null && fromUrl.plantae == null
-      && !fromUrl.include_non_plants) {
+      && !fromUrl.include_non_plants
+      && fromUrl.near_lat == null && fromUrl.near_lng == null
+      && fromUrl.place_id == null) {
     return readPersisted(DEFAULT_FILTERS);
   }
   return fromUrl;
@@ -140,6 +170,20 @@ export function useUrlFilters() {
       if (!('genus' in patch)) next.genus = undefined;
       if (!('family' in patch)) next.family = undefined;
       next.page = 0;
+    }
+    // Picking a taxonomy/cluster card leaves the map place — otherwise the
+    // grid would stay scoped to the old neighbourhood and the new card
+    // would look empty. A patch that explicitly sets a near triple (the
+    // map click) is exempt.
+    const groupKeys = ['cluster_id', 'supergroup', 'species', 'genus', 'family'] as const;
+    const setsGroupKey = groupKeys.some((k) => k in patch);
+    if (setsGroupKey && !('near_lat' in patch)) {
+      next.near_lat = undefined;
+      next.near_lng = undefined;
+      next.near_radius = undefined;
+      next.place_id = undefined;
+      next.place_granularity = undefined;
+      next.place_min_photos = undefined;
     }
     // has_person changes (including toggling off) re-paginate to 0 so
     // the user lands on page 1 of the new result set.

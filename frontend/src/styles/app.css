@@ -478,6 +478,16 @@
   .knn-ref-more        { @apply text-[10px] text-fg-2 pt-1; }
 }
 
+/* Leaflet's default #ddd background shows through as grey bands when a
+   wide set of markers is fitted into a tall/narrow (mobile) viewport.
+   OSM's own water colour makes that dead space read as ocean instead. */
+/* Doubled class: Leaflet's own `.leaflet-container{background:#ddd}` is
+   emitted later in the bundle (component import order), so a single
+   class would lose the cascade. */
+.leaflet-container.leaflet-container {
+  background: #aad3df;
+}
+
 /* Tailwind utility escape hatches — for the handful of cases where a
    utility class is the wrong tool. Most custom CSS lived in this file
    before the migration; with Tailwind, this layer should stay empty

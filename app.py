@@ -47,6 +47,8 @@ from pydantic import BaseModel
 import storage
 from immich_client import ImmichClient, ImmichProbeError
 import clusters
+import location_guess
+import map_clusters
 if TYPE_CHECKING:
     import numpy as np
 import pipeline  # full module — the SSE generator reads pipeline._log_file_path
@@ -287,7 +289,11 @@ _classifier = None
 # the pipeline commits results per batch, and without the TTL the
 # first mid-run request pinned its (usually empty) payload for the
 # entire multi-hour run. Values are (payload, monotonic_ts) tuples.
-_RESULTS_CACHE_MAX = 8
+# 12, not 8: the map view's place payloads share this LRU with the grid's
+# result payloads, and map entries are small (a dict per place, not a row
+# per photo). Keeping a few of each avoids thrashing the grid cache while
+# the user flips granularity.
+_RESULTS_CACHE_MAX = 12
 _RESULTS_CACHE_RUNNING_TTL = 10.0
 _results_cache: "OrderedDict[str, tuple[dict, float]]" = OrderedDict()
 _results_lock = threading.Lock()
@@ -300,6 +306,10 @@ _results_lock = threading.Lock()
 # pattern. Invalidated when a pipeline run completes.
 _clusters_cache: dict[tuple, dict] = {}
 _clusters_cache_lock = threading.Lock()
+
+# Serialises "recompute inferred locations": it replaces the whole guess
+# table, so two concurrent runs could interleave DELETE/INSERT.
+_location_guess_lock = threading.Lock()
 
 # Centroid vectors per cluster (see clusters.cluster_centroids) backing
 # /api/clusters/related. One global entry — like the payload cache above
@@ -455,6 +465,14 @@ def _invalidate_results_cache(prefix: str = "all:") -> None:
         for k in list(_results_cache):
             if k.startswith(prefix) or k == bare:
                 _results_cache.pop(k, None)
+        # The map view derives from the same rows. Every "all:" invalidation
+        # (run finished, KNN reclassify, purge, refit, external script) has
+        # to drop its separately-keyed entries too, or a marker keeps
+        # pointing at a photo that no longer exists.
+        if prefix.startswith("all:"):
+            for k in list(_results_cache):
+                if k.startswith("map:"):
+                    _results_cache.pop(k, None)
 
 # Pipeline runs execute in a child process so BioCLIP's ~5.5 GB resident
 # memory never lives in uvicorn. The child writes status to a JSON file
@@ -1999,8 +2017,209 @@ async def cache_invalidate(prefix: str = Query(default="all:")) -> dict:
     keeps serving the pre-update payload until it is restarted.
     """
     _invalidate_results_cache(prefix)
+    # The map view derives from the same DB rows; a script that just wrote
+    # new assets/predictions must not leave a stale place list behind.
+    _invalidate_results_cache("map:")
     _invalidate_clusters_cache()
     return {"invalidated_prefix": prefix}
+
+
+@app.get("/api/location/guesses")
+async def get_location_guesses() -> dict:
+    """Stats for the locally inferred coordinates (location_guesses).
+
+    Nothing here touches Immich. `total` counts guesses that are still
+    effective (assets.latitude is still NULL); a real fix that arrived later
+    shadows the guess automatically.
+    """
+    def _read() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            return storage.get_location_guess_stats(
+                conn, plantae_yellow=PLANTAE_YELLOW
+            )
+
+    return await asyncio.to_thread(_read)
+
+
+@app.post("/api/location/guesses/apply")
+async def apply_location_guesses(
+    dry_run: bool = Query(default=False),
+    # Same defaults as the dry-run analysis: both sides within 15 min and
+    # the reference points within 1 km. Loosening either turns "same place"
+    # into "same day" and the interpolation stops being defensible.
+    window_minutes: int = Query(default=15, ge=1, le=1440),
+    max_span_m: float = Query(default=1000.0, ge=10, le=100_000),
+) -> dict:
+    """Recompute inferred coordinates from GPS-tagged temporal neighbours.
+
+    Local only: writes `location_guesses`, never `assets.latitude` and never
+    Immich. Idempotent — replaces the previous set, so it is also the
+    "refresh after new photos" action.
+    """
+
+    def _run() -> dict:
+        with _location_guess_lock:
+            with storage.connect(DB_PATH) as conn:
+                rows = storage.get_assets_for_location_guess(conn)
+                guesses = location_guess.compute_guesses(
+                    rows,
+                    window_seconds=window_minutes * 60,
+                    max_span_m=max_span_m,
+                )
+                high = sum(1 for g in guesses if g["confidence"] == "high")
+                medium = len(guesses) - high
+                if not dry_run:
+                    storage.replace_location_guesses(conn, guesses)
+                stats = storage.get_location_guess_stats(
+                    conn, plantae_yellow=PLANTAE_YELLOW
+                ) if not dry_run else {}
+        return {
+            "dry_run": dry_run,
+            "computed": len(guesses),
+            "computed_high": high,
+            "computed_medium": medium,
+            "window_minutes": window_minutes,
+            "max_span_m": max_span_m,
+            **stats,
+        }
+
+    result = await asyncio.to_thread(_run)
+    if not dry_run:
+        # Both /api/results and /api/map/clusters read through these rows.
+        _invalidate_results_cache("all:")
+    return result
+
+
+@app.delete("/api/location/guesses")
+async def clear_location_guesses() -> dict:
+    """Delete every inferred coordinate (complete local rollback)."""
+    def _run() -> int:
+        with _location_guess_lock:
+            with storage.connect(DB_PATH) as conn:
+                return storage.clear_location_guesses(conn)
+
+    cleared = await asyncio.to_thread(_run)
+    _invalidate_results_cache("all:")
+    return {"cleared": cleared}
+
+
+@app.get("/api/map/clusters")
+async def get_map_clusters(
+    # Same radius semantics as Solar's location mode: `fine` = one place per
+    # venue (150 m), `wide` = one place per ~1 km neighbourhood. A radius is
+    # the whole difference — there is no nested hierarchy.
+    granularity: str = Query(default="fine", pattern="^(fine|wide|region)$"),
+    # One-off places would otherwise add thousands of same-size dots to a
+    # large library. The UI's "show single-photo places" toggle refetches
+    # with min_photos=1.
+    min_photos: int = Query(default=2, ge=1, le=500),
+    # The same filter surface as /api/results, minus pagination/sort. The
+    # map is a view of the current browse filters ("map of this cluster"),
+    # so counts always reconcile with the grid.
+    cluster_id: int | None = Query(default=None),
+    cluster_group: int | None = Query(default=None, ge=0),
+    species: str | None = Query(default=None),
+    genus: str | None = Query(default=None),
+    family: str | None = Query(default=None),
+    has_person: int | None = Query(default=None, ge=0, le=1),
+    plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
+    include_non_plants: bool = Query(default=False),
+    # Locally inferred coordinates (location_guesses). `include` prefers a
+    # real EXIF fix and falls back to the guess; `exclude` is the old
+    # EXIF-only behaviour; `only` is a review mode.
+    guessed: str = Query(default="include", pattern="^(include|exclude|only)$"),
+) -> dict:
+    """Places on a map: geotagged assets grouped by distance alone.
+
+    Location mode is the counterpart to the (semantic) HDBSCAN clusters the
+    Browse cards show. A place is a running-centroid grouping: photos within
+    `radius` of the nearest existing place centroid join it, otherwise they
+    start a new place. Time never splits a place — a park visited in May and
+    October is still one marker — it only orders the walk and counts visits.
+
+    Photos without GPS are counted in `unlocated` (they cannot be plotted);
+    `(0, 0)` EXIF placeholders count as missing.
+
+    Response: `{granularity, radius_m, photo_count, located_photos,
+    cluster_count, singleton_places, unlocated, total_assets, clusters:
+    [{id, latitude, longitude, count, radius_m, sample_asset_id, start,
+    end, visits}]}`. `photo_count` is what is plotted at this
+    `min_photos`; `located_photos` is every photo with a usable fix.
+    `radius_m` on a cluster is its largest member distance from the centroid
+    (+5 m padding). The UI passes the centroid + radius to /api/results as
+    `near_*` (title + coarse disk) and the cluster `id` as `place_id`
+    (exact membership). `guessed_count` / `guessed_photos` report how many
+    coordinates came from location_guesses (never written to Immich).
+    """
+    radius_m, id_prefix = {
+        "fine": (map_clusters.PLACE_RADIUS_FINE_M, "loc-"),
+        "wide": (map_clusters.PLACE_RADIUS_WIDE_M, "loc-wide-"),
+        "region": (map_clusters.PLACE_RADIUS_REGION_M, "loc-region-"),
+    }[granularity]
+    # Shares the /api/results LRU so a run ending invalidates both, and a
+    # pipeline-active TTL stops the map pinning mid-run counts.
+    cache_key = (
+        f"map:g={granularity}:mp={min_photos}:cid={cluster_id}:cg={cluster_group}"
+        f":sp={species}:ge={genus}:fa={family}:hp={has_person}"
+        f":pl={plantae}:inp={int(include_non_plants)}:gss={guessed}"
+    )
+    cached = _results_cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    # Resolve a super-group to its member clusters exactly like /api/results.
+    cluster_ids_filter: list[int] | None = None
+    if cluster_group is not None:
+        group_members, ungrouped = await _cluster_group_index()
+        cluster_ids_filter = _resolve_group_clusters(
+            cluster_group, group_members, ungrouped
+        )
+        if not cluster_ids_filter:
+            return {
+                "granularity": granularity,
+                "radius_m": radius_m,
+                "photo_count": 0,
+                "located_photos": 0,
+                "guessed_photos": 0,
+                "cluster_count": 0,
+                "singleton_places": 0,
+                "unlocated": 0,
+                "total_assets": 0,
+                "clusters": [],
+            }
+
+    def _build() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            # Lightweight coordinates-only query with the same predicates as
+            # /api/results. No near-dup dedup on purpose: a marker's photo
+            # count must equal the grid's `pagination.total` after the
+            # click-through (which counts every file).
+            rows = storage.get_geo_assets(
+                conn,
+                cluster_id=cluster_id,
+                cluster_ids=cluster_ids_filter,
+                species=species,
+                genus=genus,
+                family=family,
+                has_person=has_person,
+                plantae=plantae,
+                plantae_green=PLANTAE_GREEN,
+                plantae_yellow=PLANTAE_YELLOW,
+                include_non_plants=include_non_plants,
+                guessed=guessed,
+            )
+        result = map_clusters.cluster_by_location(
+            rows,
+            radius_m=radius_m,
+            min_photos=min_photos,
+            id_prefix=id_prefix,
+        )
+        result["granularity"] = granularity
+        return result
+
+    payload = await asyncio.to_thread(_build)
+    _results_cache_put(cache_key, payload)
+    return payload
 
 
 @app.get("/api/results")
@@ -2018,6 +2237,21 @@ async def get_results(
     has_person: int | None = Query(default=None, ge=0, le=1),
     plantae: str | None = Query(default=None, pattern="^(plant|non_plant|uncertain)$"),
     include_non_plants: bool = Query(default=False),
+    # Map click-through. A map "place" is a centroid + radius, not a
+    # semantic HDBSCAN cluster, so it cannot ride on cluster_id. Sent as a
+    # triple by LocationMapView; when lat/lng are absent the filter is off.
+    near_lat: float | None = Query(default=None, ge=-90, le=90),
+    near_lng: float | None = Query(default=None, ge=-180, le=180),
+    near_radius: float = Query(default=150.0, ge=1, le=50_000),
+    # Exact map-place click-through. `near_*` keeps the grid to the place's
+    # neighbourhood; `place_id` then narrows it to the actual greedy-cluster
+    # members. The disk alone also catches a neighbouring place's photos
+    # (places can overlap), which made the marker count disagree with the
+    # grid's total. Resolved server-side by recomputing the same partition
+    # (the URL carries granularity + min_photos so the id is reproducible).
+    place_id: str | None = Query(default=None, pattern=r"^loc-(wide-|region-)?\d+$"),
+    place_granularity: str = Query(default="fine", pattern="^(fine|wide|region)$"),
+    place_min_photos: int = Query(default=2, ge=1, le=500),
     # Default is 'time' (capture date DESC) — matches the frontend
     # DEFAULT_FILTERS.sort and the "Newest first" pill in Grid.tsx.
     # Clients passing plantae/score instead send sort='rank' (no-op
@@ -2047,6 +2281,16 @@ async def get_results(
       policy applied to results. Set True to restore legacy behavior
       and include every photo in the all-view. Has no effect when an
       explicit `plantae` tier is given.
+    - near_lat/near_lng/near_radius: map click-through — keep only
+      assets within `near_radius` metres of the point. Applied as a SQL
+      bounding box plus an exact haversine cut, so it is independent of
+      the semantic cluster_id and survives dedup/pagination unchanged.
+    - place_id (+place_granularity/place_min_photos): exact membership
+      of one location cluster. `near_*` alone is a disk and can include
+      an overlapping place's photos; this recomputes the partition and
+      filters by the cluster's asset ids, so a marker's "N photos"
+      equals the grid total.
+
     - sort: 'time' (default — newest captured_at first, NULLs last),
       'added' (newest first_seen_at first, NULLs last), or 'rank'
       (Immich search-rank from the most recent run, then cluster_id
@@ -2064,10 +2308,15 @@ async def get_results(
     # include_non_plants are included so each value gets its own cached
     # slice — flipping the toggle on the same filter combination MUST
     # bust the cache, otherwise stale results leak across toggles.
-    has_filter = any(v is not None for v in (cluster_id, cluster_group, species, genus, family, has_person, plantae))
+    has_filter = any(v is not None for v in (cluster_id, cluster_group, species, genus, family, has_person, plantae, near_lat, place_id))
+    near_key = f":nlat={near_lat}:nlng={near_lng}:nr={near_radius}" if near_lat is not None and near_lng is not None else ""
+    place_key = (
+        f":place={place_id}:pg={place_granularity}:pm={place_min_photos}"
+        if place_id is not None else ""
+    )
     cache_key = (
-        f"all:cid={cluster_id}:cg={cluster_group}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
-        if has_filter else f"all:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}"
+        f"all:cid={cluster_id}:cg={cluster_group}:sp={species}:ge={genus}:fa={family}:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}{near_key}{place_key}"
+        if has_filter else f"all:hp={has_person}:pl={plantae}:inp={int(include_non_plants)}:sort={sort}{near_key}{place_key}"
     )
 
     cached = _results_cache_get(cache_key)
@@ -2109,6 +2358,59 @@ async def get_results(
                 },
             }
 
+    # Resolve an exact map place to its member asset ids. The partition is
+    # recomputed from the same lightweight geo rows the map used, under the
+    # granularity/min_photos the URL carries — place ids are indices into
+    # that partition, so the three values must travel together.
+    place_asset_ids: list[str] | None = None
+    if place_id is not None:
+        place_radius, place_prefix = {
+            "fine": (map_clusters.PLACE_RADIUS_FINE_M, "loc-"),
+            "wide": (map_clusters.PLACE_RADIUS_WIDE_M, "loc-wide-"),
+            "region": (map_clusters.PLACE_RADIUS_REGION_M, "loc-region-"),
+        }[place_granularity]
+
+        def _resolve_place_assets() -> list[str]:
+            with storage.connect(DB_PATH) as conn:
+                geo_rows = storage.get_geo_assets(
+                    conn,
+                    cluster_id=cluster_id,
+                    cluster_ids=cluster_ids_filter,
+                    species=species,
+                    genus=genus,
+                    family=family,
+                    has_person=has_person,
+                    plantae=plantae,
+                    plantae_green=PLANTAE_GREEN,
+                    plantae_yellow=PLANTAE_YELLOW,
+                    include_non_plants=include_non_plants,
+                )
+            partition = map_clusters.cluster_by_location(
+                geo_rows,
+                radius_m=place_radius,
+                min_photos=place_min_photos,
+                id_prefix=place_prefix,
+                include_asset_ids=True,
+            )
+            for cluster in partition["clusters"]:
+                if cluster["id"] == place_id:
+                    return cluster.get("asset_ids") or []
+            return []
+
+        place_asset_ids = await asyncio.to_thread(_resolve_place_assets)
+        if not place_asset_ids:
+            return {
+                "error": "no assets match this filter",
+                "results": [],
+                "taxonomy": {},
+                "pagination": {
+                    "page": page,
+                    "page_size": page_size,
+                    "total": 0,
+                    "total_pages": 0,
+                },
+            }
+
     # Cache miss → build from SQLite. The query asks for ALL matching
     # rows (page_size=10M) so we can sort/filter in Python once, then
     # slice per-page. For a 19k-row DB this is ~500ms of sync work —
@@ -2122,6 +2424,7 @@ async def get_results(
                 page_size=10_000_000,  # fetch all matching, slice in memory
                 cluster_id=cluster_id,
                 cluster_ids=cluster_ids_filter,
+                asset_ids=place_asset_ids,
                 species=species,
                 genus=genus,
                 family=family,
@@ -2130,6 +2433,9 @@ async def get_results(
                 plantae_green=PLANTAE_GREEN,
                 plantae_yellow=PLANTAE_YELLOW,
                 include_non_plants=include_non_plants,
+                near_lat=near_lat,
+                near_lng=near_lng,
+                near_radius_m=near_radius,
             )
             taxonomy = storage.get_global_taxonomy_summary(
                 conn,

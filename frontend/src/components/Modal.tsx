@@ -1,26 +1,34 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
 interface Props {
   open: boolean;
   onClose: () => void;
   title?: string;
   children: ReactNode;
+  /** Wider dialog for content like the scoped map. */
+  wide?: boolean;
 }
 
-export function Modal({ open, onClose, title, children }: Props) {
+export function Modal({ open, onClose, title, children, wide = false }: Props) {
   const ref = useRef<HTMLDialogElement>(null);
+  // Children are mounted one commit *after* showModal(). Anything that
+  // measures its container on mount (Leaflet, in the scoped map dialog)
+  // otherwise initialises against a display:none dialog at 0×0 and draws
+  // zero-radius markers that never recover.
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
     const d = ref.current;
     if (!d) return;
     if (open && !d.open) d.showModal();
     if (!open && d.open) d.close();
+    setReady(open);
   }, [open]);
 
   return (
     <dialog
       ref={ref}
-      className="max-w-[min(92vw,900px)] max-h-[92vh] bg-bg-1 text-fg border border-line2 rounded-lg p-0"
+      className={`${wide ? 'w-[min(96vw,1200px)] max-w-[min(96vw,1200px)]' : 'max-w-[min(92vw,900px)]'} max-h-[92vh] bg-bg-1 text-fg border border-line2 rounded-lg p-0`}
       onClose={onClose}
       onClick={e => {
         if (e.target === ref.current) onClose();
@@ -39,7 +47,9 @@ export function Modal({ open, onClose, title, children }: Props) {
             onClick={onClose}
           >×</button>
         </header>
-        <div className="overflow-auto max-h-[70vh] px-6 py-4">{children}</div>
+        <div className={`overflow-auto max-h-[70vh] ${wide ? 'px-2 py-2' : 'px-6 py-4'}`}>
+          {ready ? children : null}
+        </div>
       </article>
     </dialog>
   );

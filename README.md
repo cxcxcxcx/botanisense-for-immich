@@ -34,6 +34,11 @@ convention.
   drives both a filter and the "with/without people" album-sync toggle.
 - **HDBSCAN clustering** of BioCLIP embeddings for browse-level
   organisation; auto-refit on library growth.
+- **Map view — places, not trips.** Geotagged photos are grouped by
+  distance alone (150 m venues or 1 km areas) and plotted on an
+  OpenStreetMap/Leaflet map. The same park visited across months stays
+  one marker; clicking it opens exactly that place's photos in the
+  normal grid. Photos without GPS are reported separately.
 - **Optional KNN reclassification** against a FAISS index over
   TreeOfLife-200M (~867k species labels) — a debugging /
   understanding tool, not recommended over zero-shot (it is less
@@ -44,6 +49,47 @@ convention.
   remove.
 - **FastAPI backend + React/Vite SPA.** Live SSE pipeline progress,
   per-job status panels, dark theme, mobile-responsive.
+
+### Map view
+
+The **Map** tab (`#map`) needs GPS coordinates on the assets. The
+pipeline stores them at ingest; for libraries indexed before that
+feature existed, run **Backfill EXIF** on the Run page once. The
+grouping is server-side (`map_clusters.py`, `/api/map/clusters`) and
+deliberately ignores time: photos join the nearest place centroid
+within the radius, so a balcony or park revisited over years is one
+marker. Clicking a marker opens a photo sheet **over** the map
+(thumbnails, date range, visits); **Open in grid** is the escape hatch to
+the full filtered grid. Markers are uniform green and sized by photo
+count — inference is a per-photo property, not a place property, so it
+never changes a cluster's colour. In the place's photo strip, a small
+amber dot marks individual photos whose position was inferred. OpenStreetMap
+tiles require outbound HTTPS from the *browser* (no API key, no account).
+
+The same component powers two deliberately different surfaces:
+
+- **Map tab (`#map`) — independent.** It ignores whatever cluster,
+  species or person filter the Browse tab happens to be on. The URL keeps
+  that state for Browse, but the map is global.
+- **Grid map button — scoped modal.** The map pin in a filtered photo
+  grid opens the map as a modal for exactly those photos ("where are
+  they?"). Closing it returns to the grid; opening a place from it keeps
+  the grid's filter and narrows to that place.
+
+Radius can be 150 m (venue), 1 km (area) or 10 km (region). Switching it
+**keeps the current viewport** — only the markers change; the **Fit**
+button re-frames explicitly, and the viewport + radius survive tab
+switches for the session.
+
+**Inferred locations (local only).** Photos from cameras without a GPS
+fix can borrow coordinates from GPS-tagged photos taken within ±15
+minutes and 1 km (interpolated, with the two anchor photos recorded).
+This is the **Infer from nearby GPS** action in the map panel; the same
+computation is available as `scripts/guess_locations.py --apply`. It
+writes only `location_guesses` in the local SQLite DB — `assets.*` and
+Immich are never modified, a real EXIF fix always wins, and **Clear**
+(or `--clear`) removes every guess. Inferred markers are amber on the
+map; the place sheet marks each inferred photo with a small amber dot.
 
 ---
 

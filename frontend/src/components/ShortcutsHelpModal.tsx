@@ -7,6 +7,7 @@ interface Props {
 
 const SHORTCUTS: Array<{ key: string; label: string; desc: string }> = [
   { key: 'b', label: 'b', desc: 'Browse view' },
+  { key: 'm', label: 'm', desc: 'Map view' },
   { key: 'r', label: 'r', desc: 'Run / Sync view' },
   { key: '?', label: '?', desc: 'Show this shortcuts help' },
   { key: 'Escape', label: 'Esc', desc: 'Close any open modal' },

@@ -8,6 +8,8 @@ import { navigate } from '../hooks/useRoute';
 import { Card } from './Card';
 import { Pagination } from './Pagination';
 import { FilterModal } from './FilterModal';
+import { LocationMapView, type MapScope } from './LocationMapView';
+import { Modal } from './Modal';
 import { GroupMembersStrip, RelatedClusters } from './RelatedClusters';
 import { useIntersectionObserver } from '../hooks/useIntersectionObserver';
 import { useToasts } from './ToastProvider';
@@ -71,6 +73,9 @@ export function Grid() {
   const [error, setError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(true);
   const [filterModalOpen, setFilterModalOpen] = useState(false);
+  // Scoped map dialog: "show me where these filtered photos are" without
+  // turning the independent Map tab into a filtered view.
+  const [mapOpen, setMapOpen] = useState(false);
   // UX-23 — infinite scroll accumulator. Reset by runFetch on any
   // filter change. Appended to by loadMore when the bottom sentinel
   // scrolls into view.
@@ -102,6 +107,12 @@ export function Grid() {
   }, [groupsData, filters.group_by, filters.supergroup]);
 
   const activeFilterLabel: string | null = (() => {
+    // A map place is orthogonal to group_by: the marker click sets a
+    // centroid + radius on top of whatever taxonomy filter was active.
+    // It wins the title so the user can tell where the photos came from.
+    if (filters.near_lat != null && filters.near_lng != null) {
+      return `Place · ${filters.near_lat.toFixed(3)}, ${filters.near_lng.toFixed(3)}`;
+    }
     const g = filters.group_by;
     if (g === 'supergroup') {
       if (activeGroup) return activeGroup.name;
@@ -119,6 +130,21 @@ export function Grid() {
     return null;
   })();
   const clearActiveFilter = () => {
+    // Reached from the map → Back means "back to the map", not "back to
+    // the cluster cards". The near triple is dropped either way.
+    if (filters.near_lat != null) {
+      setFilters({
+        near_lat: undefined,
+        near_lng: undefined,
+        near_radius: undefined,
+        place_id: undefined,
+        place_granularity: undefined,
+        place_min_photos: undefined,
+        page: 0,
+      });
+      navigate('map');
+      return;
+    }
     if (filters.group_by === 'supergroup') setFilters({ supergroup: undefined, page: 0 });
     else if (filters.group_by === 'cluster') setFilters({ cluster_id: undefined, page: 0 });
     else if (filters.group_by === 'species') setFilters({ species: undefined, page: 0 });
@@ -161,6 +187,15 @@ export function Grid() {
       // Explicit `plantae` tiers always win server-side, so sending
       // the flag alongside a tier is a no-op there.
       include_non_plants: filters.include_non_plants,
+      // Map click-through: keep only assets within the place's radius.
+      // All three travel together (useUrlFilters only parses a complete
+      // lat+lng pair; the radius falls back to 150 m).
+      near_lat: filters.near_lat,
+      near_lng: filters.near_lng,
+      near_radius: filters.near_radius,
+      place_id: filters.place_id,
+      place_granularity: filters.place_granularity,
+      place_min_photos: filters.place_min_photos,
       sort: serverSort,
     })
       .then(r => {
@@ -194,6 +229,10 @@ export function Grid() {
     filters.cluster_id, filters.supergroup, filters.species, filters.genus, filters.family,
     filters.has_person, filters.plantae,
     filters.include_non_plants,
+    // Map place filters: a marker click in the scoped modal changes only
+    // these, so they must re-run the fetch even when taxonomy is unchanged.
+    filters.near_lat, filters.near_lng, filters.near_radius,
+    filters.place_id, filters.place_granularity, filters.place_min_photos,
     filters.sort,
   ]);
 
@@ -228,6 +267,12 @@ export function Grid() {
       has_person: filters.has_person,
       plantae: filters.plantae,
       include_non_plants: filters.include_non_plants,
+      near_lat: filters.near_lat,
+      near_lng: filters.near_lng,
+      near_radius: filters.near_radius,
+      place_id: filters.place_id,
+      place_granularity: filters.place_granularity,
+      place_min_photos: filters.place_min_photos,
       sort: serverSort,
     })
       .then(r => {
@@ -274,6 +319,17 @@ export function Grid() {
 
   const filtersActive = filters.plantae != null || filters.has_person != null;
 
+  const mapScope: MapScope = {
+    cluster_id: filters.cluster_id,
+    supergroup: filters.supergroup,
+    species: filters.species,
+    genus: filters.genus,
+    family: filters.family,
+    has_person: filters.has_person,
+    plantae: filters.plantae,
+    include_non_plants: filters.include_non_plants,
+  };
+
   return (
     <div>
       {/* Sticky back-bar at the top of the photo view. Per the mock:
@@ -285,7 +341,7 @@ export function Grid() {
           type="button"
           onClick={clearActiveFilter}
           className="back-bar-back"
-          title="Back to all clusters"
+          title={filters.near_lat != null ? 'Back to the map' : 'Back to all clusters'}
         >
           <BackArrowIcon />
           <span className="text-xs font-medium hidden sm:inline">Back</span>
@@ -303,6 +359,15 @@ export function Grid() {
         </div>
 
         <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => setMapOpen(true)}
+            className="filter-trigger"
+            title="Map these photos"
+            aria-label="Map these photos"
+          >
+            <MapPinIcon />
+          </button>
           <button
             type="button"
             onClick={() => setFilterModalOpen(true)}
@@ -422,6 +487,31 @@ export function Grid() {
       )}
 
       <FilterModal open={filterModalOpen} onClose={() => setFilterModalOpen(false)} />
+
+      <Modal
+        open={mapOpen}
+        onClose={() => setMapOpen(false)}
+        title={`Map · ${activeFilterLabel ?? 'all photos'}`}
+        wide
+      >
+        <LocationMapView
+          scope={mapScope}
+          variant="modal"
+          scopeLabel={activeFilterLabel ?? undefined}
+          onOpenInGrid={(place, granularity, minPhotos) => {
+            setMapOpen(false);
+            setFilters({
+              near_lat: place.latitude,
+              near_lng: place.longitude,
+              near_radius: Math.ceil(place.radius_m * 1.05),
+              place_id: place.id,
+              place_granularity: granularity,
+              place_min_photos: minPhotos,
+              page: 0,
+            });
+          }}
+        />
+      </Modal>
     </div>
   );
 }
@@ -512,6 +602,15 @@ function FilteredEmpty({
         Change filters
       </button>
     </div>
+  );
+}
+
+function MapPinIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+      <circle cx="12" cy="10" r="3" />
+    </svg>
   );
 }
 
