@@ -1,24 +1,68 @@
 # BotaniSense for Immich
 
 > **Browse your Immich library by plant species.**
-> BioCLIP-2 zero-shot classification + optional KNN reclassification,
-> with smart-album sync back to Immich.
+> BioCLIP-2 species identification, auto-named plant clusters, and
+> smart-album sync back to Immich.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Immich compat ≥ 1.111](https://img.shields.io/badge/Immich-%E2%89%A5%201.111-blue)](https://immich.app)
 [![Python ≥ 3.10](https://img.shields.io/badge/Python-%E2%89%A5%203.10-blue)](https://www.python.org)
 
-BotaniSense for Immich is a self-hosted companion to
-[Immich](https://immich.app) that classifies plant (and other
-organism) photos using [BioCLIP-2](https://arxiv.org/abs/2311.18803),
-then helps you organise the results — by cluster, species, genus, or
-family — and optionally push curated albums back into Immich.
+![Cluster cards: a grid of plant groups named Camellia, Wisteria, Sunflower, Lotus, Saguaro…](docs/images/browse-clusters.jpg)
 
-The ML engine inside is BioCLIP-2 (a CLIP model fine-tuned on the
-TreeOfLife-200M label set). The app is "BotaniSense for Immich";
-keep the two names straight when reading the code, comments, or this
-README — see [DEVELOPMENT.md](DEVELOPMENT.md) for the dual-naming
-convention.
+A self-hosted companion to [Immich](https://immich.app): it finds the
+plant photos in your library, identifies the species with
+[BioCLIP-2](https://arxiv.org/abs/2311.18803), and groups them into
+auto-named **cluster cards** — each cover is the most representative
+*person-free* photo in the group.
+
+Click a card for its photo grid — every image tagged with the top
+species prediction and confidence, with a strip of related clusters
+on top:
+
+![Inside a Camellia cluster: a grid of camellia photos labeled Camellia japonica with confidence scores](docs/images/cluster-grid.jpg)
+
+The same browse levels exist for **species, genus, and family**, plus
+a map of where you took them, a global search, and smart-album sync
+back to Immich.
+
+---
+
+## Quickstart
+
+```bash
+git clone https://github.com/cxcxcxcx/botanisense-for-immich
+cd botanisense-for-immich
+
+# 1. Build + run
+docker compose up --build -d
+
+# 2. Open http://<this-host>:8765 — from any LAN device; the server
+#    binds 0.0.0.0. (http://localhost:8765 works only on the host
+#    itself.)
+#    → the Welcome screen asks for your Immich URL and API key.
+#      Click "Save & test connection" — it verifies immediately.
+```
+
+No `.env`, no config files. The Immich URL + API key you enter are
+stored in the app's database (`./data/`) and take effect immediately;
+you can change them any time via **Fix connection** in the health
+banner or the **Edit** link on the Run page → Sync to IMMICH section.
+
+Don't want to build locally? Uncomment the `image:` line in
+`compose.yml` to pull the prebuilt image from GHCR instead
+(published by CI on every release). Prefer not to type the key into
+the web UI? Set `IMMICH_BASE_URL` / `IMMICH_API_KEY` in `compose.yml`
+or a `.env` file instead — environment variables pin the connection.
+
+The image contains the backend and the built web UI (~2.5 GB; CPU-only
+torch). BioCLIP-2 downloads into `./data/` on the first pipeline run
+(needs ~6 GB free RAM while it runs — see [Prerequisites](#prerequisites)).
+To enable the optional KNN reclassification, see
+[KNN reclassification](#knn-reclassification-debug-tool-not-recommended).
+
+Contributing or developing from source (Python + Node)? See
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
@@ -140,61 +184,6 @@ shines. Below ~1 000 photos the run-once latency dominates; above
 
 [immich-keys]: https://immich.app/docs/administration/users-and-access
 [bioclip-hf]: https://huggingface.co/imageomics/bioclip-2
-
----
-
-## Quickstart
-
-```bash
-git clone https://github.com/cxcxcxcx/botanisense-for-immich
-cd botanisense-for-immich
-
-# 1. Build + run
-docker compose up --build -d
-
-# 2. Open http://<this-host>:8765 — from any LAN device; the server
-#    binds 0.0.0.0. (http://localhost:8765 works only on the host
-#    itself.)
-#    → the Welcome screen asks for your Immich URL and API key.
-#      Click "Save & test connection" — it verifies immediately.
-```
-
-No `.env`, no config files. The Immich URL + API key you enter are
-stored in the app's database (`./data/`) and take effect immediately;
-you can change them any time via **Fix connection** in the health
-banner or the **Edit** link on the Run page → Sync to IMMICH section.
-
-Don't want to build locally? Uncomment the `image:` line in
-`compose.yml` to pull the prebuilt image from GHCR instead
-(published by CI on every release). Prefer not to type the key into
-the web UI? Set `IMMICH_BASE_URL` / `IMMICH_API_KEY` in `compose.yml`
-or a `.env` file instead — environment variables pin the connection.
-
-The image contains the backend and the built web UI (~2.5 GB; CPU-only
-torch). BioCLIP-2 downloads into `./data/` on the first pipeline run.
-To enable the optional KNN reclassification, see
-[KNN reclassification](#knn-reclassification-debug-tool-not-recommended).
-
-Contributing or developing from source (Python + Node)? See
-[DEVELOPMENT.md](DEVELOPMENT.md).
-
----
-
-## Screenshots
-
-Browse your library as auto-named **cluster cards** — each cover is
-the most representative *person-free* photo in the group:
-
-![Cluster cards: a grid of plant groups named Camellia, Wisteria, Sunflower, Lotus, Saguaro…](docs/images/browse-clusters.jpg)
-
-Click a card for its photo grid — every image tagged with the top
-species prediction and confidence, with a strip of related clusters
-on top:
-
-![Inside a Camellia cluster: a grid of camellia photos labeled Camellia japonica with confidence scores](docs/images/cluster-grid.jpg)
-
-The same browse levels exist for **species, genus, and family**, plus
-a global search and smart-album sync back to Immich.
 
 ---
 
@@ -340,6 +329,12 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, test, and commit
 guidelines. Be sure to read the "What not to commit" list — there are
 some large runtime artifacts (`data/`, `weights/`, `data.state.db`)
 that are easy to accidentally `git add`.
+
+The ML engine inside is BioCLIP-2 (a CLIP model fine-tuned on the
+TreeOfLife-200M label set). The app is "BotaniSense for Immich";
+keep the two names straight when reading the code, comments, or this
+README — see [DEVELOPMENT.md](DEVELOPMENT.md) for the dual-naming
+convention.
 
 ---
 
