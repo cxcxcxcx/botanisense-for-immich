@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { getAsset, reclassifyBbox, reclassify, getConfig, getKnnStatus } from '../api/endpoints';
 import type { KnnStatus } from '../api/types';
 import type { AssetDetail as AssetDetailType } from '../api/types';
@@ -10,6 +10,7 @@ import { DetectionBlock } from './DetectionBlock';
 import { BboxImage } from './BboxImage';
 import { useToasts } from './ToastProvider';
 import { formatPct } from '../lib/format';
+import { copyTextOrSelect } from '../lib/clipboard';
 
 interface Props {
   assetId: string;
@@ -124,6 +125,7 @@ export function AssetDetail({ assetId }: Props) {
   const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [copied, setCopied] = useState(false);
+  const assetIdRef = useRef<HTMLElement | null>(null);
   // If the 'fullsize' thumb fails to load, fall back to the smaller
   // 'preview' size. Reset on asset change so each asset tries fullsize
   // first.
@@ -214,13 +216,21 @@ export function AssetDetail({ assetId }: Props) {
 
   const handleCopy = async () => {
     if (!data) return;
-    try {
-      await navigator.clipboard.writeText(data.asset_id);
+    const result = await copyTextOrSelect(data.asset_id, assetIdRef.current);
+    if (result === 'copied') {
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1500);
-    } catch (e) {
-      push({ kind: 'error', message: 'Copy failed: ' + (e instanceof Error ? e.message : String(e)) }, 3000);
+      return;
     }
+    if (result === 'selected') {
+      push({
+        kind: 'info',
+        message:
+          'Clipboard is blocked on HTTP. The asset ID is selected — press Ctrl+C or long-press to copy.',
+      }, 6000);
+      return;
+    }
+    push({ kind: 'error', message: 'Copy failed — select the ID manually.' }, 3000);
   };
 
   if (error) return <div className="text-red-300">Failed to load asset: {error.message}</div>;
@@ -279,6 +289,7 @@ export function AssetDetail({ assetId }: Props) {
           flips to a checkmark for 1.5s after a successful write. */}
       <div className="flex items-center justify-between gap-2">
         <code
+          ref={assetIdRef}
           className="text-[11px] font-mono text-fg-1 truncate"
           title={data.asset_id}
         >{data.asset_id}</code>

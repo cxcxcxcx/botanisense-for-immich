@@ -9,10 +9,19 @@
 //     Older ones fall off the bottom.
 //   - Dismissal: the timer auto-dismisses; the × button dismisses
 //     immediately; an action-button click runs `onClick` then
-//     dismisses. Clicking the body itself does NOT dismiss — toasts
-//     are notifications, not popovers.
+//     dismisses. Clicking the body itself does NOT dismiss.
 
-import { createContext, useCallback, useContext, useMemo, useReducer, type ReactNode } from 'react';
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useReducer,
+  useState,
+  type ReactNode,
+} from 'react';
+import { createPortal } from 'react-dom';
 
 export type ToastKind = 'success' | 'error' | 'info';
 export interface Toast {
@@ -46,8 +55,19 @@ function reducer(state: Toast[], action: { type: 'push'; toast: Toast } | { type
   }
 }
 
+/** The topmost open native <dialog>, or <body> when no dialog is open. */
+function toastHostElement(): HTMLElement {
+  const dialogs = document.querySelectorAll<HTMLDialogElement>('dialog[open]');
+  const top = dialogs[dialogs.length - 1];
+  return top ?? document.body;
+}
+
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [items, dispatch] = useReducer(reducer, [] as Toast[]);
+  const [toastHost, setToastHost] = useState<HTMLElement>(() =>
+    typeof document === 'undefined' ? (null as unknown as HTMLElement) : document.body,
+  );
+
   const push = useCallback((t: Omit<Toast, 'id' | 'ttlMs'>, ttlMs = 3000) => {
     const id = Date.now() + Math.random();
     const toast: Toast = { ...t, id, ttlMs };
@@ -56,36 +76,57 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   }, []);
   const expire = useCallback((id: number) => dispatch({ type: 'expire', id }), []);
   const value = useMemo(() => ({ push }), [push]);
+
+  // A native <dialog> is in the browser's top layer: a toast that is a
+  // sibling of the dialog (even with a huge z-index) is painted BEHIND
+  // it. Portal the toast stack into the open dialog instead. When no
+  // dialog is open it lives on <body> with z-index 1001.
+  useEffect(() => {
+    const update = () => setToastHost(toastHostElement());
+    update();
+    const observer = new MutationObserver(update);
+    observer.observe(document.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['open'],
+    });
+    return () => observer.disconnect();
+  }, []);
+
+  const stack = (
+    <div className="toast-stack" role="status" aria-live="polite">
+      {items.map(t => (
+        <div key={t.id} className={`toast-${t.kind} flex items-center gap-3`}>
+          <span className="flex-1">{t.message}</span>
+          {t.action && (
+            <button
+              type="button"
+              className="text-[0.78rem] underline hover:no-underline"
+              onClick={() => {
+                t.action!.onClick();
+                expire(t.id);
+              }}
+            >
+              {t.action.label}
+            </button>
+          )}
+          <button
+            type="button"
+            aria-label="Dismiss"
+            className="text-fg-1 hover:text-fg leading-none text-base"
+            onClick={() => expire(t.id)}
+          >
+            ×
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+
   return (
     <Ctx.Provider value={value}>
       {children}
-      <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-[1001] flex flex-col gap-2">
-        {items.map(t => (
-          <div key={t.id} className={`toast-${t.kind} flex items-center gap-3`}>
-            <span className="flex-1">{t.message}</span>
-            {t.action && (
-              <button
-                type="button"
-                className="text-[0.78rem] underline hover:no-underline"
-                onClick={() => {
-                  t.action!.onClick();
-                  expire(t.id);
-                }}
-              >
-                {t.action.label}
-              </button>
-            )}
-            <button
-              type="button"
-              aria-label="Dismiss"
-              className="text-fg-1 hover:text-fg leading-none text-base"
-              onClick={() => expire(t.id)}
-            >
-              ×
-            </button>
-          </div>
-        ))}
-      </div>
+      {toastHost ? createPortal(stack, toastHost) : null}
     </Ctx.Provider>
   );
 }

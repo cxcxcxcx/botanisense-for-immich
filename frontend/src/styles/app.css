@@ -133,10 +133,29 @@
   .plantae-yellow { @apply bg-plantae-yellow text-yellow-300; }
   .plantae-red    { @apply bg-plantae-red text-red-300; }
 
-  /* Toast variants. */
-  .toast-success { @apply fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 rounded-md shadow-lg z-[1001] bg-emerald-900 text-emerald-100; }
-  .toast-error   { @apply fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 rounded-md shadow-lg z-[1001] bg-red-900 text-red-200; }
-  .toast-info    { @apply fixed bottom-6 left-1/2 -translate-x-1/2 px-5 py-3 rounded-md shadow-lg z-[1001] bg-indigo-950 text-indigo-200; }
+  /* Toast variants. The stack owns positioning; native <dialog>
+     top layer is handled by making the stack a manual popover. */
+  .toast-success { @apply px-5 py-3 rounded-md shadow-lg bg-emerald-900 text-emerald-100; }
+  .toast-error   { @apply px-5 py-3 rounded-md shadow-lg bg-red-900 text-red-200; }
+  .toast-info    { @apply px-5 py-3 rounded-md shadow-lg bg-indigo-950 text-indigo-200; }
+
+  .toast-stack {
+    position: fixed;
+    inset: auto auto 1.5rem 50%;
+    transform: translateX(-50%);
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    width: max-content;
+    max-width: min(92vw, 640px);
+    max-height: 70vh;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    z-index: 1001;
+  }
 
   /* Taxonomy hierarchy ranks in the asset-detail modal. Each rank
      gets a distinct chip color so users can scan kingdom → species
