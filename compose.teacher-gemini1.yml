@@ -1,0 +1,43 @@
+# BotaniSense for Immich — teacher BioCLIP-2 + trained gemini1 detector.
+#
+# This is the "prod classifier + own YOLO" A/B instance. It replaces the
+# S0/mobile instance on :8771 while keeping the S0 container and its DB on
+# disk for rollback.
+#
+#   docker stop botanisense-s0          # keep it for rollback
+#   docker compose -f compose.teacher-gemini1.yml up --build -d
+#   → http://localhost:8771
+#
+# The DB is a copy of the production teacher DB (data/state.db) with the
+# detector-derived rows cleared, so species/embeddings stay identical to
+# :8770 and only the detection backend differs.
+
+services:
+  botanisense-tg:
+    build: .
+    container_name: botanisense-tg
+    restart: unless-stopped
+    ports:
+      - "8771:8765"
+    environment:
+      # Teacher BioCLIP-2 (same as :8770), not the mobile S0 engine.
+      ENGINE: teacher
+      # Own trained gemini1 seg detector instead of YOLO-World.
+      YOLO_BACKEND: gemini1
+      YOLO_GEMINI1_ONNX: /app/models/gemini1_seg_best.fp16.onnx
+      # Separate DB so S0 and teacher embeddings never mix. It is a copy of
+      # the production teacher DB with detections/has_person/yolo markers
+      # cleared; the first run scans every asset with gemini1.
+      DB_PATH: /app/data/tg/state.db
+      # PERSON_CLF_PATH defaults to data/person_classifier.joblib (trained
+      # on teacher vectors — valid here). NEAR_DUP_THRESHOLD stays at the
+      # teacher-calibrated 0.97 default (do NOT inherit S0's 0.99).
+    volumes:
+      - ./data:/app/data
+      # Model files are gitignored host-side; /app/models is read-only.
+      - ./data/models:/app/models:ro
+      # Reuse the BioCLIP-2 weights already downloaded by the old :8770
+      # container instead of re-fetching 4.2 GB. HF_HOME in the image is
+      # /app/data/huggingface, so this nested mount replaces the empty dir.
+      - /home/chenxing/open_source/botanisense-fresh/data/huggingface:/app/data/huggingface
+      - /etc/localtime:/etc/localtime:ro

@@ -1,9 +1,10 @@
-"""gemini1_seg potted-plant detector — ONNX backend for the yolo stage.
+"""Trained potted-plant detector — ONNX backend for the yolo stage.
 
-Serves the trained YOLO26-seg model (weights gemini1_seg_best, labels
-from the GEMINI1 annotation standard: plant / pot / person / hand /
-flower / tree) through onnxruntime, as a drop-in replacement for the
-YOLO-World open-vocab module (`yolo.py`). Same interface:
+Serves a trained YOLO26-seg model through onnxruntime, as a drop-in
+replacement for the YOLO-World open-vocab module (`yolo.py`). Two
+exports are supported (see CLASS_TABLES): the 6-class gemini1 standard
+(plant / pot / person / hand / flower / tree) and the 5-class
+2026-11-20 obj6-control-5c (no pot). Same interface:
 
     get_model() / unload_model() / detect(images, conf=...) -> [[{…}], …]
 
@@ -17,9 +18,10 @@ bbox-bioclip crop stage.
 Model/export contract (plant_yolo docs/MOBILE_EXPORT.md, golden
 manifest): letterbox to 960×960 (gain = min(960/h, 960/w), centered,
 pad to stride 32, BGR→RGB CHW, /255 — done here, not in the graph).
-Outputs: `output0` (1, 42, 18900) = 4 xywh (center format, PIXELS in
-the letterboxed frame) + 6 per-class sigmoid scores + 32 mask
-coefficients, pre-NMS; `output1` (1, 32, 240, 240) mask prototypes.
+Outputs: `output0` (1, 4+nc+32, 18900) = 4 xywh (center format,
+PIXELS in the letterboxed frame) + nc per-class sigmoid scores + 32
+mask coefficients, pre-NMS — 42 channels for gemini1, 41 for obj6-5c;
+`output1` (1, 32, 240, 240) mask prototypes.
 We only need boxes — the 32 coefficients are sliced off and the
 prototypes are never touched.
 
@@ -48,7 +50,16 @@ DECODE_PREVIEW_MAX_SIZE = 960
 
 IMGSZ = 960
 STRIDE = 32
-NAMES = ("plant", "pot", "person", "hand", "flower", "tree")
+# Two export generations share the box/mask layout and differ only in
+# the class block: gemini1 (6 classes, pot at index 1) and 2026-11-20
+# obj6-control-5c (5 classes, no pot — every index after pot shifts down).
+# The class block is chosen from the ONNX output's channel count
+# (4 + nc + 32), so pointing YOLO_GEMINI1_ONNX at either file works.
+CLASS_TABLES = {
+    6: ("plant", "pot", "person", "hand", "flower", "tree"),
+    5: ("plant", "person", "hand", "flower", "tree"),
+}
+NAMES = CLASS_TABLES[6]  # legacy 6-class table; decode uses classes_for()
 CONF_FLOOR = 0.25
 NMS_IOU = 0.70
 MAX_DET = 300
@@ -63,6 +74,18 @@ def _model_path() -> Path:
     return Path(
         os.environ.get("YOLO_GEMINI1_ONNX", DEFAULT_MODEL_PATH)
     )
+
+
+def classes_for(n_channels: int) -> tuple[str, ...]:
+    """Class names for a pred tensor with `n_channels` channels.
+    Layout is 4 box + nc class scores + 32 mask coefficients."""
+    nc = int(n_channels) - 4 - 32
+    if nc not in CLASS_TABLES:
+        raise ValueError(
+            f"unsupported detector: {n_channels} output channels "
+            f"({nc} classes); known: {sorted(CLASS_TABLES)}"
+        )
+    return CLASS_TABLES[nc]
 
 
 def get_model():
@@ -176,11 +199,12 @@ def detect(images: list[Image.Image], *, conf: float = CONF_FLOOR) -> list[list[
     out: list[list[dict]] = []
     for img in images:
         x, gain, pad_w, pad_h = letterbox(img)
-        raw_pred = session.run(None, {input_name: x})[0]  # (1, 42, 18900)
-        pred = np.asarray(raw_pred, dtype=np.float32)[0]  # (42, 18900)
+        raw_pred = session.run(None, {input_name: x})[0]  # (1, 4+nc+32, 18900)
+        pred = np.asarray(raw_pred, dtype=np.float32)[0]
+        names = classes_for(pred.shape[0])
         xywh = pred[:4]                 # center xywh, letterbox pixels
-        cls_scores = pred[4 : 4 + len(NAMES)]
-        # pred[4 + len(NAMES):] = 32 mask coefficients — boxes only here
+        cls_scores = pred[4 : 4 + len(names)]
+        # pred[4 + len(names):] = 32 mask coefficients — boxes only here
 
         cls_id = cls_scores.argmax(axis=0)
         best = cls_scores.max(axis=0)
@@ -203,7 +227,7 @@ def detect(images: list[Image.Image], *, conf: float = CONF_FLOOR) -> list[list[
         # (cross-class overlaps are pipeline._merge_overlapping_boxes's
         # job, same as the YOLO-World path).
         keep: list[int] = []
-        for c in range(len(NAMES)):
+        for c in range(len(names)):
             idx_c = np.nonzero(cls_id == c)[0]
             if idx_c.size:
                 # _nms indexes into the subset — map back to global rows.
@@ -229,7 +253,7 @@ def detect(images: list[Image.Image], *, conf: float = CONF_FLOOR) -> list[list[
                 continue
             dets.append(
                 {
-                    "label": NAMES[cls_id[i]],
+                    "label": names[cls_id[i]],
                     "score": float(best[i]),
                     "x": x,
                     "y": y,

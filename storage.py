@@ -45,6 +45,7 @@ import logging
 import math
 import os
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +134,21 @@ CREATE TABLE IF NOT EXISTS bbox_predictions (
 );
 CREATE INDEX IF NOT EXISTS idx_bbox_preds_detection
   ON bbox_predictions(detection_id, score DESC);
+
+-- One normalized BioCLIP image embedding per detection crop. This is the
+-- vector used by the box-level similarity search; it lives in the same
+-- 768-d space as the whole-image `embeddings` table, so a crop can be
+-- matched against both other crops and whole photos (the "virtual box").
+-- model_version separates teacher / mobile spaces; never mix them.
+CREATE TABLE IF NOT EXISTS bbox_embeddings (
+  detection_id  INTEGER PRIMARY KEY REFERENCES detections(id) ON DELETE CASCADE,
+  model_version TEXT NOT NULL,
+  dim           INTEGER NOT NULL,
+  vector        BLOB NOT NULL,
+  computed_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_bbox_embeddings_version
+  ON bbox_embeddings(model_version);
 
 -- One row per (asset, rank, taxon_name) — a slice of the BioCLIP
 -- predict() output at a higher taxonomic level (e.g. KINGDOM). We use
@@ -2632,6 +2648,313 @@ def fetch_bbox_predictions(
             }
         )
     return out
+
+
+# ---------- box-level similarity -----------------------------------------
+#
+# Box crops and whole photos live in the same teacher BioCLIP space (both
+# are 768-d L2-normalized vectors). The index below concatenates them so a
+# crop query can return both similar crops and similar whole photos — the
+# whole photo is the "virtual box" fallback when YOLO found no plant box.
+# The matrix is materialized once per (db mtime, model_version, include_photos)
+# and cached in-process; 91k boxes + 20k photos is ~340 MB.
+
+_BBOX_INDEX_LOCK = threading.Lock()
+_BBOX_INDEX_CACHE: dict | None = None
+_BBOX_INDEX_KEY: tuple | None = None
+
+
+def bbox_embedding(
+    conn: sqlite3.Connection, detection_id: int
+) -> tuple[int, str, np.ndarray] | None:
+    """Return (dim, model_version, vector) for one detection crop."""
+    row = conn.execute(
+        "SELECT dim, model_version, vector FROM bbox_embeddings WHERE detection_id=?",
+        (int(detection_id),),
+    ).fetchone()
+    if row is None:
+        return None
+    vector = np.frombuffer(row["vector"], dtype="<f4").copy()
+    if vector.size != int(row["dim"]):
+        return None
+    return int(row["dim"]), str(row["model_version"]), vector
+
+
+def _bbox_index(conn: sqlite3.Connection, model_version: str, include_photos: bool) -> dict:
+    """Materialize the box + photo embedding matrix, cached by DB mtime.
+
+    Each row also carries its source asset_id (and a per-asset box count)
+    so the neighbor query can collapse N crops from one photo into one
+    result.  The corpus is intentionally still crop-level: a bouquet may
+    have ten useful flower crops, and the caller may want the best one;
+    only the *result* is deduped per source image.
+    """
+    global _BBOX_INDEX_CACHE, _BBOX_INDEX_KEY
+    path_row = conn.execute("PRAGMA database_list").fetchone()
+    db_path = path_row[2] if path_row else ""
+    try:
+        stat = os.stat(db_path) if db_path else None
+    except OSError:
+        stat = None
+    key = (
+        db_path,
+        stat.st_mtime_ns if stat else 0,
+        stat.st_size if stat else 0,
+        model_version,
+        bool(include_photos),
+    )
+    with _BBOX_INDEX_LOCK:
+        if _BBOX_INDEX_KEY == key and _BBOX_INDEX_CACHE is not None:
+            return _BBOX_INDEX_CACHE
+
+    # Join detections so an orphan bbox_embeddings row (shouldn't happen
+    # with the FK, but old DBs may have one) is never indexed without a
+    # source asset.
+    box_rows = conn.execute(
+        """
+        SELECT e.detection_id, e.vector, d.asset_id
+        FROM bbox_embeddings e
+        JOIN detections d ON d.id = e.detection_id
+        WHERE e.model_version = ?
+        """,
+        (model_version,),
+    ).fetchall()
+    box_ids: list[tuple[str, int | str]] = []
+    box_vecs: list[np.ndarray] = []
+    box_asset_ids: list[str] = []
+    for row in box_rows:
+        vec = np.frombuffer(row["vector"], dtype="<f4")
+        if vec.size == 768:
+            box_ids.append(("box", int(row["detection_id"])))
+            box_vecs.append(vec.copy())
+            box_asset_ids.append(str(row["asset_id"]))
+
+    photo_ids: list[tuple[str, int | str]] = []
+    photo_vecs: list[np.ndarray] = []
+    photo_asset_ids: list[str] = []
+    if include_photos and box_vecs:
+        asset_ids, photo_matrix = all_embeddings(conn)
+        if photo_matrix.size and photo_matrix.shape[1] == 768:
+            for i, asset_id in enumerate(asset_ids):
+                photo_ids.append(("photo", asset_id))
+                photo_vecs.append(photo_matrix[i])
+                photo_asset_ids.append(str(asset_id))
+
+    ids = box_ids + photo_ids
+    asset_by_pos = box_asset_ids + photo_asset_ids
+    asset_box_counts: dict[str, int] = {}
+    for aid in box_asset_ids:
+        asset_box_counts[aid] = asset_box_counts.get(aid, 0) + 1
+
+    if not ids:
+        result = {
+            "ids": [],
+            "matrix": np.empty((0, 768), dtype="<f4"),
+            "index": {},
+            "asset_by_pos": [],
+            "asset_box_counts": {},
+        }
+    else:
+        matrix = np.vstack(box_vecs + photo_vecs).astype(np.float32, copy=False)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        matrix = matrix / np.maximum(norms, 1e-12)
+        result = {
+            "ids": ids,
+            "matrix": matrix,
+            "index": {key: i for i, key in enumerate(ids)},
+            "asset_by_pos": asset_by_pos,
+            "asset_box_counts": asset_box_counts,
+        }
+    with _BBOX_INDEX_LOCK:
+        _BBOX_INDEX_KEY = key
+        _BBOX_INDEX_CACHE = result
+    return result
+
+
+def bbox_neighbors(
+    conn: sqlite3.Connection,
+    *,
+    detection_id: int,
+    k: int = 12,
+    include_photos: bool = True,
+) -> dict | None:
+    """Top-K similar source images for a detection crop.
+
+    Box and photo vectors both live in the teacher BioCLIP space, but the
+    result is collapsed to **one row per source asset**. A target photo
+    with ten flower crops contributes only its highest-scoring crop; its
+    `n_boxes` field records how many crops it had. The query photo is
+    excluded entirely — every crop from the same image plus its whole
+    photo — so a bouquet cannot fill the list with itself.
+
+    `k` therefore means "k distinct source images", not "k crops".
+    """
+    query = bbox_embedding(conn, detection_id)
+    if query is None:
+        return None
+    _dim, model_version, vec = query
+    norm = float(np.linalg.norm(vec))
+    if norm <= 0:
+        return None
+    vec = vec / norm
+
+    qrow = get_detection_with_asset_url(conn, detection_id=int(detection_id)) or {}
+    if not qrow:
+        return None
+    query_asset = str(qrow.get("asset_id") or "")
+
+    index = _bbox_index(conn, model_version, include_photos)
+    ids = index["ids"]
+    matrix = index["matrix"]
+    if not ids or matrix.size == 0:
+        return None
+    asset_by_pos = index.get("asset_by_pos") or []
+    asset_box_counts = index.get("asset_box_counts") or {}
+    if len(asset_by_pos) != len(ids):
+        # Old cached index or a hand-built test; no way to dedupe safely.
+        return None
+
+    query_pos = index["index"].get(("box", int(detection_id)))
+    sims = matrix @ vec
+    if query_pos is not None:
+        sims[query_pos] = -2.0
+    if query_asset:
+        for pos, aid in enumerate(asset_by_pos):
+            if aid == query_asset:
+                sims[pos] = -2.0
+
+    take = min(max(1, int(k)), len(ids))
+    order = np.argsort(-sims)
+    selected: list[tuple[str, int | str, str, float]] = []
+    seen_assets: set[str] = {query_asset} if query_asset else set()
+    for pos in order:
+        if len(selected) >= take:
+            break
+        score = float(sims[int(pos)])
+        if score <= -1.5:
+            continue
+        kind, ident = ids[int(pos)]
+        aid = str(asset_by_pos[int(pos)] or "")
+        if not aid or aid in seen_assets:
+            continue
+        seen_assets.add(aid)
+        selected.append((str(kind), ident, aid, score))
+    if not selected:
+        return None
+
+    box_hits: list[tuple[int, float, str]] = [
+        (int(ident), score, aid)
+        for kind, ident, aid, score in selected if kind == "box"
+    ]
+    photo_hits: list[tuple[str, float, str]] = [
+        (str(ident), score, aid)
+        for kind, ident, aid, score in selected if kind == "photo"
+    ]
+
+    box_meta: dict[int, dict] = {}
+    box_preds: dict[int, list[dict]] = {}
+    if box_hits:
+        box_ids = [did for did, _, _ in box_hits]
+        placeholders = ",".join("?" for _ in box_ids)
+        rows = conn.execute(
+            f"""
+            SELECT d.id, d.asset_id, d.label, d.score AS yolo_score,
+                   d.x, d.y, d.w, d.h, a.original_file_name
+            FROM detections d
+            JOIN assets a ON a.asset_id = d.asset_id
+            WHERE d.id IN ({placeholders})
+            """,
+            box_ids,
+        ).fetchall()
+        box_meta = {int(r["id"]): dict(r) for r in rows}
+        box_preds = fetch_bbox_predictions(conn, detection_ids=box_ids, rank="species")
+
+    photo_meta: dict[str, dict] = {}
+    photo_top: dict[str, dict] = {}
+    if photo_hits:
+        photo_ids = [aid for aid, _, _ in photo_hits]
+        placeholders = ",".join("?" for _ in photo_ids)
+        rows = conn.execute(
+            f"SELECT asset_id, original_file_name FROM assets WHERE asset_id IN ({placeholders})",
+            photo_ids,
+        ).fetchall()
+        photo_meta = {str(r["asset_id"]): dict(r) for r in rows}
+        pred_rows = conn.execute(
+            f"""
+            SELECT asset_id, species, common_name, score
+            FROM predictions
+            WHERE rank='species' AND position=0
+              AND asset_id IN ({placeholders})
+            """,
+            photo_ids,
+        ).fetchall()
+        photo_top = {str(r["asset_id"]): dict(r) for r in pred_rows}
+
+    qpred = (fetch_bbox_predictions(conn, detection_ids=[int(detection_id)], rank="species")
+             .get(int(detection_id)) or [])
+    qtop = qpred[0] if qpred else {}
+    query_payload = {
+        "detection_id": int(detection_id),
+        "asset_id": qrow.get("asset_id"),
+        "label": qrow.get("label"),
+        "score": qrow.get("score"),
+        "x": qrow.get("x"),
+        "y": qrow.get("y"),
+        "w": qrow.get("w"),
+        "h": qrow.get("h"),
+        "original_file_name": qrow.get("original_file_name"),
+        "species": qtop.get("species"),
+        "common_name": qtop.get("common_name"),
+        "species_score": qtop.get("score"),
+        "thumb_url": f"/api/bbox/{int(detection_id)}/thumb",
+    }
+
+    neighbors: list[dict] = []
+    for did, sim, aid in box_hits:
+        meta = box_meta.get(did)
+        if meta is None:
+            continue
+        top1 = (box_preds.get(did) or [None])[0] or {}
+        neighbors.append({
+            "kind": "box",
+            "detection_id": did,
+            "asset_id": meta["asset_id"],
+            "label": meta["label"],
+            "yolo_score": meta["yolo_score"],
+            "similarity": sim,
+            "species": top1.get("species"),
+            "common_name": top1.get("common_name"),
+            "species_score": top1.get("score"),
+            "family": top1.get("family"),
+            "genus": top1.get("genus"),
+            "original_file_name": meta["original_file_name"],
+            "thumb_url": f"/api/bbox/{did}/thumb",
+            "n_boxes": int(asset_box_counts.get(aid, 1)),
+        })
+    for aid, sim, _source_aid in photo_hits:
+        meta = photo_meta.get(aid)
+        if meta is None:
+            continue
+        top1 = photo_top.get(aid) or {}
+        neighbors.append({
+            "kind": "photo",
+            "asset_id": aid,
+            "similarity": sim,
+            "species": top1.get("species"),
+            "common_name": top1.get("common_name"),
+            "species_score": top1.get("score"),
+            "original_file_name": meta["original_file_name"],
+            "thumb_url": f"/thumb/{aid}?size=thumbnail",
+            "n_boxes": int(asset_box_counts.get(aid, 0)),
+        })
+
+    neighbors.sort(key=lambda n: n["similarity"], reverse=True)
+    return {
+        "query": query_payload,
+        "neighbors": neighbors,
+        "model_version": model_version,
+        "include_photos": bool(include_photos),
+    }
 
 
 # ---------- taxon_scores -------------------------------------------------

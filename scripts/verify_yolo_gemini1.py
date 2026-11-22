@@ -22,6 +22,9 @@ import argparse
 import sys
 from pathlib import Path
 
+import json
+import os
+
 import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
@@ -63,6 +66,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--golden", default="data/models/gemini1_golden")
     ap.add_argument("--onnx", default="data/models/gemini1_seg_best.fp16.onnx")
+    ap.add_argument(
+        "--source-dir", default=None,
+        help="original images the golden was built from (preferred over "
+             "golden/img/*.jpg, which are lossy re-encodes)")
     args = ap.parse_args()
 
     golden_dir = Path(args.golden)
@@ -72,14 +79,32 @@ def main() -> None:
     if not onnx.is_absolute():
         onnx = REPO / onnx
 
+    # detect() resolves its graph from YOLO_GEMINI1_ONNX; without this the
+    # gate silently ran the default model against the other export's golden
+    # (2026-11-20: obj6 golden vs gemini1 graph → 'pot' label not in names).
+    os.environ["YOLO_GEMINI1_ONNX"] = str(onnx)
+
+    source_dir = Path(args.source_dir) if args.source_dir else None
+
     g = np.load(golden_dir / "golden.npz", allow_pickle=True)
-    names = list(ydet.NAMES)
+    # The golden dir carries the class table it was exported with
+    # (6 for gemini1, 5 for the 2026-11-20 obj6 export).
+    gmanifest = json.loads((golden_dir / "manifest.json").read_text())
+    names = list(gmanifest.get("names") or ydet.NAMES)
+    ydet.CLASS_TABLES[len(names)] = tuple(names)
+
 
     ratios, conf_ds, n_ref, n_new = [], [], 0, 0
     for i, stem in enumerate(g["stems"]):
-        img_path = next(golden_dir.parent.glob(f"**/{stem}.jpg")) if not (
-            golden_dir / "img" / f"{stem}.jpg"
-        ).exists() else golden_dir / "img" / f"{stem}.jpg"
+        # golden/img/*.jpg are cv2.imwrite RE-ENCODED copies of the source
+        # images, but the reference boxes were computed from the originals
+        # (export_golden.py: cv2.imread -> letterbox -> predict -> imwrite).
+        # Decoding the copy moves pixels by up to ~30 counts and drops boxes
+        # near the conf floor (2026-11-20: obj6 min ratio .909 on the copy).
+        # Prefer --source-dir originals; fall back to the copy.
+        img_path = (source_dir / f"{stem}.jpg") if source_dir else None
+        if not (img_path and img_path.exists()):
+            img_path = golden_dir / "img" / f"{stem}.jpg"
         # detect() returns normalized source-space xywh; the golden ref
         # boxes are letterbox-space xyxy — undo via the stored gain/pad.
         from PIL import Image

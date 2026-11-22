@@ -1688,6 +1688,14 @@ async def public_config() -> dict:
     is returned so the form can pre-fill it, but the API key is only
     ever surfaced as a boolean — never its value.
     """
+    try:
+        with storage.connect(DB_PATH) as conn:
+            bbox_embeddings = int(conn.execute(
+                "SELECT COUNT(*) FROM bbox_embeddings"
+            ).fetchone()[0])
+    except Exception:
+        # Older DB / first boot before init_db: no box index yet.
+        bbox_embeddings = 0
     return {
         "immich_public_url": os.environ.get("IMMICH_PUBLIC_URL")
         or immich_base_url(),
@@ -1698,6 +1706,7 @@ async def public_config() -> dict:
             os.environ.get("IMMICH_BASE_URL")
             or os.environ.get("IMMICH_API_KEY")
         ),
+        "bbox_embeddings": bbox_embeddings,
     }
 
 
@@ -2620,6 +2629,134 @@ async def asset_detail(asset_id: str) -> dict:
     if status != 200:
         raise HTTPException(status_code=status, detail=body["detail"])
     return body
+
+
+# ---- Box-level similarity ------------------------------------------------
+
+
+@app.get("/api/bbox/{detection_id}/neighbors")
+async def bbox_neighbors_route(
+    detection_id: int,
+    k: int = 12,
+    include_photos: bool = True,
+) -> dict:
+    """Similar source images and whole photos for one YOLO box.
+
+    Box and whole-photo vectors are both teacher BioCLIP embeddings, so the
+    ranking happens in one matrix (see storage.bbox_neighbors). The result
+    is collapsed to one row per source asset (n_boxes records how many
+    crops that image contributed), and the query's own asset is excluded
+    so its other crops cannot self-match. `k` is distinct images, not
+    crops. Whole photos are the fallback for photos where YOLO found
+    nothing.
+    """
+    take = min(max(int(k), 1), 50)
+
+    def _build() -> dict | None:
+        with storage.connect(DB_PATH) as conn:
+            return storage.bbox_neighbors(
+                conn,
+                detection_id=int(detection_id),
+                k=take,
+                include_photos=include_photos,
+            )
+
+    result = await asyncio.to_thread(_build)
+    if result is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No box embedding for this detection — run the box backfill first.",
+        )
+    return result
+
+
+_bbox_thumb_cache: OrderedDict[int, tuple[bytes, str]] = OrderedDict()
+_bbox_thumb_lock = asyncio.Lock()
+_BBOX_THUMB_CACHE_MAX = 512
+
+
+@app.get("/api/bbox/{detection_id}/thumb")
+async def bbox_thumb(detection_id: int) -> Response:
+    """Crop one detection bbox out of its source preview (cached)."""
+    import io
+
+    from PIL import Image
+
+    key = int(detection_id)
+    async with _bbox_thumb_lock:
+        hit = _bbox_thumb_cache.get(key)
+        if hit is not None:
+            _bbox_thumb_cache.move_to_end(key)
+            body, media_type = hit
+            return Response(
+                content=body,
+                media_type=media_type,
+                headers={
+                    "Cache-Control": "public, max-age=86400, immutable",
+                    "Content-Length": str(len(body)),
+                    "X-Bbox-Thumb-Cache": "HIT",
+                },
+            )
+
+    def _lookup() -> dict | None:
+        with storage.connect(DB_PATH) as conn:
+            return storage.get_detection_with_asset_url(conn, detection_id=key)
+
+    det = await asyncio.to_thread(_lookup)
+    if not det:
+        raise HTTPException(status_code=404, detail="Detection not found")
+
+    client = _thumb_client
+    if client is None:
+        async with httpx.AsyncClient(
+            base_url=immich_base_url(),
+            headers={"x-api-key": immich_api_key(), "Accept": "image/*"},
+            timeout=30.0,
+        ) as fallback:
+            r = await fallback.get(
+                f"/api/assets/{det['asset_id']}/thumbnail",
+                params={"size": "preview"},
+            )
+    else:
+        r = await client.get(
+            f"/api/assets/{det['asset_id']}/thumbnail",
+            params={"size": "preview"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(
+            status_code=r.status_code,
+            detail=f"immich preview {det['asset_id']}: {r.text[:200]}",
+        )
+
+    try:
+        image = Image.open(io.BytesIO(r.content)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"bad preview image: {exc}") from exc
+    W, H = image.size
+    x0 = max(0, int(float(det["x"]) * W))
+    y0 = max(0, int(float(det["y"]) * H))
+    x1 = min(W, int((float(det["x"]) + float(det["w"])) * W))
+    y1 = min(H, int((float(det["y"]) + float(det["h"])) * H))
+    if x1 <= x0 or y1 <= y0:
+        raise HTTPException(status_code=422, detail="empty bbox")
+    crop = image.crop((x0, y0, x1, y1))
+    out = io.BytesIO()
+    crop.save(out, format="JPEG", quality=90, optimize=True)
+    body = out.getvalue()
+    media_type = "image/jpeg"
+    async with _bbox_thumb_lock:
+        _bbox_thumb_cache[key] = (body, media_type)
+        while len(_bbox_thumb_cache) > _BBOX_THUMB_CACHE_MAX:
+            _bbox_thumb_cache.popitem(last=False)
+    return Response(
+        content=body,
+        media_type=media_type,
+        headers={
+            "Cache-Control": "public, max-age=86400, immutable",
+            "Content-Length": str(len(body)),
+            "X-Bbox-Thumb-Cache": "MISS",
+        },
+    )
 
 
 # NOTE: the old "/api/album/plants" endpoints were folded into the

@@ -612,6 +612,16 @@ def _chunk_log(
         eta_seconds=remaining,
     )
 BBOX_BIOCLIP_MIN = 0.15
+# The Linux pipeline can re-classify each crop, but it only writes
+# bbox_predictions — it does NOT write the bbox_embeddings used by the
+# Similar panel. On the teacher model that pass is also the heaviest
+# stage in the run (tens of thousands of crops, ~11 GB peak); the Mac
+# CoreML worker computes both predictions and embeddings far faster.
+# Set BBOX_BIOCLIP_ENABLED=0 on teacher instances that use the Mac box
+# backfill, so a normal run cannot OOM here.
+BBOX_BIOCLIP_ENABLED = os.environ.get(
+    "BBOX_BIOCLIP_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 # Top-K to ask BioCLIP for on each crop. Stored in full; UI shows 3.
 BBOX_BIOCLIP_TOP_K = 5
 
@@ -2799,6 +2809,8 @@ def run_pipeline(
             # assets also get bbox classification on the next run.
             all_bbox_targets: list[tuple[str, int, dict]] = []
             for asset in assets:
+                if not BBOX_BIOCLIP_ENABLED:
+                    break
                 dets = storage.fetch_detections(
                     conn, asset_id=asset.id, rank=rank_name
                 )
@@ -2821,6 +2833,13 @@ def run_pipeline(
                     ):
                         continue
                     all_bbox_targets.append((asset.id, d["id"], d))
+
+            if not BBOX_BIOCLIP_ENABLED:
+                _log.info(
+                    "[bbox-bioclip] disabled by BBOX_BIOCLIP_ENABLED=0 — "
+                    "skipping the Linux teacher crop pass; use the Mac box "
+                    "backfill to write predictions + bbox_embeddings"
+                )
 
             bbox_total_chunks = (
                 (len(all_bbox_targets) + batch_size - 1) // batch_size

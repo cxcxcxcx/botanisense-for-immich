@@ -14,7 +14,7 @@
 
 # ---- Stage 1: build the SPA ------------------------------------------------
 
-FROM node:20-alpine AS frontend
+FROM node:24-alpine AS frontend
 WORKDIR /build
 # Fetch deps first so source edits don't invalidate the npm layer.
 COPY frontend/package.json frontend/package-lock.json ./

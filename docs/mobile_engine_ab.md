@@ -134,3 +134,45 @@ docker compose -f compose.s0.yml down        # 容器停掉；生产 :8770 无�
 ```
 
 镜像 `immich_bioclip-botanisense-s0` 与生产镜像互不影响；不用了 `docker rmi` 即可。
+
+## 变体：teacher + gemini1（2026-11-16）
+
+把 :8771 从 S0 手机引擎切成 **prod BioCLIP-2 + 自训练 gemini1 YOLO**。
+species/embeddings 与 :8770 完全同源，只比较检测框和人物标记。
+
+| | 值 |
+|---|---|
+| 地址 | `:8771`（systemd `botanisense-teacher-gemini1.service`） |
+| 引擎 | `ENGINE=teacher`（BioCLIP-2，复用 `botanisense-fresh/data/huggingface` 缓存） |
+| 检测 | `YOLO_BACKEND=gemini1` + `YOLO_GEMINI1_ONNX=data/models/gemini1_seg_best.fp16.onnx` |
+| DB | `data/tg/state.db`（生产 teacher DB 的 `.backup`，清空 detections / bbox_predictions / bbox_knn_predictions / `has_person` / `yolo_scanned_at`） |
+| person veto | `data/person_classifier.joblib`（teacher 空间，启用） |
+| near-dup | 默认 0.97（不要继承 S0 的 0.99） |
+| 旧 S0 | 容器 `botanisense-s0` 已停止，保留 `data/ab/state_s0-2M.db` 可回滚 |
+
+烟测（20 张）：
+
+```
+[yolo] loading detection backend yolo_gemini1 (YOLO_BACKEND=gemini1)
+[yolo] loading gemini1_seg ONNX .../gemini1_seg_best.fp16.onnx
+[yolo] done 20 assets in 3s   → plant/pot/hand/flower/tree/person
+```
+
+`person` 阶段会按 `has_person IS NULL` 做全库补扫（约 500 张 / 72 s），
+20k 库约 45–60 分钟；不需要等它跑完才能看检测框。
+
+Docker 备选：`compose.teacher-gemini1.yml`（镜像已构建
+`immich_bioclip-botanisense-tg`）。用 Docker 前先停 systemd 服务：
+
+```bash
+sudo systemctl disable --now botanisense-teacher-gemini1.service
+docker compose -f compose.teacher-gemini1.yml up -d
+```
+
+回滚到 S0：
+
+```bash
+sudo systemctl disable --now botanisense-teacher-gemini1.service
+docker update --restart=unless-stopped botanisense-s0
+docker start botanisense-s0
+```
