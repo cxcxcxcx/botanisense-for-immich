@@ -1,5 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { MouseEvent } from 'react';
 import type { Detection } from '../api/types';
+import { mergeDetectionsForDisplay } from '../lib/bbox';
 
 // Color-code by label so the user can tell at a glance what YOLO
 // saw. Person-flavored boxes (person / face / human) get the accent
@@ -47,15 +49,17 @@ interface Props {
   // Fires if the image fails to decode (so callers can swap to a
   // fallback URL, e.g. fullsize → preview).
   onError?: () => void;
-  // When provided, the canvas draws ONLY the boxes whose `id` is in
-  // the set, regardless of score. This is the "plants in this image"
-  // signal: the asset-detail modal passes the detection IDs that
-  // storage.compute_plant_attribution accepted as justified, so
-  // plausibly-low-YOLO boxes are still drawn when the whole-image
-  // plantae score confirms the bbox. When omitted, the canvas falls
-  // back to the original `score >= 0.50` filter (used by grid cards
-  // that don't have an attribution summary).
+  // Boxes whose `id` is in the set are always drawn, regardless of
+  // score. This is the "plants in this image" signal: the asset-detail
+  // modal passes the detection IDs that storage.compute_plant_attribution
+  // accepted as justified, so plausibly-low-YOLO boxes are still drawn
+  // when the whole-image plantae score confirms the bbox.
   highlightDetectionIds?: number[] | null;
+  // Draw boxes with score >= this threshold (default 0.50). The asset
+  // detail lowers it to 0.25 for the "show all boxes" mode.
+  minScore?: number;
+  // Click a box on the canvas to select it (asset detail → Similar).
+  onDetectionClick?: (detectionId: number) => void;
 }
 
 // A <canvas> that draws BOTH the photo and its YOLO detection boxes.
@@ -74,6 +78,8 @@ export function BboxImage({
   ariaLabel,
   onError,
   highlightDetectionIds,
+  minScore,
+  onDetectionClick,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgRef = useRef<HTMLImageElement | null>(null);
@@ -186,14 +192,17 @@ export function BboxImage({
       const mapX = (px: number) => offX + px * drawW;
       const mapY = (py: number) => offY + py * drawH;
 
-      const visible = (detections ?? []).filter(d => {
-        if (highlightDetectionIds && highlightDetectionIds.length > 0) {
-          return highlightDetectionIds.includes(d.id);
-        }
-        // Backwards-compat default: only draw high-confidence boxes
-        // when the caller hasn't supplied a curated highlight set.
-        return d.score >= 0.50;
-      });
+      const threshold = minScore ?? 0.50;
+      const highlight = highlightDetectionIds?.length
+        ? new Set(highlightDetectionIds)
+        : null;
+      const visible = (detections ?? []).filter(
+        d => (highlight?.has(d.id) ?? false) || d.score >= threshold,
+      );
+      // A bouquet often produces one YOLO box per flower head. Draw
+      // adjacent same-label boxes as one union region, with the member
+      // count in the label. The raw detections remain in the debug list.
+      const display = mergeDetectionsForDisplay(visible);
       const stroke = 2 * s;
       const fontSize = 10 * s;
       const pad = 2 * s;
@@ -201,7 +210,7 @@ export function BboxImage({
       ctx.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
       ctx.textBaseline = 'top';
 
-      for (const d of visible) {
+      for (const d of display) {
         const color = COLOR_FOR[d.label] ?? DEFAULT_COLOR;
         const bx = mapX(d.x);
         const by = mapY(d.y);
@@ -210,7 +219,8 @@ export function BboxImage({
         ctx.strokeStyle = color;
         ctx.strokeRect(bx, by, bw, bh);
 
-        const label = `${d.label} ${Math.round(d.score * 100)}%`;
+        const count = d.group_count > 1 ? ` ×${d.group_count}` : '';
+        const label = `${d.label}${count} ${Math.round(d.score * 100)}%`;
         const tw = ctx.measureText(label).width;
         const chipH = fontSize + pad * 2;
         let cx = Math.max(0, bx);
@@ -229,7 +239,46 @@ export function BboxImage({
     const ro = new ResizeObserver(draw);
     ro.observe(canvas);
     return () => ro.disconnect();
-  }, [natural, detections, fit, highlightDetectionIds]);
+  }, [natural, detections, fit, highlightDetectionIds, minScore]);
+
+  const handleClick = (event: MouseEvent<HTMLCanvasElement>) => {
+    if (!onDetectionClick || !natural) return;
+    const canvas = event.currentTarget;
+    const rect = canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const px = event.clientX - rect.left;
+    const py = event.clientY - rect.top;
+    let nx: number;
+    let ny: number;
+    if (fit === 'cover') {
+      const scale = Math.max(rect.width / natural.w, rect.height / natural.h);
+      const drawW = natural.w * scale;
+      const drawH = natural.h * scale;
+      const offX = (rect.width - drawW) / 2;
+      const offY = (rect.height - drawH) / 2;
+      nx = (px - offX) / drawW;
+      ny = (py - offY) / drawH;
+    } else {
+      nx = px / rect.width;
+      ny = py / rect.height;
+    }
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return;
+    const threshold = minScore ?? 0.50;
+    const highlight = highlightDetectionIds?.length
+      ? new Set(highlightDetectionIds)
+      : null;
+    const visible = (detections ?? []).filter(
+      d => (highlight?.has(d.id) ?? false) || d.score >= threshold,
+    );
+    const hits = mergeDetectionsForDisplay(visible).filter(
+      d => nx >= d.x && nx <= d.x + d.w
+        && ny >= d.y && ny <= d.y + d.h,
+    );
+    if (hits.length === 0) return;
+    hits.sort((a, b) => a.w * a.h - b.w * b.h);
+    const first = hits[0];
+    if (first) onDetectionClick(first.id);
+  };
 
   const baseClass = fit === 'cover'
     ? 'block w-full h-full'
@@ -242,9 +291,10 @@ export function BboxImage({
       // Hide until the image loads so the default 300×150 canvas never
       // flashes (contain mode has no intrinsic size before then).
       className={`${baseClass}${natural ? '' : ' opacity-0'}${className ? ` ${className}` : ''}`}
-      style={style}
+      style={onDetectionClick ? { ...style, cursor: 'pointer' } : style}
       role="img"
       aria-label={ariaLabel}
+      onClick={handleClick}
     />
   );
 }
