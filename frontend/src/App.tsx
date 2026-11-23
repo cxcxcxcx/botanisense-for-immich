@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { lazy, Suspense, useEffect, useState } from 'react';
 import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
 import { ClusterAlbumBar } from './components/ClusterAlbumBar';
@@ -24,6 +24,12 @@ import { useApp, useFilters, useModal } from './state/AppContext';
 import { initialFilters, parseUrlFilters } from './hooks/useUrlFilters';
 import { useRoute, navigate } from './hooks/useRoute';
 import { getConfig } from './api/endpoints';
+import { BOTANISENSE_ENABLED } from './lib/features';
+
+// Lazy so a build with the switch off never bundles firebase.
+const BotanisensePage = BOTANISENSE_ENABLED
+  ? lazy(() => import('./components/BotanisensePage').then(m => ({ default: m.BotanisensePage })))
+  : null;
 
 export function App() {
   const { dispatch } = useApp();
@@ -43,6 +49,9 @@ export function App() {
     { key: 'b', label: 'b', action: () => navigate('browse-list') },
     { key: 'm', label: 'm', action: () => navigate('map') },
     { key: 'r', label: 'r', action: () => navigate('run') },
+    ...(BOTANISENSE_ENABLED
+      ? [{ key: 't', label: 't', action: () => navigate('botanisense') }]
+      : []),
     { key: '?', label: '?', action: () => setShowShortcuts(s => !s) },
   ]);
 
@@ -97,7 +106,7 @@ export function App() {
   // and the URL bar shows the current view.
   useEffect(() => {
     const h = window.location.hash.replace(/^#/, '').trim();
-    if (h !== 'browse' && h !== 'browse/content' && h !== 'map' && h !== 'run') {
+    if (h !== 'browse' && h !== 'browse/content' && h !== 'map' && h !== 'run' && !(BOTANISENSE_ENABLED && h === 'botanisense')) {
       window.location.hash = '#browse';
     }
   }, []);
@@ -187,6 +196,10 @@ export function App() {
           </section>
         ) : view === 'map' ? (
           <LocationMapView />
+        ) : view === 'botanisense' && BotanisensePage ? (
+          <Suspense fallback={null}>
+            <BotanisensePage />
+          </Suspense>
         ) : view === 'browse-content' ? (
           <>
             <ClusterAlbumBar />

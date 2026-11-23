@@ -20,6 +20,11 @@ WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
+# BotaniSense account integration (sign-in, Diary tab, Send to
+# BotaniSense) is compiled out unless this is 1 — see
+# frontend/src/lib/features.ts.
+ARG VITE_BOTANISENSE_ENABLED=0
+ENV VITE_BOTANISENSE_ENABLED=$VITE_BOTANISENSE_ENABLED
 # tsc -b && vite build -> /build/dist
 RUN npm run build
 

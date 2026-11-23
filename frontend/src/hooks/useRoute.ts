@@ -13,8 +13,9 @@
 //   #run               → params + status + logs (pipeline)
 
 import { useEffect, useState } from 'react';
+import { BOTANISENSE_ENABLED } from '../lib/features';
 
-export type View = 'browse-list' | 'browse-content' | 'map' | 'run';
+export type View = 'browse-list' | 'browse-content' | 'map' | 'run' | 'botanisense';
 
 export type BrowseTab = 'browse-list' | 'browse-content';
 
@@ -30,14 +31,16 @@ export function parseHashRoute(hash: string = window.location.hash): View {
   const h = hash.replace(/^#/, '').trim();
   if (h === 'run') return 'run';
   if (h === 'map') return 'map';
+  if (BOTANISENSE_ENABLED && h === 'botanisense') return 'botanisense';
   if (h === 'browse/content' || h === 'browse/content/') return 'browse-content';
   return 'browse-list';
 }
 
 /** Top-level view for the header tab strip. */
-export function topLevel(view: View): BrowseTab | 'map' | 'run' {
+export function topLevel(view: View): BrowseTab | 'map' | 'run' | 'botanisense' {
   if (view === 'run') return 'run';
   if (view === 'map') return 'map';
+  if (view === 'botanisense') return 'botanisense';
   return 'browse-list';
 }
 
@@ -56,6 +59,7 @@ export function navigate(view: View): void {
   const next = view === 'browse-list' ? '#browse'
              : view === 'browse-content' ? '#browse/content'
              : view === 'map' ? '#map'
+             : view === 'botanisense' ? '#botanisense'
              : '#run';
   // Setting hash fires hashchange synchronously; useRoute picks it up.
   window.location.hash = next;

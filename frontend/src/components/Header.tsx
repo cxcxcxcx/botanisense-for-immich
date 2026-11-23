@@ -3,6 +3,7 @@ import { useApp } from '../state/AppContext';
 import { getHealth } from '../api/endpoints';
 import type { HealthEngine } from '../api/types';
 import { useEffect, useState } from 'react';
+import { BOTANISENSE_ENABLED } from '../lib/features';
 
 // Inline BotaniSense brand mark — same fan-of-blades SVG used by
 // `frontend/public/favicon.svg`. Drawn at 28×28 in the header so the
@@ -131,6 +132,18 @@ export function Header({ view }: Props) {
             <MapIcon />
             <span className="hidden sm:inline">Map</span>
           </button>
+          {BOTANISENSE_ENABLED && (
+            <button
+              role="tab"
+              aria-selected={active === 'botanisense'}
+              title="BotaniSense diary"
+              className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2.5 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'botanisense' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
+              onClick={() => navigate('botanisense')}
+            >
+              <DiaryIcon />
+              <span className="hidden sm:inline">Diary</span>
+            </button>
+          )}
           <button
             role="tab"
             aria-selected={active === 'run'}
@@ -175,6 +188,15 @@ function MapIcon() {
     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
       <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
       <circle cx="12" cy="10" r="3" />
+    </svg>
+  );
+}
+
+function DiaryIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M11 20A7 7 0 0 1 9.8 6.1C15.5 5 17 4.48 19 2c1 2 2 4.18 2 8 0 5.5-4.78 10-10 10Z" />
+      <path d="M2 21c0-3 1.85-5.36 5.08-6C9.5 14.52 12 13 13 12" />
     </svg>
   );
 }
