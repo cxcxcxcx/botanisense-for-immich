@@ -8,6 +8,8 @@ import { LibraryNeighbors } from './LibraryNeighbors';
 import { KnnRefNeighbors } from './KnnRefNeighbors';
 import { DetectionBlock } from './DetectionBlock';
 import { BboxImage } from './BboxImage';
+import { BboxNeighbors } from './BboxNeighbors';
+import { useApp } from '../state/AppContext';
 import { useToasts } from './ToastProvider';
 import { formatPct } from '../lib/format';
 import { copyTextOrSelect } from '../lib/clipboard';
@@ -125,13 +127,20 @@ export function AssetDetail({ assetId }: Props) {
   const [data, setData] = useState<AssetDetailType | null>(null);
   const [error, setError] = useState<Error | null>(null);
   const [copied, setCopied] = useState(false);
+  const [showAllBoxes, setShowAllBoxes] = useState(true);
+  const [similarDetectionId, setSimilarDetectionId] = useState<number | null>(null);
   const assetIdRef = useRef<HTMLElement | null>(null);
+  const { dispatch } = useApp();
   // If the 'fullsize' thumb fails to load, fall back to the smaller
   // 'preview' size. Reset on asset change so each asset tries fullsize
   // first.
   const [usePreview, setUsePreview] = useState(false);
   // Public Immich URL for the "Open in Immich ↗" deep-link.
   const [immichPublicUrl, setImmichPublicUrl] = useState<string | null>(null);
+  // Box-level search is only available on instances that have run the
+  // bbox backfill; /api/config reports the row count so the 8770
+  // YOLO-World instance doesn't offer a button that would 404.
+  const [bboxCount, setBboxCount] = useState(0);
   // KNN status — fetched once on mount. When the reference index is
   // built, "Re-run KNN on this asset" appears in the modal so the
   // user can opt into per-asset KNN reclassification. Hidden when
@@ -150,6 +159,8 @@ export function AssetDetail({ assetId }: Props) {
     setError(null);
     setCopied(false);
     setUsePreview(false);
+    setShowAllBoxes(true);
+    setSimilarDetectionId(null);
     getAsset(assetId)
       .then(d => { if (!cancelled) setData(d); })
       .catch(e => { if (!cancelled) setError(e); });
@@ -159,7 +170,11 @@ export function AssetDetail({ assetId }: Props) {
   useEffect(() => {
     let cancelled = false;
     getConfig()
-      .then(c => { if (!cancelled) setImmichPublicUrl(c.immich_public_url); })
+      .then(c => {
+        if (cancelled) return;
+        setImmichPublicUrl(c.immich_public_url);
+        setBboxCount(c.bbox_embeddings ?? 0);
+      })
       .catch(() => { /* silently no link */ });
     return () => { cancelled = true; };
   }, []);
@@ -256,6 +271,8 @@ export function AssetDetail({ assetId }: Props) {
             src={thumbUrl(data.asset_id, usePreview ? 'preview' : 'fullsize')}
             detections={data.detections}
             highlightDetectionIds={highlightIds}
+            minScore={showAllBoxes ? 0.25 : 0.5}
+            onDetectionClick={bboxCount > 0 ? id => setSimilarDetectionId(id) : undefined}
             fit="contain"
             maxHeight={224}
             ariaLabel={data.original_file_name}
@@ -263,6 +280,24 @@ export function AssetDetail({ assetId }: Props) {
           />
         </figure>
       </div>
+      <label className="flex items-center justify-center gap-1.5 text-[11px] text-fg-2">
+        <input
+          type="checkbox"
+          checked={!showAllBoxes}
+          onChange={event => setShowAllBoxes(!event.target.checked)}
+        />
+        Confident only (≥50%); off = show all ≥25%
+      </label>
+      {similarDetectionId != null && (
+        <BboxNeighbors
+          detectionId={similarDetectionId}
+          onClose={() => setSimilarDetectionId(null)}
+          onOpenAsset={nextAssetId => {
+            setSimilarDetectionId(null);
+            dispatch({ type: 'OPEN_MODAL', assetId: nextAssetId });
+          }}
+        />
+      )}
 
       {/* Filename + Open in Immich — side-by-side, filename
           truncates, CTA stays visible. Green-tinted accent matches
@@ -514,13 +549,24 @@ export function AssetDetail({ assetId }: Props) {
             .map((d, i) => (
               <div key={d.id}>
                 <DetectionBlock det={d} fullTop1={fullTop1} />
-                <button
-                  type="button"
-                  className="self-start text-[11px] text-fg-1 underline hover:text-fg"
-                  onClick={() => handleReclassifyBbox(d.id)}
-                >
-                  Reclassify crop
-                </button>
+                <div className="flex items-center gap-3">
+                  {bboxCount > 0 && (
+                    <button
+                      type="button"
+                      className="text-[11px] text-accent underline hover:text-fg"
+                      onClick={() => setSimilarDetectionId(d.id)}
+                    >
+                      Similar
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="text-[11px] text-fg-1 underline hover:text-fg"
+                    onClick={() => handleReclassifyBbox(d.id)}
+                  >
+                    Reclassify crop
+                  </button>
+                </div>
               </div>
             ))}
         </details>

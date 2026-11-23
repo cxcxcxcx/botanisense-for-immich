@@ -3,6 +3,7 @@
 // shapes stay in one place.
 
 import { fetchJson } from './client';
+import type { BboxNeighborsResponse } from './types';
 import type {
   AssetDetail,
   BulkClusterRemoveParams,
@@ -420,4 +421,18 @@ export const startKnnBuild = (args: KnnBuildArgs) =>
 export const getKnnBuildLogs = (job_id: string, tail = 50) =>
   fetchJson<KnnBuildLogsResponse>('/api/knn/build/logs', {
     query: { job_id, tail },
+  });
+
+// ---- Box-level similarity ------------------------------------------------
+// One YOLO detection crop → similar source images + whole photos. The
+// backend ranks both in the same teacher BioCLIP space, then collapses
+// all crops from the same source image into one row (n_boxes) and
+// excludes the query image itself.
+export const getBboxNeighbors = (
+  detectionId: number,
+  k = 12,
+  includePhotos = true,
+) =>
+  fetchJson<BboxNeighborsResponse>(`/api/bbox/${detectionId}/neighbors`, {
+    query: { k, include_photos: includePhotos },
   });

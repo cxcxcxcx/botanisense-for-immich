@@ -321,6 +321,8 @@ export interface PublicConfig {
   api_key_set: boolean;
   source: 'env' | 'db' | 'none';
   env_pinned: boolean;
+  /** Number of box embeddings in this DB; 0 hides the Similar UI. */
+  bbox_embeddings?: number;
 }
 
 // POST /api/settings/immich — save the Immich connection from the web
@@ -639,4 +641,46 @@ export interface EventSnapshot {
   // Log tail is included in the snapshot so LogTail can drop its own
   // 2-second poll. `mtime` lets the client dedupe / know freshness.
   logs: { lines: string[]; mtime: number };
+}
+// ---- Box-level similarity ------------------------------------------------
+
+export interface BboxNeighbor {
+  kind: 'box' | 'photo';
+  detection_id?: number;
+  asset_id: string;
+  label?: string | null;
+  yolo_score?: number | null;
+  similarity: number;
+  species?: string | null;
+  common_name?: string | null;
+  species_score?: number | null;
+  family?: string | null;
+  genus?: string | null;
+  original_file_name?: string | null;
+  thumb_url: string;
+  // Number of crop embeddings for this source image. The backend
+  // collapses all of them into this one row; >1 means "N crops seen,
+  // best one shown". Photo rows can also carry the count.
+  n_boxes?: number;
+}
+
+export interface BboxNeighborsResponse {
+  query: {
+    detection_id: number;
+    asset_id: string;
+    label: string;
+    score: number;
+    x: number;
+    y: number;
+    w: number;
+    h: number;
+    original_file_name: string;
+    species?: string | null;
+    common_name?: string | null;
+    species_score?: number | null;
+    thumb_url: string;
+  };
+  neighbors: BboxNeighbor[];
+  model_version: string;
+  include_photos: boolean;
 }
