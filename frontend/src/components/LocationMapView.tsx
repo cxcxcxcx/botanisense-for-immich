@@ -841,8 +841,11 @@ export function LocationMapView({
                 <>
                   {/* Filmstrip on phones (one row, swipe sideways), grid
                       on larger screens. Same nodes either way, so no
-                      duplicated image requests. */}
-                  <div className="flex gap-1 p-2 overflow-x-auto sm:grid sm:grid-cols-6 lg:grid-cols-8 sm:overflow-y-auto sm:overflow-x-hidden">
+                      duplicated image requests. `auto-rows-max` keeps
+                      rows at the tiles' square height: the sheet's
+                      max-height shrinks this box, and plain `auto` rows
+                      would squash to fit instead of scrolling. */}
+                  <div className="flex gap-1 p-2 overflow-x-auto sm:grid sm:grid-cols-6 lg:grid-cols-8 sm:auto-rows-max sm:overflow-y-auto sm:overflow-x-hidden">
                     {placeRows.map((row) => (
                       <button
                         key={row.asset_id}
