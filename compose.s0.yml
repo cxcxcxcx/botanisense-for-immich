@@ -1,8 +1,8 @@
 # BotaniSense for Immich — S0-engine A/B instance (EXPERIMENTAL).
 #
 # Runs a SECOND container next to production with the BioCLIP-Mobile S0
-# package as the classification engine and the trained gemini1_seg
-# detector instead of YOLO-World, against a SHADOW database
+# package as the classification engine and the trained obj6 detector
+# instead of the default RTMDet, against a SHADOW database
 # (data/ab/state.db — created by scripts/setup_shadow_ab.py). The
 # production container (botanisense, :8770) keeps the BioCLIP-2 teacher
 # and its own DB; this file never touches it.
@@ -28,12 +28,12 @@ services:
       DB_PATH: /app/data/ab/state_s0-2M.db
       # Engine selection (pipeline._resolve_classifier) + detection
       # backend (pipeline._yolo_backend_module). Unset both on the
-      # production container → teacher + YOLO-World, byte-identical
+      # production container → teacher + RTMDet, the defaults
       # behavior.
       ENGINE: mobile-s0-2M
       MOBILE_PACKAGE: /app/models/bioclip-mobile-s0-2M
-      YOLO_BACKEND: gemini1
-      YOLO_GEMINI1_ONNX: /app/models/gemini1_seg_best.fp16.onnx
+      YOLO_BACKEND: obj6
+      YOLO_OBJ6_ONNX: /app/models/2026_11_20_obj6_control_5c.fp16.onnx
       # The person-veto logistic head was trained on teacher vectors —
       # meaningless against S0 embeddings. Point it at a missing path:
       # _load_person_clf() degrades to "veto disabled" with a log line.

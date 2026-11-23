@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Side-by-side detector A/B on a sample of library photos (read-only).
 
-Runs two gemini1-contract ONNX detectors (same 6-class / 42-channel output,
-so both go through yolo_gemini1 unchanged) over the same previews, applies
+Runs two obj6-contract ONNX detectors (same 5-class / 41-channel output,
+so both go through yolo_obj6 unchanged) over the same previews, applies
 the product's class-agnostic merge, and renders one row per photo:
 
     A boxes | B boxes      + per-photo counts of the crops BioCLIP would get
@@ -16,7 +16,7 @@ is written to it. Output goes under the :8780 static server's root:
 
 Usage:
   .venv/bin/python scripts/yolo_ab_compare.py \
-      --a data/models/gemini1_seg_best.fp16.onnx \
+      --a data/models/2026_11_20_obj6_control_5c.fp16.onnx \
       --b data/models/2026_11_19_obj4_control.fp16.onnx \
       --db data/tg/state.db --random 100
 """
@@ -39,11 +39,11 @@ from PIL import Image, ImageDraw, ImageFont
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
-os.environ["YOLO_BACKEND"] = "gemini1"
+os.environ["YOLO_BACKEND"] = "obj6"
 
 import pipeline  # noqa: E402
 import storage  # noqa: E402
-import yolo_gemini1  # noqa: E402
+import yolo_obj6  # noqa: E402
 from immich_client import ImmichClient  # noqa: E402
 
 REVIEW = ROOT / "data/labeling/bbox_review_v1"
@@ -51,7 +51,7 @@ REVIEW = ROOT / "data/labeling/bbox_review_v1"
 CROP_LABELS = ("plant", "flower", "tree")
 CROP_MIN = 0.25
 RGB = {
-    "plant": (40, 220, 40), "pot": (40, 120, 255), "flower": (255, 80, 200),
+    "plant": (40, 220, 40), "flower": (255, 80, 200),
     "tree": (20, 130, 20), "person": (230, 60, 60), "hand": (255, 160, 40),
 }
 
@@ -79,13 +79,13 @@ def _sample(db: Path, n_random: int, seed: int) -> list[tuple[str, str]]:
 
 
 def _run(onnx: Path, images: list[Image.Image], conf: float) -> list[list[dict]]:
-    yolo_gemini1.unload_model()
-    os.environ["YOLO_GEMINI1_ONNX"] = str(onnx)
+    yolo_obj6.unload_model()
+    os.environ["YOLO_OBJ6_ONNX"] = str(onnx)
     out = []
     for i in range(0, len(images), 8):
-        for dets in yolo_gemini1.detect(images[i:i + 8], conf=conf):
+        for dets in yolo_obj6.detect(images[i:i + 8], conf=conf):
             out.append(pipeline._merge_overlapping_boxes(dets))
-    yolo_gemini1.unload_model()
+    yolo_obj6.unload_model()
     return out
 
 
@@ -116,7 +116,6 @@ def _stats(dets: list[dict]) -> dict:
     areas = sorted(c["w"] * c["h"] for c in crops)
     return {
         "crops": len(crops),
-        "pots": sum(1 for d in dets if d["label"] == "pot" and d["score"] >= CROP_MIN),
         "max_crop_area": round(areas[-1], 3) if areas else 0.0,
     }
 
@@ -126,7 +125,7 @@ def main() -> int:
     ap.add_argument("--a", required=True, type=Path, help="baseline ONNX")
     ap.add_argument("--b", required=True, type=Path, help="candidate ONNX")
     ap.add_argument("--c", type=Path, default=None, help="optional third ONNX")
-    ap.add_argument("--a-name", default="A: gemini1 (8771 now)")
+    ap.add_argument("--a-name", default="A: obj6")
     ap.add_argument("--b-name", default="B: 2026-11-19-obj4-control")
     ap.add_argument("--c-name", default="C: 2026-11-20-obj6-control-5c")
     ap.add_argument("--db", default="data/tg/state.db", type=Path)
@@ -149,7 +148,7 @@ def main() -> int:
     )
     images, dead = pipeline.fetch_thumbs(
         client, [(a, a) for a, _ in sample], "yolo-ab",
-        max_size=yolo_gemini1.DECODE_PREVIEW_MAX_SIZE,
+        max_size=yolo_obj6.DECODE_PREVIEW_MAX_SIZE,
     )
     sample = [(a, why) for a, why in sample if a in images]
     imgs = [images[a] for a, _ in sample]
@@ -194,7 +193,6 @@ def main() -> int:
         **{side: str(onnx) for side, onnx, _ in specs},
         "n": len(records),
         "crops": {side: tot(side, "crops") for side in sides},
-        "pots": {side: tot(side, "pots") for side in sides},
         "no_crop_images": {side: sum(r[side]["crops"] == 0 for r in records) for side in sides},
         "changed": sum(r["changed"] for r in records),
     }
@@ -208,7 +206,7 @@ def main() -> int:
         f"<p>n={summary['n']} · BioCLIP crops (plant/flower/tree ≥{CROP_MIN}) "
         + " · ".join(
             f"{side.upper()} {summary['crops'][side]} (no crop "
-            f"{summary['no_crop_images'][side]}, pot {summary['pots'][side]})"
+            f"{summary['no_crop_images'][side]})"
             for side in sides) + f" · changed {summary['changed']}. "
         "Thin boxes = below the crop threshold.</p>"
         '<input type=checkbox id=only><label for=only> only changed</label>'

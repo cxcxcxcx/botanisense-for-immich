@@ -36,18 +36,18 @@ FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
 
-# libgl1 + libglib2.0-0: ultralytics imports cv2, whose wheel needs
-# them at runtime. libgomp1: torch's OpenMP runtime.
+# libgomp1: torch's OpenMP runtime. (cv2 is opencv-python-headless,
+# which needs no libgl1/libglib.)
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        libgl1 libglib2.0-0 libgomp1 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # CPU-only torch/torchvision: UV_TORCH_BACKEND makes uv resolve the
 # PyTorch CPU index instead of the default CUDA build — ~800 MB instead
 # of several GB of NVIDIA wheels. This intentionally bypasses uv.lock
 # for the torch flavor only; nothing in the codebase is CUDA-aware
-# (BioCLIP-2 and YOLO both run on CPU).
+# (BioCLIP-2 runs on CPU; the detector is a CPU onnxruntime graph).
 ENV UV_TORCH_BACKEND=cpu \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1 \
@@ -57,30 +57,22 @@ ENV UV_TORCH_BACKEND=cpu \
     HF_HOME=/app/data/huggingface
 
 WORKDIR /app
-# config.toml / .env / data/ / YOLO weights are all resolved relative
+# config.toml / .env / data/ / models/ are all resolved relative
 # to the CWD — the app must run from /app. Secrets come in via the
 # environment (compose env_file), never baked into the image.
 COPY pyproject.toml ./
 RUN uv pip install --system --no-cache -r pyproject.toml
 
-# Warm model downloads so first scan doesn't need to fetch them, and so
-# a read-only /app still works — yolo.py loads weights by bare filename
-# from the CWD, and ultralytics resolves its weights dir to
-# $CWD/weights (settings weights_dir="weights"), which is root-owned at
-# runtime. set_classes() also imports OpenAI CLIP and downloads its
-# ViT-B/32 text-encoder weights (~340 MB into /app/weights/clip), so
-# doing it here both proves the `clip` dep is present and bakes the
-# weights into the image world-readable.
-RUN python -c "from ultralytics import YOLOWorld; m = YOLOWorld('yolov8s-world.pt'); m.set_classes(['plant'])"
-
 COPY --from=frontend /build/dist frontend/dist
 COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
      map_clusters.py location_guess.py \
-     knn.py knn_io.py immich_client.py run.py yolo.py face.py \
-     mobile_engine.py yolo_gemini1.py ./
-# YuNet face weights — face.py loads by bare filename from the CWD
-# (same read-only-/app constraint as yolov8s-world.pt above).
+     knn.py knn_io.py immich_client.py run.py face.py \
+     mobile_engine.py yolo_obj6.py yolo_rtmdet.py ./
+# YuNet face weights — face.py loads by bare filename from the CWD,
+# and the default RTMDet detector from models/ — both
+# baked in because /app is read-only at runtime.
 COPY face_detection_yunet_2023mar.onnx ./
+COPY models/obj6_rtmdet_ep97.onnx models/
 
 RUN useradd --uid 1000 --create-home botanisense \
     && mkdir -p /app/data \

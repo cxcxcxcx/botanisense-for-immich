@@ -66,7 +66,7 @@ CLEAR_NON_KINGDOM_TAXON_SCORES = (
 )
 
 # Person flag + detection scan marker: the shadow instance re-derives
-# both with the gemini1 detector (compose sets YOLO_BACKEND=gemini1).
+# both with the obj6 detector (compose sets YOLO_BACKEND=obj6).
 RESET_ASSET_COLUMNS = """
 UPDATE assets SET cluster_id = NULL, has_person = NULL,
                   yolo_scanned_at = NULL

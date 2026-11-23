@@ -13,7 +13,7 @@ ONNX that finds those faces at the pipeline's own 448px decode in ~3 ms.
 Model: face_detection_yunet_2023mar.onnx, from github.com/opencv/opencv_zoo
 (Apache-2.0). Committed at the repo root and baked into the Docker image:
 it loads by bare filename from the CWD (same convention as
-yolov8s-world.pt) because /app is read-only at runtime, so a
+the detector ONNX in models/) because /app is read-only at runtime, so a
 download-on-first-use path is not viable.
 
 Outputs are normalized (x, y, w, h) where (x, y) is the top-left corner

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Deploy-time golden gate for the gemini1_seg ONNX detection backend.
+"""Deploy-time golden gate for the obj6 ONNX detection backend.
 
 Checks the parts this repo ADDED on top of the already-gated export:
 letterbox, numpy per-class NMS, and the letterbox→source coordinate
-restore. Runs yolo_gemini1.detect() end-to-end on the 8 golden source
+restore. Runs yolo_obj6.detect() end-to-end on the 8 golden source
 images and matches boxes against the references stored in the export's
 golden.npz (greedy same-class IoU>=0.5, the mobile_golden_gate.py
 protocol):
 
-    python scripts/verify_yolo_gemini1.py \
-        [--golden data/models/gemini1_golden] \
-        [--onnx   data/models/gemini1_seg_best.fp16.onnx]
+    python scripts/verify_yolo_obj6.py \
+        [--golden data/models/obj6_golden] \
+        [--onnx   data/models/2026_11_20_obj6_control_5c.fp16.onnx]
 
 Exit 0 iff every image matches >=95% of ref boxes with mean conf
 |delta| <= 0.02.
@@ -30,7 +30,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-import yolo_gemini1 as ydet  # noqa: E402
+import yolo_obj6 as ydet  # noqa: E402
 
 
 def box_iou(a: np.ndarray, b: np.ndarray) -> np.ndarray:
@@ -64,12 +64,13 @@ def match(ref_b, ref_c, new_b, new_c):
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--golden", default="data/models/gemini1_golden")
-    ap.add_argument("--onnx", default="data/models/gemini1_seg_best.fp16.onnx")
+    ap.add_argument("--golden", default="data/models/obj6_golden")
+    ap.add_argument("--onnx", default="data/models/2026_11_20_obj6_control_5c.fp16.onnx")
     ap.add_argument(
         "--source-dir", default=None,
         help="original images the golden was built from (preferred over "
-             "golden/img/*.jpg, which are lossy re-encodes)")
+             "golden/img/*.jpg, which are lossy re-encodes); defaults to "
+             "<golden>/src when that directory exists")
     args = ap.parse_args()
 
     golden_dir = Path(args.golden)
@@ -79,16 +80,21 @@ def main() -> None:
     if not onnx.is_absolute():
         onnx = REPO / onnx
 
-    # detect() resolves its graph from YOLO_GEMINI1_ONNX; without this the
-    # gate silently ran the default model against the other export's golden
-    # (2026-11-20: obj6 golden vs gemini1 graph → 'pot' label not in names).
-    os.environ["YOLO_GEMINI1_ONNX"] = str(onnx)
+    # detect() resolves its graph from YOLO_OBJ6_ONNX; without this the gate
+    # would silently run the default model against the wrong export's golden
+    # (2026-11-20: obj6 golden vs the retired 6-class graph → 'pot' label
+    # not in names).
+    os.environ["YOLO_OBJ6_ONNX"] = str(onnx)
 
-    source_dir = Path(args.source_dir) if args.source_dir else None
+    if args.source_dir:
+        source_dir = Path(args.source_dir)
+    else:
+        default_src = golden_dir / "src"
+        source_dir = default_src if default_src.is_dir() else None
 
     g = np.load(golden_dir / "golden.npz", allow_pickle=True)
     # The golden dir carries the class table it was exported with
-    # (6 for gemini1, 5 for the 2026-11-20 obj6 export).
+    # (5 for the 2026-11-20 obj6 export).
     gmanifest = json.loads((golden_dir / "manifest.json").read_text())
     names = list(gmanifest.get("names") or ydet.NAMES)
     ydet.CLASS_TABLES[len(names)] = tuple(names)

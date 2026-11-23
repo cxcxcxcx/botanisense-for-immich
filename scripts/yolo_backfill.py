@@ -9,13 +9,13 @@ labels" path — so after switching a shadow DB to a new detector, most of the
 library had no plant/pot boxes at all.
 
 This script fills that gap: it walks the assets table, downloads previews,
-runs the detector selected by $YOLO_BACKEND (world or gemini1), and writes
+runs the detector selected by $YOLO_BACKEND (rtmdet by default, or obj6), and writes
 all labels via storage.replace_detections + mark_yolo_scanned.
 
 Usage (run from the repo root, with the same env as the target app):
 
-  YOLO_BACKEND=gemini1 \
-  YOLO_GEMINI1_ONNX=$PWD/data/models/gemini1_seg_best.fp16.onnx \
+  YOLO_BACKEND=obj6 \
+  YOLO_OBJ6_ONNX=$PWD/data/models/2026_11_20_obj6_control_5c.fp16.onnx \
   DB_PATH=$PWD/data/tg/state.db \
   .venv/bin/python scripts/yolo_backfill.py --batch-size 8
 
@@ -115,7 +115,7 @@ def main() -> int:
         raise SystemExit(f"DB not found: {db_path}")
     base_url, api_key = _connection(db_path)
     ids = _asset_ids(db_path, force=args.force, limit=args.limit)
-    backend = os.environ.get("YOLO_BACKEND", "world")
+    backend = os.environ.get("YOLO_BACKEND", "rtmdet")
     print(
         f"yolo_backfill: backend={backend} db={db_path} "
         f"assets={len(ids)} batch={args.batch_size} force={args.force}",

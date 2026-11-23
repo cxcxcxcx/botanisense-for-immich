@@ -1,11 +1,11 @@
-# BotaniSense for Immich — teacher BioCLIP-2 + trained gemini1 detector.
+# BotaniSense for Immich — teacher BioCLIP-2 + trained obj6 detector.
 #
 # This is the "prod classifier + own YOLO" A/B instance. It replaces the
 # S0/mobile instance on :8771 while keeping the S0 container and its DB on
 # disk for rollback.
 #
 #   docker stop botanisense-s0          # keep it for rollback
-#   docker compose -f compose.teacher-gemini1.yml up --build -d
+#   docker compose -f compose.teacher-obj6.yml up --build -d
 #   → http://localhost:8771
 #
 # The DB is a copy of the production teacher DB (data/state.db) with the
@@ -22,12 +22,12 @@ services:
     environment:
       # Teacher BioCLIP-2 (same as :8770), not the mobile S0 engine.
       ENGINE: teacher
-      # Own trained gemini1 seg detector instead of YOLO-World.
-      YOLO_BACKEND: gemini1
-      YOLO_GEMINI1_ONNX: /app/models/gemini1_seg_best.fp16.onnx
+      # Own trained obj6 detector instead of the default RTMDet.
+      YOLO_BACKEND: obj6
+      YOLO_OBJ6_ONNX: /app/models/2026_11_20_obj6_control_5c.fp16.onnx
       # Separate DB so S0 and teacher embeddings never mix. It is a copy of
       # the production teacher DB with detections/has_person/yolo markers
-      # cleared; the first run scans every asset with gemini1.
+      # cleared; the first run scans every asset with the obj6 detector.
       DB_PATH: /app/data/tg/state.db
       # PERSON_CLF_PATH defaults to data/person_classifier.joblib (trained
       # on teacher vectors — valid here). NEAR_DUP_THRESHOLD stays at the

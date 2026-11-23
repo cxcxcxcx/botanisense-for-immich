@@ -15,22 +15,16 @@ dependencies = [
     "uvicorn>=0.27",
     "hdbscan>=0.8.33",
     "scikit-learn>=1.7.2",
-    "ultralytics>=8.4.113",
-    # YOLO-World bakes its open-vocab text embeddings through OpenAI's
-    # CLIP (import name `clip`); ultralytics only auto-installs it on
-    # first set_classes() via `pip install git+...ultralytics/CLIP`,
-    # which fails in the unprivileged container. Pin the source directly
-    # — a tarball so slim images don't need git. (The PyPI project named
-    # `clip` is an unrelated squat; this MUST stay a direct URL.)
-    "clip @ https://github.com/ultralytics/CLIP/archive/refs/heads/master.tar.gz",
     "faiss-cpu>=1.8",
     "duckdb>=1.0",
     "pyarrow>=25.0.0",
-    # ENGINE=mobile-* (mobile_engine.py) + YOLO_BACKEND=gemini1
-    # (yolo_gemini1.py). Both import it lazily — a production container
-    # with neither env var set never loads it, but it must ship so the
-    # A/B compose file (compose.s0.yml) works from the same image.
+    # Detection (yolo_rtmdet.py, the default; yolo_obj6.py) and
+    # ENGINE=mobile-* (mobile_engine.py) all run ONNX graphs. No
+    # Ultralytics here on purpose — it is AGPL-3.0; see README "License".
     "onnxruntime>=1.20",
+    # Letterbox/resize for the detectors + the YuNet face rescue
+    # (face.py). Headless: the slim image has no GUI libs.
+    "opencv-python-headless>=4.8",
     # tomllib is stdlib in 3.11+. The 3.10 fallback is gated by the
     # python_version marker below — only installed when running 3.10.
     "tomli>=2.0; python_version < '3.11'",

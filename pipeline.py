@@ -1,8 +1,8 @@
 """Shared pipeline: Immich smart-search → BioCLIP embed+predict →
-DB → k-means cluster → YOLO-World detect.
+DB → k-means cluster → detector (RTMDet by default; see YOLO_BACKEND).
 
 Memory note: BioCLIP-2 (~4.3 GB of artifacts: weights + species label
-table) and YOLOv8s-world (~27 MB) are both resident during the first run
+table) and the detector ONNX (~20 MB) are both resident during the first run
 on uncached assets; peak RSS ~6 GB in the pipeline child — see
 docs/BIOCLIP_MEMORY.md. To keep peak RAM
 manageable on small machines, all heavy passes happen in chunks of
@@ -31,7 +31,7 @@ import numpy as np
 from PIL import Image
 import threading
 
-# Heavy imports (torch/bioclip/sklearn-via-clusters/ultralytics-via-yolo)
+# Heavy imports (torch/bioclip/sklearn-via-clusters/onnxruntime-via-yolo)
 # are deferred to run_pipeline() so that `import pipeline` stays cheap and
 # the FastAPI browse-only server doesn't pay ~3 GB of model weights at
 # startup. See run_pipeline() for the deferred-import block.
@@ -41,7 +41,7 @@ from storage import PERSON_LABELS, PERSON_MIN_CONF, HAND_LABEL, HAND_MIN_CONF, h
 from immich_client import ImmichAsset, ImmichClient
 
 # PEP 562 module-level __getattr__ — lazy-loads the heavy bits
-# (torch/bioclip/sklearn-via-clusters/ultralytics-via-yolo) the first
+# (torch/bioclip/sklearn-via-clusters/onnxruntime-via-yolo) the first
 # time anything looks them up by name. Keeps `import pipeline` cheap
 # for the browse-only FastAPI server, while still allowing
 # `pipeline.TreeOfLifeClassifier`, `pipeline.clusters`, `pipeline.yolo`,
@@ -51,12 +51,24 @@ _LAZY_ATTRS = ("TreeOfLifeClassifier", "Rank", "clusters", "yolo", "knn", "face"
 
 
 def _yolo_backend_module() -> str:
-    """Detection backend chosen once per process: 'world' (default) is
-    the YOLO-World open-vocab module; 'gemini1' is the trained potted-
-    plant seg model served through ONNX (yolo_gemini1). Both expose the
-    same get_model()/unload_model()/detect() interface."""
-    backend = (os.environ.get("YOLO_BACKEND") or "world").strip().lower()
-    return "yolo_gemini1" if backend == "gemini1" else "yolo"
+    """Detection backend chosen once per process: 'rtmdet' (default) is
+    the Apache-2.0 RTMDet export shipped in models/; 'obj6' is the
+    opt-in Ultralytics YOLO26 export (AGPL-3.0 weights, bring your own
+    ONNX). Both are served through onnxruntime and expose the same
+    get_model()/unload_model()/detect() interface. 'gemini1' is the
+    retired pre-rename id for 'obj6' and is still accepted so old
+    deployments keep working. The YOLO-World backend ('world') was
+    removed with the ultralytics dependency."""
+    backend = (os.environ.get("YOLO_BACKEND") or "rtmdet").strip().lower()
+    if backend in ("obj6", "gemini1"):
+        return "yolo_obj6"
+    if backend == "rtmdet":
+        return "yolo_rtmdet"
+    raise ValueError(
+        f"unknown YOLO_BACKEND={backend!r} — use 'rtmdet' (default) or "
+        f"'obj6'; 'world' (YOLO-World) was removed with the ultralytics "
+        f"dependency (see docs/detector_backends.md)"
+    )
 
 
 def __getattr__(name: str):  # PEP 562
@@ -787,11 +799,11 @@ _PIL_DRAFT_SIZE = 448  # ~2x the model's 224px input — decode-cheap
 
 
 def _yolo_decode_size() -> int:
-    """Preview decode cap for the detection stages. YOLO-World squashes
-    to 224 internally (the 448 draft decode is already generous), but
-    gemini1 letterboxes to 960 and was trained/gated at that size —
-    upsampling a 448 decode would blur small boxes away. Each backend
-    module declares its own cap; the default is the BioCLIP draft size."""
+    """Preview decode cap for the detection stages. The RTMDet / obj6
+    exports letterbox to 960 and were trained/gated at that size —
+    upsampling a 448 BioCLIP draft decode would blur small boxes away.
+    Each backend module declares its own cap; the fallback is the
+    BioCLIP draft size."""
     import importlib
 
     mod = importlib.import_module(_yolo_backend_module())
@@ -1731,7 +1743,7 @@ def run_pipeline(
     stop_criteria_pct: float | None = None,
 ) -> RunResult:
     """Run a smart-search on Immich for `query`, embed + predict any assets
-    not yet cached, recompute clusters, run YOLO-World on uncached images,
+    not yet cached, recompute clusters, run the detector on uncached images,
     persist everything, and return the ordered result list for this run.
 
     Heavy passes run in chunks of `batch_size` so peak memory stays small.
@@ -1878,7 +1890,7 @@ def run_pipeline(
             # YOLO scan status is its OWN cache dimension — an asset can
             # have complete species predictions but never have been
             # detection-scanned (a run that stopped or crashed between
-            # the species and yolo stages — e.g. the ultralytics
+            # the species and yolo stages — e.g. the old YOLO-World
             # config-dir PermissionError). Gate the yolo worklist on
             # yolo_scanned_at, not on the predictions cache.
             yolo_scanned_ids = storage.bulk_yolo_scanned_assets(
@@ -2450,7 +2462,7 @@ def run_pipeline(
                 _unload_classifier()
                 clf = None
 
-            # ---- YOLO-World: detect on uncached assets (chunked) ----
+            # ---- Detector: detect on uncached assets (chunked) ----
             # Detection rows are persisted as we go; the bbox BioCLIP
             # pass below queries the detections table directly so it
             # handles cache-hit assets without needing tuples handed
@@ -2490,14 +2502,14 @@ def run_pipeline(
                         if not todo:
                             i = j
                             continue
-                        # Lazy: don't import YOLOWorld until we actually
+                        # Lazy: don't load the detector until we actually
                         # need it.
                         if not yolo_model_loaded:
                             _log.info(
                                 "[yolo] loading detection backend %s "
                                 "(YOLO_BACKEND=%s)",
                                 _yolo_backend_module(),
-                                os.environ.get("YOLO_BACKEND", "world"),
+                                os.environ.get("YOLO_BACKEND", "rtmdet"),
                             )
                             _yolo.get_model()
                             yolo_model_loaded = True
@@ -2681,11 +2693,9 @@ def run_pipeline(
                     todo_items: list[tuple[str, str]] = []
                     for asset_id, _fn, _ts in todo:
                         todo_items.append((asset_id, _ts))
-                    # Process in chunks of `batch_size`. YOLO-World's
-                    # first forward pass here rebakes the open-vocab
-                    # embedding table under the singleton's _LOCK; the
-                    # previous yolo stage's finally already unloaded so
-                    # we get the fresh 17-class init.
+                    # Process in chunks of `batch_size`; the previous
+                    # yolo stage's finally already unloaded, so this
+                    # reloads the detector session on first use.
                     person_t0 = time.monotonic()
                     for i in range(0, len(todo_items), batch_size):
                         check_stop(stop_event)

@@ -74,8 +74,12 @@ Contributing or developing from source (Python + Node)? See
 - **BioCLIP-2 zero-shot species prediction.** Top-K (default 5) species
   per asset, with full taxonomy. Lazy-loaded in a child process — your
   backend process never holds the ~4.3 GB model weights + label table.
-- **YOLO-World person detection.** Per-asset flag (`has_person`),
-  drives both a filter and the "with/without people" album-sync toggle.
+- **Plant / person detector.** A trained RTMDet detector (~20 MB
+  ONNX) boxes plants, flowers, trees,
+  people and hands; each plant box is classified by BioCLIP-2 on its
+  own. The person boxes drive the per-asset `has_person` flag (a
+  filter and the "with/without people" album-sync toggle). See
+  [docs/detector_backends.md](docs/detector_backends.md).
 - **HDBSCAN clustering** of BioCLIP embeddings for browse-level
   organisation; auto-refit on library growth.
 - **Map view — places, not trips.** Geotagged photos are grouped by
@@ -351,6 +355,15 @@ for suspected security bugs — email the maintainer directly.
 
 The BioCLIP-2 model weights are subject to their own license; see the
 [imageomics/bioclip-2 model card][bioclip-hf].
+
+**Detector.** The shipped detector (`models/obj6_rtmdet_ep97.onnx`) is
+an [RTMDet](https://github.com/open-mmlab/mmdetection) model trained by
+the author; RTMDet/mmdetection is Apache-2.0. <!-- TODO(weights
+decision): distribution and license terms for the trained weights are
+not decided yet — fill in before release. --> The app does not
+depend on Ultralytics. An optional `obj6` backend can run your own
+Ultralytics YOLO26 ONNX export, but such weights are AGPL-3.0 and none
+are distributed here — see [docs/detector_backends.md](docs/detector_backends.md).
 
 ---
 

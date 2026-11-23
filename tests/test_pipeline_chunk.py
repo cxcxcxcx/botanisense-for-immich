@@ -361,17 +361,21 @@ def test_species_stage_reuses_search_embeddings():
             pipeline._clf_cache = None
 
 
-def test_yolo_config_dir_is_writable():
-    """yolo.py must point YOLO_CONFIG_DIR at a writable dir BEFORE
-    ultralytics imports. In a container running as non-root with
-    HOME=/root, ultralytics' settings-dir resolution crashes on
-    Path.exists() -> PermissionError and its /tmp fallback never runs
-    (the crash is before it). Regression test for:
-    'PermissionError: /root/.config/Ultralytics' on first yolo stage."""
-    import yolo as _yolo_mod  # noqa: F401 — import runs the env block
-    cfg = os.environ.get("YOLO_CONFIG_DIR")
-    assert cfg, "YOLO_CONFIG_DIR not set"
-    assert os.path.isdir(cfg) and os.access(cfg, os.W_OK), cfg
+def test_yolo_backend_dispatch(monkeypatch):
+    """RTMDet is the default backend; obj6 (and its pre-rename id) is
+    opt-in; the removed YOLO-World id fails loudly instead of silently
+    falling back."""
+    import pytest
+
+    monkeypatch.delenv("YOLO_BACKEND", raising=False)
+    assert pipeline._yolo_backend_module() == "yolo_rtmdet"
+    for value, module in (("rtmdet", "yolo_rtmdet"), ("obj6", "yolo_obj6"),
+                          ("gemini1", "yolo_obj6")):
+        monkeypatch.setenv("YOLO_BACKEND", value)
+        assert pipeline._yolo_backend_module() == module
+    monkeypatch.setenv("YOLO_BACKEND", "world")
+    with pytest.raises(ValueError, match="removed"):
+        pipeline._yolo_backend_module()
 
 
 def test_yolo_resumes_after_species_completed():

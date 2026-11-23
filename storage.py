@@ -4,7 +4,7 @@ Storage model
 -------------
 Most tables are pooled across runs — keyed by `asset_id` (Immich UUID)
 with no `run_id` column. This is intentional and is what makes cached
-re-runs near-instant: BioCLIP forward + YOLO-World inference are
+re-runs near-instant: BioCLIP forward + detector inference are
 skipped for any asset that already has predictions / detections / an
 embedding stored, regardless of which run originally produced them.
 
@@ -28,7 +28,7 @@ embeddings       One BioCLIP image embedding per asset (BLOB of float32).
 predictions      Top-k predictions per (asset, rank, position).
 clusters         Each asset's cluster id (assigned by k-means on the
                  embeddings).
-detections       YOLO-World bounding boxes per asset (label, score, xywh).
+detections       Detector bounding boxes per asset (label, score, xywh).
 runs             One row per pipeline invocation (query, started/finished,
                  n_new, n_cached).
 search_results   Many-to-many: which assets appeared in which run, in what
@@ -1912,8 +1912,9 @@ def mark_yolo_scanned(
     )
 
 
-# YOLO labels that count as "this image has a person in it". Kept in
-# sync with the trailing entries of yolo.PLANT_LABELS — used by the
+# Detector labels that count as "this image has a person in it" (the
+# detectors' NAMES tables emit "person"; "face" comes from the YuNet
+# rescue, "human" from older YOLO-World rows) — used by the
 # pipeline's person stage to derive `assets.has_person` and by the
 # frontend filter chip "has person". "hand" is deliberately NOT in this
 # set — a hand reaching into frame shouldn't flip has_person=1.

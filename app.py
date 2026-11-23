@@ -1647,8 +1647,10 @@ async def health() -> dict:
 def _yolo_backend_name() -> str:
     """Detection backend id — mirrors pipeline._yolo_backend_module's
     env contract without importing pipeline (cheap, read-only)."""
-    backend = (os.environ.get("YOLO_BACKEND") or "world").strip().lower()
-    return backend or "world"
+    backend = (os.environ.get("YOLO_BACKEND") or "rtmdet").strip().lower()
+    if backend == "gemini1":  # pre-rename id for obj6
+        backend = "obj6"
+    return backend
 
 
 def _engine_health() -> dict:
