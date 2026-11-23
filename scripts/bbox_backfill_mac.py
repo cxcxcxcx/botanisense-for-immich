@@ -265,7 +265,17 @@ def main() -> int:
     txt_t, names = _load_text(Path(args.hf_cache))
     logit_scale = _logit_scale()
 
-    model = ct.models.MLModel(args.encoder, compute_units=ct.ComputeUnit.ALL)
+    # An .mlpackage is compiled on load into the system temp dir on the
+    # internal disk (TMPDIR is ignored), which fails once that disk is
+    # nearly full (2026-11-23: 405 MB free vs ~580 MB of weights). A
+    # precompiled .mlmodelc — `xcrun coremlcompiler compile
+    # encoder_b16.mlpackage <dir>` — loads in place and skips that step.
+    if args.encoder.rstrip("/").endswith(".mlmodelc"):
+        model = ct.models.CompiledMLModel(
+            args.encoder, compute_units=ct.ComputeUnit.ALL
+        )
+    else:
+        model = ct.models.MLModel(args.encoder, compute_units=ct.ComputeUnit.ALL)
     conn = _db(Path(args.db))
     rows = _select(conn, args.min_score, args.force)
     if args.limit > 0:
