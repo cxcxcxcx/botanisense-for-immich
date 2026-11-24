@@ -358,9 +358,9 @@ The BioCLIP-2 model weights are subject to their own license; see the
 
 **Detector.** The shipped detector (`models/obj6_rtmdet_ep97.onnx`) is
 an [RTMDet](https://github.com/open-mmlab/mmdetection) model trained by
-the author; RTMDet/mmdetection is Apache-2.0. <!-- TODO(weights
-decision): distribution and license terms for the trained weights are
-not decided yet — fill in before release. --> The app does not
+the author; RTMDet/mmdetection is Apache-2.0. The trained weights are
+licensed separately under **CC BY-NC 4.0** (non-commercial) — see
+[models/README.md](models/README.md). The app does not
 depend on Ultralytics. An optional `obj6` backend can run your own
 Ultralytics YOLO26 ONNX export, but such weights are AGPL-3.0 and none
 are distributed here — see [docs/detector_backends.md](docs/detector_backends.md).

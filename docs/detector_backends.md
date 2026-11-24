@@ -13,7 +13,7 @@ module tells the pipeline what preview size to decode at.
 
 | `YOLO_BACKEND` | Module | Weights | Params | ONNX (deploy) | License |
 |---|---|---|---|---|---|
-| `rtmdet` (default) | `yolo_rtmdet.py` | RTMDet-Ins-tiny, trained obj6 (5 classes) | 6.47 M | 20.5 MB fp32, `models/` | Apache-2.0 base; weights TBD |
+| `rtmdet` (default) | `yolo_rtmdet.py` | RTMDet-Ins-tiny, trained obj6 (5 classes) | 6.47 M | 20.5 MB fp32, `models/` | Apache-2.0 code; weights CC BY-NC 4.0 |
 | `obj6` (opt-in) | `yolo_obj6.py` | YOLO26n-seg, trained obj6 (5 classes) | 3.05 M | 5.7 MB fp16, not shipped | AGPL-3.0 |
 
 The YOLO-World open-vocab backend (`world`, `yolo.py`) was removed
@@ -119,8 +119,8 @@ Ultralytics-trained weights are AGPL-3.0-derived, and so was any image
 that linked `ultralytics` (the old YOLO-World backend made it a runtime
 dependency). AGPL §7 forbids adding a non-commercial /
 no-derivative-training clause on top. RTMDet (mmdet) is Apache-2.0, so
-this backend's code carries no copyleft (license terms for the trained
-weights are still to be decided), and the image no
+this backend's code carries no copyleft (the trained weights are
+CC BY-NC 4.0, see `models/README.md`), and the image no
 longer installs `ultralytics` (or its `clip` fork) at all. Nothing else
 in the stack blocks it: BioCLIP-2 is MIT, TreeOfLife-200M is CC0, the
 repo is MIT.

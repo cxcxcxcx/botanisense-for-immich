@@ -70,9 +70,10 @@ COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
      mobile_engine.py yolo_obj6.py yolo_rtmdet.py ./
 # YuNet face weights — face.py loads by bare filename from the CWD,
 # and the default RTMDet detector from models/ — both
-# baked in because /app is read-only at runtime.
+# baked in because /app is read-only at runtime. The detector weights
+# are CC BY-NC 4.0, so their license and model card ship alongside.
 COPY face_detection_yunet_2023mar.onnx ./
-COPY models/obj6_rtmdet_ep97.onnx models/
+COPY models/obj6_rtmdet_ep97.onnx models/LICENSE models/README.md models/
 
 RUN useradd --uid 1000 --create-home botanisense \
     && mkdir -p /app/data \
