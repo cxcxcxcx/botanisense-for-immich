@@ -2,31 +2,30 @@ import { navigate, topLevel, type View } from '../hooks/useRoute';
 import { useApp } from '../state/AppContext';
 import { getHealth } from '../api/endpoints';
 import type { HealthEngine } from '../api/types';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { BOTANISENSE_ENABLED } from '../lib/features';
+import {
+  APP_VERSION,
+  BOTANISENSE_APP_URL,
+  FEEDBACK_URL,
+  REPO_URL,
+  bugReportUrl,
+} from '../lib/links';
 
-// Inline BotaniSense brand mark — same fan-of-blades SVG used by
-// `frontend/public/favicon.svg`. Drawn at 28×28 in the header so the
-// brand is immediately readable without the gradient circle wrapper.
+// App icon (watercolor bird-of-paradise + Immich mark), the same image
+// as the favicon/manifest icons; icon-64.png keeps it sharp at 2× DPR.
+// Source: docs/brand/icon.svg. The earlier fan-of-blades mark is kept
+// at docs/brand/fan-mark.svg.
 function BrandMark({ size = 28 }: { size?: number }) {
   return (
-    <svg
-      xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 32 32"
+    <img
+      src="/icon-64.png"
       width={size}
       height={size}
       className="brand-mark"
+      alt=""
       aria-hidden="true"
-    >
-      <g transform="translate(16 24)">
-        <path d="M0 0 C -1 -7 -7 -13 -12 -10 C -8 -5 -4 -2 0 0 Z" fill="#c8201f" />
-        <path d="M0 0 C -1 -10 -3 -17 -6 -16 C -5 -10 -2 -4 0 0 Z" fill="#ee7d18" />
-        <path d="M0 0 C 0 -12 -1 -19 -3 -18 C -2 -12 -1 -5 0 0 Z" fill="#f3c623" />
-        <path d="M0 0 C 2 -11 4 -17 7 -16 C 5 -11 3 -5 0 0 Z" fill="#6b3a8a" />
-        <path d="M0 0 C 4 -9 10 -12 12 -8 C 8 -5 4 -2 0 0 Z" fill="#1f6fb4" />
-        <path d="M0 0 C 7 2 13 1 14 -2 C 9 -2 4 -2 0 0 Z" fill="#1f8a3d" />
-      </g>
-    </svg>
+    />
   );
 }
 
@@ -82,7 +81,7 @@ export function Header({ view }: Props) {
 
   return (
     <header className="sticky top-0 z-50 bg-bg/95 backdrop-blur flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
-      {/* Brand identity: bare fan-of-blades SVG (no gradient ring).
+      {/* Brand identity: the app icon.
           Wordmark + "for Immich" subtitle on mobile, one line on sm:
           and up. Sits on the left, takes only as much space as it
           needs. */}
@@ -168,8 +167,88 @@ export function Header({ view }: Props) {
         >
           {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
         </button>
+        <AboutMenu
+          detail={engine ? `engine ${engine.id}, detector ${engine.yolo_backend ?? '?'}` : undefined}
+        />
       </div>
     </header>
+  );
+}
+
+// About / feedback popover: version, GitHub, issue links and the
+// BotaniSense app. Closes on outside click, Escape, or following a link.
+function AboutMenu({ detail }: { detail?: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const item = 'flex items-center justify-between gap-3 px-3 py-1.5 text-[12.5px] text-fg-0 no-underline hover:bg-bg-2 hover:text-fg';
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        aria-label="About and feedback"
+        aria-expanded={open}
+        aria-haspopup="menu"
+        title="About and feedback"
+        className="p-1.5 rounded border border-line2 text-fg-1 hover:text-fg hover:border-accent"
+        onClick={() => setOpen(o => !o)}
+      >
+        <InfoIcon />
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute right-0 mt-1.5 w-64 py-1 rounded-lg border border-line2 bg-bg-1 shadow-lg z-50"
+          onClick={e => { if ((e.target as HTMLElement).closest('a')) setOpen(false); }}
+        >
+          <div className="px-3 pt-1.5 pb-2 border-b border-line">
+            <div className="text-[13px] text-fg font-semibold">BotaniSense for Immich</div>
+            <div className="text-[11px] text-fg-2">
+              v{APP_VERSION} · plant ID for your Immich library
+            </div>
+          </div>
+          <a role="menuitem" className={item} href={REPO_URL} target="_blank" rel="noreferrer">
+            GitHub <span aria-hidden="true">↗</span>
+          </a>
+          <a role="menuitem" className={item} href={bugReportUrl(detail)} target="_blank" rel="noreferrer">
+            Report a problem <span aria-hidden="true">↗</span>
+          </a>
+          <a role="menuitem" className={item} href={FEEDBACK_URL} target="_blank" rel="noreferrer">
+            Ideas &amp; feedback <span aria-hidden="true">↗</span>
+          </a>
+          <div className="my-1 border-t border-line" />
+          <a role="menuitem" className={item} href={BOTANISENSE_APP_URL} target="_blank" rel="noreferrer">
+            BotaniSense app <span aria-hidden="true">↗</span>
+          </a>
+          <a role="menuitem" className={item} href={`${REPO_URL}#license`} target="_blank" rel="noreferrer">
+            License <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function InfoIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="10" />
+      <line x1="12" y1="16" x2="12" y2="12" />
+      <line x1="12" y1="8" x2="12.01" y2="8" />
+    </svg>
   );
 }
 

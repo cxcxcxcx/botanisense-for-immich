@@ -12,8 +12,8 @@
 // offline support would precache the route shell + offline page,
 // handle fetch errors gracefully, and version the cache key.
 
-const CACHE = 'botanisense-shell-v1';
-const SHELL_PATHS = ['/', '/favicon.svg'];
+const CACHE = 'botanisense-shell-v2';
+const SHELL_PATHS = ['/', '/favicon.ico'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

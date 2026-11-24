@@ -3,6 +3,7 @@ import { getHealth, getResults, getStatus } from '../api/endpoints';
 import { navigate } from '../hooks/useRoute';
 import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot } from '../api/types';
+import { APP_VERSION, BOTANISENSE_APP_URL, REPO_URL, bugReportUrl } from '../lib/links';
 import { ConnectForm } from './ConnectForm';
 import { StatusPanel } from './StatusPanel';
 
@@ -175,6 +176,13 @@ export function Welcome() {
           </button>
         </Step>
       )}
+
+      <p className="text-fg-2 text-[11px] m-0 mt-6 pt-3 border-t border-line flex flex-wrap gap-x-3 gap-y-1">
+        <span>v{APP_VERSION}</span>
+        <a className="text-fg-1 hover:text-fg" href={REPO_URL} target="_blank" rel="noreferrer">GitHub ↗</a>
+        <a className="text-fg-1 hover:text-fg" href={bugReportUrl()} target="_blank" rel="noreferrer">Report a problem ↗</a>
+        <a className="text-fg-1 hover:text-fg" href={BOTANISENSE_APP_URL} target="_blank" rel="noreferrer">BotaniSense app ↗</a>
+      </p>
     </section>
   );
 }

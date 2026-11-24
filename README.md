@@ -1,3 +1,5 @@
+<img src="frontend/public/icon-192.png" alt="" width="96" align="right">
+
 # BotaniSense for Immich
 
 > **Browse your Immich library by plant species.**

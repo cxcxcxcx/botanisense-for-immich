@@ -3,7 +3,7 @@
 > **App name: BotaniSense for Immich.**
 > This repo's user-facing name is **BotaniSense for Immich** (see
 > `frontend/index.html` `<title>`, `Header.tsx`, `app.py` FastAPI title,
-> and `frontend/public/favicon.svg`). The ML engine inside the app is
+> and the app icon in `frontend/public/`, source `docs/brand/icon.svg`). The ML engine inside the app is
 > **BioCLIP-2** — BioCLIP references in code, comments, and filenames
 > (`tol200m_bioclip2.faiss`, `bg-stage-bioclip`, etc.) describe the
 > model, not the app. Keep the two names distinct when reading or
