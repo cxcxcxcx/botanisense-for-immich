@@ -4,10 +4,54 @@ All notable changes to BotaniSense for Immich are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project does **not** follow Semantic Versioning until v1.0.
 
-## Unreleased
+## 0.1.0 — 2026-11-24
+
+First public release. The codebase has been under active private
+development since the BotaniSense-for-Immich rebrand in mid-2026.
 
 ### Features
 
+- **In-app setup — no config files.** The Immich URL and API key are
+  entered in the web UI (Welcome screen), stored in the app's SQLite
+  DB, and take effect immediately; edit them later via the health
+  banner's "Fix connection" or the Run page's Sync section.
+  `IMMICH_BASE_URL` / `IMMICH_API_KEY` environment variables still
+  work and pin the connection. `config.toml` is gone; an existing
+  file is migrated automatically on first boot of the new version
+  (base URL → DB, KNN/CORS values → environment).
+- **Immich smart-search ingestion.** Runs Immich's `/api/search/smart`
+  with a configurable seed query and ingests the top-N matching assets
+  (default 10 000).
+- **BioCLIP-2 zero-shot classification.** Lazy-loaded, runs in a
+  child process so uvicorn never holds the ~5 GB weights.
+  Top-K predictions (default 5) per asset, with full taxonomy
+  (kingdom → family → genus → species). Thumbnails are fetched from
+  Immich in parallel during the kingdom, species and detection stages.
+- **Bundled plant/people detector.** A trained RTMDet-Ins-tiny model
+  (`plant`, `person`, `hand`, `flower`, `tree`; 20.5 MB ONNX, CPU
+  onnxruntime) is the default detection backend and ships in the repo
+  and the Docker image — nothing to download. It replaces the
+  YOLO-World open-vocabulary detector; the `ultralytics` dependency is
+  gone and the image shrank from 2.53 to 2.17 GB. Each detected box
+  is drawn on its own. See `docs/detector_backends.md`.
+- **Similar boxes.** Click a detection box (or its Similar button) in
+  the photo detail to see the most similar crops and photos from the
+  rest of the library (`/api/bbox/{id}/neighbors`).
+- **Hierarchical browse.** Cluster cards (HDBSCAN over BioCLIP
+  embeddings, auto-refit on growth), plus two extra levels: a
+  **related-clusters** strip on every cluster (nearest clusters by
+  centroid cosine) and **super-groups** that merge genuinely-close
+  clusters into plant families. The same cards exist per species,
+  genus, and family. The near-duplicate threshold that collapses
+  burst shots is configurable (`NEAR_DUP_THRESHOLD`, default 0.97).
+- **People-aware photos.** A `has_person` flag drives a filter and
+  the album-sync "with/without people" toggle. It combines three
+  signals — the detector's person/hand boxes, a YuNet face-detection
+  rescue pass (catches people the box model misses), and a
+  BioCLIP-based classifier veto (a confident `p < 0.05` negative
+  suppresses hand-holding-a-plant false positives). Card cover
+  photos prefer person-free members; a people photo is used only
+  when a whole group has none.
 - **Map view.** New `#map` tab plots geotagged assets on an
   OpenStreetMap/Leaflet map, grouped into places by distance alone
   (150 m / 1 km / 10 km, optionally including single-photo places).
@@ -30,43 +74,6 @@ and the project does **not** follow Semantic Versioning until v1.0.
   real EXIF wins via `COALESCE`, inferred markers are amber, and the map
   panel can recompute or clear the set. Script:
   `scripts/guess_locations.py`.
-
-## 0.1.0 — 2026-09-15
-
-First public release. The codebase has been under active private
-development since the BotaniSense-for-Immich rebrand in mid-2026.
-
-### Features
-
-- **In-app setup — no config files.** The Immich URL and API key are
-  entered in the web UI (Welcome screen), stored in the app's SQLite
-  DB, and take effect immediately; edit them later via the health
-  banner's "Fix connection" or the Run page's Sync section.
-  `IMMICH_BASE_URL` / `IMMICH_API_KEY` environment variables still
-  work and pin the connection. `config.toml` is gone; an existing
-  file is migrated automatically on first boot of the new version
-  (base URL → DB, KNN/CORS values → environment).
-- **Immich smart-search ingestion.** Runs Immich's `/api/search/smart`
-  with a configurable seed query and ingests the top-N matching assets
-  (default 10 000).
-- **BioCLIP-2 zero-shot classification.** Lazy-loaded, runs in a
-  child process so uvicorn never holds the ~5 GB weights.
-  Top-K predictions (default 5) per asset, with full taxonomy
-  (kingdom → family → genus → species).
-- **Hierarchical browse.** Cluster cards (HDBSCAN over BioCLIP
-  embeddings, auto-refit on growth), plus two extra levels: a
-  **related-clusters** strip on every cluster (nearest clusters by
-  centroid cosine) and **super-groups** that merge genuinely-close
-  clusters into plant families. The same cards exist per species,
-  genus, and family.
-- **People-aware photos.** A `has_person` flag drives a filter and
-  the album-sync "with/without people" toggle. It combines three
-  signals — YOLO-World person/hand boxes, a YuNet face-detection
-  rescue pass (catches people the box model misses), and a
-  BioCLIP-based classifier veto (a confident `p < 0.05` negative
-  suppresses hand-holding-a-plant false positives). Card cover
-  photos prefer person-free members; a people photo is used only
-  when a whole group has none.
 - **Live run updates.** Results stream in while a pipeline run is in
   progress (committed per batch, not once at the end), and the home
   page shows current run status; an optional in-app scheduler
@@ -81,10 +88,16 @@ development since the BotaniSense-for-Immich rebrand in mid-2026.
   and bulk remove.
 - **FastAPI backend + React/Vite SPA.** SSE pipeline progress, light
   and dark themes, mobile-responsive, installable as a PWA
-  (add-to-home-screen).
+  (add-to-home-screen). New app icon, and an About menu in the header
+  (version, GitHub, bug report with the version pre-filled, feedback,
+  license). Copy-to-clipboard falls back gracefully on plain-HTTP
+  LAN setups.
 
 ### Notes
 
+- **Licensing.** The code is MIT. The bundled detector weights
+  (`models/obj6_rtmdet_ep97.onnx`) are licensed separately under
+  **CC BY-NC 4.0** — see `models/README.md`.
 - Cluster sync is **beta**. Per-cluster `Delete` and bulk `Remove
   synced clusters` always delete the Immich album alongside the local
   mapping (no orphans). Cluster titles may go stale after a cluster
