@@ -67,7 +67,7 @@ COPY --from=frontend /build/dist frontend/dist
 COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
      map_clusters.py location_guess.py \
      knn.py knn_io.py immich_client.py run.py face.py \
-     mobile_engine.py yolo_obj6.py yolo_rtmdet.py ./
+     mobile_engine.py coreml_engine.py yolo_obj6.py yolo_rtmdet.py ./
 # YuNet face weights — face.py loads by bare filename from the CWD,
 # and the default RTMDet detector from models/ — both
 # baked in because /app is read-only at runtime. The detector weights

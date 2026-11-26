@@ -1,6 +1,6 @@
 # Mac 原生加速方案：CoreML BioCLIP-2 编码器（v0.2 候选）
 
-状态：方案草稿（2026-11-26），未实施。HF 上传、发版需用户拍板。
+状态：第 0–3 步完成（2026-11-26），门 1–3 已过；第 4 步（HF 上传）、第 5 步（发版）需用户拍板。
 
 ## 目标与边界
 
@@ -166,7 +166,7 @@ LICENSE                   # MIT
 
 - 产物在 Mac `/Volumes/X9_APFS/mac_big/home/bioclip_coreml/teacher_v2/`；golden 与 manifest 也拷到了 `out/coreml_parity/teacher_v2/`。
 
-## 第 2 步结果（2026-11-26，未提交）
+## 第 2 步结果（2026-11-26）
 
 - `coreml_engine.py`：`CoreMLEngine(TreeOfLifeClassifier)`，只换图像塔，不加载 torch 权重（`logit_scale` 取自 manifest，实测 100.000008）。
   - 首次加载把 `.mlpackage` 编译成 `.mlmodelc` 并保存在旁边；之后加载 0.0 s。
@@ -179,10 +179,61 @@ LICENSE                   # MIT
   - 第二次 3.9 s 就绪、28.7 img/s。
 - 还没做：`/api/health` 的引擎徽章（`app.py` 里有用户未提交的改动，暂不动）；pyproject 的 Python 钉版与 `mac` extra 放到第 5 步，因为会改 `uv.lock`。
 
+## 第 3 步结果（2026-11-26）
+
+同一个 Immich 查询（`intentional plant photos`，n=500，入库 559 张），两边各跑一次完整流程：
+
+- 参考：Linux Docker 影子实例，`ENGINE=teacher`，torch CPU；
+- 被测：Mac mini M4 原生，`ENGINE=auto` → CoreML ALL。
+
+对比脚本 `scripts/compare_engine_runs.py`，报告 `out/step3/report.json`。影子实例、镜像和两边的 DB 已清理。
+
+**门 2（端到端一致性）：通过。**
+
+| 指标 | 结果 | 门槛 |
+|---|---|---|
+| 整图 embedding cos 均值 / 最小（559 张） | .999712 / .998195 | ≥ .999 / ≥ .998 ✅ |
+| kingdom argmax 一致 | 99.82%（1/559） | ≥ 99% ✅ |
+| Plantae ≥ .35 资格判定一致 | 99.64%（2/559） | ≥ 99% ✅ |
+| 整图 species top-1 落在参考 top-5 | 100%（498 张） | ≥ 99% ✅ |
+| 整图 species top-1 一致 | 95.8%（21 个翻转） | 只记录，地板 90% |
+| 框 species top-1 落在参考 top-5 | 99.74%（2331 个配对框） | 参考 |
+| 框 species top-1 一致 | 92.2% | 只记录 |
+
+- 唯一的 kingdom 分歧是近似并列：Plantae .302 / Fungi .298 → Fungi .314 / Plantae .306，两边都低于 .35，资格判定不受影响。
+- 框级数字混进了检测差异：两边检测各自独立，2389 对 2399 个框，按 label + IoU ≥ .9 配上 2377 个，裁剪不完全相同，所以比整图低。
+- **bbox embedding 的 cos 门量不了**：pipeline 的 bbox-bioclip 阶段走 `clf.predict(images=crop_paths)`，两边都不写 `bbox_embeddings`（目前只有 Mac 回填脚本写）。门 2 改用整图 embedding 判定，见下面的后续项。
+
+**门 3（吞吐 ≥ Mac Docker CPU 的 3 倍）：用上界代理通过，约 3.0 倍，没有实测 colima。**
+
+- 代理：在 Mac 上原生跑 `ENGINE=teacher`，torch 2.13 CPU，128 张 crop，编码 + 867k 标签 softmax，`smoke_coreml_engine.py`：
+  - 4 线程和 10 线程都是 **8.0 img/s**；
+  - CoreML ALL 同一组 crop 是 **23.7 img/s**。
+- Docker 里同样是 torch CPU，但隔着 Linux 虚拟机，CPU 和内存都要分出去，不会比原生 macOS 的 torch CPU 快。所以 8.0 img/s 是 Mac Docker 的上界，实际倍数 ≥ 3.0。
+- 没起 colima：16 GB 的机器上要给虚拟机 8–10 GB，还得在 Mac 上构建 arm64 镜像，换来的只是把上界换成实测值。README 里按"至少 3 倍"写。
+
+**整条流程耗时**：两台机器硬件不同，只作参考，不算门。
+
+| 阶段 | Linux Docker（teacher） | Mac 原生（CoreML） |
+|---|---|---|
+| search（取图 + 编码） | 3m56s | 55s |
+| species | 37s | 23s |
+| yolo | 52s | 48s |
+| bbox-bioclip | 16m11s（2343 框，2.4/s） | 5m12s（2353 框，7.5/s） |
+| 合计 | 21m45s | 7m26s |
+
+- Mac 的 bbox-bioclip 卡在 `clf.predict()` 上：每个框先写 JPEG 再读回来重编码，再做 867k 行的 Python 格式化，CoreML 本身不是瓶颈（直接编码 23.7 img/s）。
+- 两边都缺 `data/person_classifier.joblib`，人像否决被关掉了。这只影响 has_person，不影响上面的一致性对比。
+
+**后续项**：
+
+1. bbox-bioclip 阶段改成"编码一次"：裁剪 → `create_image_features` → 写 `bbox_embeddings` → 从特征分类。新的框聚类依赖 `bbox_embeddings`，现在只有回填脚本在写；这样也能去掉 `predict()` 的瓶颈，并让框级 cos 门可测。
+2. `pipeline.TreeOfLifeClassifier` 是模块级懒加载：直接调 `_resolve_classifier()` 走 teacher 分支会 KeyError，worker 因为先访问了这个属性才没事。冒烟脚本已照 worker 的做法先访问一次；`_resolve_classifier` 本身改成用 `getattr` 更稳。
+
 ## 部署定位（2026-11-26 用户决定）
 
 - Linux，或想要省事的用户：用 Docker。
-- Mac：**强烈推荐原生跑 + 我们导出的 CoreML 编码器**。Docker Desktop / colima 在 Mac 上是 Linux 虚拟机，碰不到 GPU 和 ANE，只能跑 CPU；预计与 Linux CPU 同档（约 3 img/s），原生 ALL 快约 10 倍。第 3 步会实测 Mac Docker 的数字写进 README。
+- Mac：**强烈推荐原生跑 + 我们导出的 CoreML 编码器**。Docker Desktop / colima 在 Mac 上是 Linux 虚拟机，碰不到 GPU 和 ANE，只能跑 torch CPU。第 3 步实测：M4 原生 torch CPU 上界 8.0 img/s，CoreML ALL 23.7 img/s，所以 Docker 至少慢 3 倍。
 - 原生安装门槛不再算主要风险：现在多数人用 AI 助手部署，关键是把步骤写得精确、可照抄，包括 Python 版本、uv 命令、模型下载、launchd 和本地网络权限。
 
 ## 风险与待决定

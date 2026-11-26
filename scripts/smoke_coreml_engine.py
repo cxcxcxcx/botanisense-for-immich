@@ -28,6 +28,9 @@ def main() -> int:
 
     import pipeline
 
+    # Materialize the lazy import the way pipeline_worker does, so the
+    # ENGINE=teacher fallback path can resolve it.
+    pipeline.TreeOfLifeClassifier  # noqa: B018
     t0 = time.monotonic()
     clf = pipeline._resolve_classifier()
     print(f"engine={type(clf).__name__} load={time.monotonic() - t0:.1f}s", flush=True)
