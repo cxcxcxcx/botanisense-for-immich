@@ -30,7 +30,6 @@ import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 import { Modal } from './Modal';
-import { BetaInfoModal } from './BetaInfoModal';
 import { undoBulkRemoveClusterAlbums } from '../api/endpoints';
 import type { ClusterAlbumMapping } from '../api/types';
 
@@ -46,26 +45,6 @@ const PEOPLE_OPTS: { value: PeopleFilter; label: string }[] = [
   { value: 0,    label: 'Without people' },
   { value: 1,    label: 'With people' },
 ];
-
-// "Beta" pill rendered inline next to cluster-sync controls. Click to
-// open the BetaInfoModal with the full explanation. Cluster sync may
-// produce stale album titles after a cluster rename (we don't
-// currently PATCH /api/albums/{id} when only the name changes), and
-// the bulk-remove always deletes the Immich albums — both behaviors
-// are intentional but worth flagging.
-function BetaTag({ onClick }: { onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="text-[0.6rem] uppercase tracking-wider px-1.5 py-0.5 rounded border border-[#a87] text-[#d8a] bg-[#2a1a2a] align-middle ml-1 cursor-pointer hover:bg-[#3a2a3a]"
-      title="Click for details on what's beta and why"
-      aria-label="Beta feature: click for details"
-    >
-      beta
-    </button>
-  );
-}
 
 function PeopleFilterChips({
   value,
@@ -298,8 +277,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
   // which action the modal is currently showing. Keeps the JSX small
   // and lets the per-action preview logic live in one place.
   const [modalFor, setModalFor] = useState<ActionKey | null>(null);
-  // Cluster-sync beta info modal — shared by the two beta-tag buttons.
-  const [showBetaInfo, setShowBetaInfo] = useState(false);
   const [overridePeople, setOverridePeople] = useState<PeopleFilter>(null);
   const [overrideScore, setOverrideScore] = useState<number>(0.6);
   const [overrideForce, setOverrideForce] = useState(false);
@@ -570,18 +547,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
             onScore={v => updateSlot('fungi', { min_score: v })}
             onPeople={v => updateSlot('fungi', { people_filter: v })}
           />
-          <SlotRow
-            label="Clusters (per-pill)"
-            showScore={false}
-            people={draft?.clusters.people_filter ?? null}
-            onPeople={v => updateSlot('clusters', { people_filter: v })}
-          />
-          <SlotRow
-            label="Sync clusters (all)"
-            showScore={false}
-            people={draft?.sync_all.people_filter ?? null}
-            onPeople={v => updateSlot('sync_all', { people_filter: v })}
-          />
           <div className="flex gap-2 items-center">
             <button
               type="button"
@@ -605,42 +570,30 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-        {/* Cluster-sync controls — both sync-all and remove-always are
-            tagged beta. Plantae/Fungi smart-album buttons stay
-            unmarked (those flows are stable). */}
-        <button
-          type="button"
-          className={buttonCls}
-          onClick={() => openModal('sync-all')}
-          disabled={!draft}
-          title="Cluster sync is beta — may produce stale titles after a cluster rename"
-        >
-          Sync clusters (all){' '}
-          <BetaTag onClick={() => setShowBetaInfo(true)} />
-        </button>
         <button type="button" className={buttonCls} onClick={() => openModal('plantae')} disabled={!draft}>
           Sync Plantae photos
         </button>
         <button type="button" className={buttonCls} onClick={() => openModal('fungi')} disabled={!draft}>
           Sync Fungi photos
         </button>
-        <button
-          type="button"
-          className={buttonCls}
-          onClick={() => openModal('remove')}
-          disabled={!draft || !syncedClusterCount}
-          title={!syncedClusterCount ? 'No clusters are currently synced' : 'Delete every synced cluster album in Immich — re-sync to recreate'}
-        >
-          Remove synced clusters{syncedClusterCount != null ? ` (${syncedClusterCount})` : ''}
-        </button>
+        {/* Cluster → album sync was removed from the UI (cluster IDs
+            aren't stable across refits, so synced albums drifted). Keep
+            the cleanup button while legacy cluster albums still exist. */}
+        {!!syncedClusterCount && (
+          <button
+            type="button"
+            className={buttonCls}
+            onClick={() => openModal('remove')}
+            disabled={!draft}
+            title="Delete every previously synced cluster album in Immich"
+          >
+            Remove synced clusters ({syncedClusterCount})
+          </button>
+        )}
       </div>
 
       {/* Inline progress rows — one per async action. Remove shows
           its result inline too (synchronous), so we render all four. */}
-      <ActionProgress
-        label={slots['sync-all'].status === 'done' ? '✓ clusters synced' : 'Sync clusters'}
-        slot={slots['sync-all']}
-      />
       <ActionProgress
         label={slots.plantae.status === 'done' ? '✓ Plantae synced' : 'Plantae'}
         slot={slots.plantae}
@@ -679,7 +632,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
           syncedClusterCount={syncedClusterCount}
         />
       )}
-      <BetaInfoModal open={showBetaInfo} onClose={() => setShowBetaInfo(false)} />
     </section>
   );
 }

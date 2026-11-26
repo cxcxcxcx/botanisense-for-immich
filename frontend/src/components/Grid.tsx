@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { SortPicker } from './SortPicker';
 import { getClusterGroups, getResults } from '../api/endpoints';
 import { ApiError } from '../api/client';
 import type { ClusterGroup, Pagination as PaginationType, ResultRow, ResultsResponse } from '../api/types';
@@ -378,19 +379,11 @@ export function Grid() {
             <FilterIcon />
             {filtersActive && <span className="filter-trigger-dot" aria-hidden="true" />}
           </button>
-          <label className="sort-select-wrapper">
-            <select
-              className="sort-select"
-              value={filters.sort}
-              onChange={(e) => setFilters({ sort: e.target.value as SortMode })}
-              aria-label="Sort photos"
-              title="Sort photos"
-            >
-              {SORT_OPTIONS.map(o => (
-                <option key={o.value} value={o.value}>{o.label}</option>
-              ))}
-            </select>
-          </label>
+          <SortPicker
+            value={filters.sort}
+            options={SORT_OPTIONS}
+            onChange={(v) => setFilters({ sort: v as SortMode })}
+          />
         </div>
       </div>
 

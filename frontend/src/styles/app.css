@@ -232,6 +232,7 @@
      selection is obvious against the dark background — text colour
      only would be invisible. */
   .chip          { @apply inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-line2 bg-transparent text-fg-0 text-[0.85rem] leading-none cursor-pointer hover:text-fg hover:border-accent transition-colors; }
+  .chip-count    { @apply text-[0.75rem] tabular-nums opacity-60; }
   .chip-active   { @apply bg-accent border-accent text-bg font-medium hover:text-bg hover:border-accent; }
 
   /* Filter row layout — one row per facet in the filter bar.
@@ -262,21 +263,17 @@
   .context-bar    { @apply flex flex-wrap items-center gap-x-4 gap-y-2 p-3 rounded-lg border border-line2 bg-bg-1; }
   .context-back   { @apply bg-transparent text-accent border-0 p-0 cursor-pointer text-[0.9rem] hover:underline; }
 
-  /* Styled native <select> for the sort dropdown. Matches the chip
-     aesthetic so the context bar reads as one component. */
-  .sort-select    { @apply bg-bg-2 text-fg border border-line2 rounded-md px-2 py-1 text-[0.85rem] cursor-pointer focus:outline-none focus:border-accent; }
 
   /* Active-filter pill — appears at the top of the filter bar when a
      cluster/taxon card is selected. Reads as "you've narrowed to X —
      clear it here". */
   .active-pill    { @apply flex items-center gap-2 px-3 py-1.5 rounded-md border border-accent/40 bg-accent/10 text-[0.85rem]; }
 
-  /* Brand mark + wordmark — header identity. The wordmark is two
-     lines (BotaniSense / for Immich) on mobile, collapses to one line
-     on `md:` and up via the inline modifier classes in Header.tsx. */
-  .brand-mark     { @apply w-7 h-7 shrink-0; }
-  .wordmark       { @apply text-fg font-semibold text-[1rem] leading-tight; }
-  .wordmark-sub   { @apply text-fg-1 text-[0.7rem] uppercase tracking-wider leading-tight; }
+  /* Brand mark + wordmark — header identity. Two-line stacked lockup
+     (BotaniSense / for Immich) with the app icon spanning both lines. */
+  .brand-mark     { @apply w-[30px] h-[30px] shrink-0; }
+  .wordmark       { @apply text-fg font-semibold text-[0.95rem] sm:text-[1rem] leading-[1.15]; }
+  .wordmark-sub   { @apply text-fg-1 text-[0.62rem] sm:text-[0.68rem] uppercase tracking-wider leading-[1.15] mt-[1px]; }
 
   /* Brand circle — wraps the fan-of-blades brand mark in the
      emerald-cyan gradient ring from the mock. */
@@ -296,7 +293,7 @@
      row 2. Sticky so it stays visible while the cluster grid scrolls.
      Tight mobile padding so the search + chips use the full width
      on a 375 px phone. */
-  .sticky-toolbar   { @apply sticky top-0 z-10 bg-bg/95 backdrop-blur-md border-b border-line; }
+  .sticky-toolbar   { @apply sticky top-[var(--header-h,0px)] z-30 bg-bg/95 backdrop-blur-md border-b border-line; }
   .sticky-toolbar-pad { @apply p-2 sm:p-3 pb-1.5 sm:pb-2 flex gap-2; }
 
   /* Search pill — search input inside the sticky toolbar. Rounded-xl
@@ -343,7 +340,6 @@
   /* Cluster card — aspect-square, rounded-xl, image fills card with
      gradient overlay. Bottom-left label + count. */
   .cluster-card      { @apply relative aspect-square rounded-xl overflow-hidden cursor-pointer border border-line2 bg-bg-2 transition-colors hover:border-accent; }
-  .cluster-card-all  { @apply border-accent/30 bg-accent/10; }
   /* The scrim sits OVER a photograph, so it is always a dark gradient
      with light text — in BOTH themes. Using the theme `bg` token here
      made it flip to a white wash in light mode (looked bad over photos
@@ -351,12 +347,11 @@
   .cluster-card-overlay { @apply absolute inset-0 bg-gradient-to-t from-black/90 via-black/40 to-transparent pointer-events-none; }
   .cluster-card-label  { @apply font-medium text-sm leading-tight truncate; }
   .cluster-card-name   { @apply text-white italic; }
-  .cluster-card-name-all { @apply text-emerald-300 not-italic; }
   .cluster-card-count  { @apply text-[10px] text-white/70 mt-0.5; }
 
   /* Back-bar — sticky top bar on Level 2 (photo grid). Back button
      left, cluster/taxon name + count centered, sort dropdown right. */
-  .back-bar          { @apply sticky top-0 z-10 bg-bg/90 backdrop-blur-md border-b border-line px-2 py-2 flex items-center justify-between gap-2; }
+  .back-bar          { @apply sticky top-[var(--header-h,0px)] z-30 bg-bg/90 backdrop-blur-md border-b border-line px-2 py-2 flex items-center justify-between gap-2; }
   .back-bar-back     { @apply flex items-center gap-1 px-2 py-1.5 rounded-lg text-fg-1 hover:bg-bg-1 hover:text-fg transition-colors; }
   .back-bar-title    { @apply text-center flex-1 min-w-0; }
   .back-bar-name     { @apply text-sm font-semibold italic text-fg truncate; }

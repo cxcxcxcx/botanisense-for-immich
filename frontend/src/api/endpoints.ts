@@ -3,7 +3,12 @@
 // shapes stay in one place.
 
 import { fetchJson } from './client';
-import type { BboxNeighborsResponse } from './types';
+import type {
+  BboxClusterItemsResponse,
+  BboxClusteringStatus,
+  BboxClustersResponse,
+  BboxNeighborsResponse,
+} from './types';
 import type {
   AssetDetail,
   BulkClusterRemoveParams,
@@ -436,3 +441,30 @@ export const getBboxNeighbors = (
   fetchJson<BboxNeighborsResponse>(`/api/bbox/${detectionId}/neighbors`, {
     query: { k, include_photos: includePhotos },
   });
+
+// ---- Box-level clustering ------------------------------------------------
+
+export const getBboxClusters = () =>
+  fetchJson<BboxClustersResponse>('/api/bbox-clusters');
+
+export const getBboxClusterItems = (
+  clusterId: number,
+  q: { page?: number; page_size?: number; sort?: 'score' | 'time' | 'area' | 'yolo'; dedupe_assets?: boolean } = {},
+) =>
+  fetchJson<BboxClusterItemsResponse>(`/api/bbox-clusters/${clusterId}`, {
+    query: q,
+  });
+
+export const getClusterGroupItems = (
+  groupId: number,
+  q: { page?: number; page_size?: number; sort?: 'score' | 'time' | 'area' | 'yolo' } = {},
+) =>
+  fetchJson<BboxClusterItemsResponse>(`/api/cluster-groups/${groupId}/items`, {
+    query: q,
+  });
+
+export const refitBboxClusters = () =>
+  fetchJson<{ job_id: string }>('/api/bbox-clusters/refit', { method: 'POST' });
+
+export const getBboxClusteringStatus = () =>
+  fetchJson<BboxClusteringStatus>('/api/bbox-clusters/status');

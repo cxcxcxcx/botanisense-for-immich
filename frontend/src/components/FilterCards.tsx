@@ -13,8 +13,8 @@
 // filtered when the user arrives on Level 1 with plantae= in the URL.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { getClusterGroups, getClusters, getResults } from '../api/endpoints';
-import type { ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
+import { getBboxClusters, getClusterGroups, getClusters, getResults, refitBboxClusters } from '../api/endpoints';
+import type { BboxClustersResponse, ClusterSummary, ResultsResponse, TaxonomyEntry } from '../api/types';
 import { useFilters, type GroupBy } from '../state/AppContext';
 import { useDebounce } from '../hooks/useDebounce';
 import { useUrlFilters } from '../hooks/useUrlFilters';
@@ -29,10 +29,8 @@ const SORTS: { value: CardSort; label: string }[] = [
   { value: 'id',     label: 'ID' },
 ];
 
-// Coarsest first: super-groups (hierarchy level above clusters) →
-// HDBSCAN clusters → taxonomy.
+// Unified 3-stage clusters first, then taxonomy.
 const GROUP_BY_CHIPS: Array<{ v: GroupBy; label: string }> = [
-  { v: 'supergroup', label: 'Super' },
   { v: 'cluster',    label: 'Cluster' },
   { v: 'species',    label: 'Species' },
   { v: 'genus',      label: 'Genus' },
@@ -43,8 +41,11 @@ interface Card {
   key: string;
   label: string;
   count: number;
+  countText?: string;
+  badge?: string | null;
   latest: string | null;
   sampleAssetId: string | null;
+  thumbSrc?: string | null;
 }
 
 const SORT_KEY = (g: GroupBy) => `filtercards:sort:${g}`;
@@ -60,6 +61,8 @@ export function FilterCards() {
   const view = useRoute();
 
   const [clusterData, setClusterData] = useState<ClusterSummary[] | null>(null);
+  const [bboxData, setBboxData] = useState<BboxClustersResponse | null>(null);
+  const [bboxRefitting, setBboxRefitting] = useState(false);
   const [groupData, setGroupData] = useState<{ id: number; name: string; count: number; sample: string | null }[] | null>(null);
   const [resultsData, setResultsData] = useState<ResultsResponse | null>(null);
   const [sortMode, setSortMode] = useState<CardSort>(() => readSort(filters.group_by));
@@ -92,14 +95,53 @@ export function FilterCards() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedSearch]);
 
-  // Cluster list re-fetches whenever group_by flips to cluster OR the
-  // plantae tier changes. Both must be in the deps array.
+  // Cluster list: unified crop-first + whole-photo-fallback clusters.
+  // Falls back to legacy /api/clusters if a fresh/unmigrated DB has no
+  // unified bbox clusters yet.
   useEffect(() => {
     if (filters.group_by !== 'cluster') return;
     let cancelled = false;
-    getClusters(filters.plantae).then(j => { if (!cancelled) setClusterData(j.clusters); }).catch(() => {});
+    getBboxClusters()
+      .then(j => {
+        if (cancelled) return;
+        if (j.clusters.length > 0) {
+          setBboxData(j);
+          setClusterData(null);
+        } else {
+          setBboxData(j);
+          getClusters(filters.plantae).then(c => { if (!cancelled) setClusterData(c.clusters); }).catch(() => {});
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBboxData(null);
+          getClusters(filters.plantae).then(c => { if (!cancelled) setClusterData(c.clusters); }).catch(() => {});
+        }
+      });
     return () => { cancelled = true; };
   }, [filters.group_by, filters.plantae]);
+
+  const handleRefitBbox = () => {
+    if (bboxRefitting) return;
+    setBboxRefitting(true);
+    refitBboxClusters()
+      .then(() => {
+        // Poll until complete, then refresh list.
+        const poll = window.setInterval(() => {
+          getBboxClusters()
+            .then(j => {
+              if (j.stats.fitted_at && j.stats.fitted_at !== bboxData?.stats.fitted_at) {
+                window.clearInterval(poll);
+                setBboxData(j);
+                setBboxRefitting(false);
+              }
+            })
+            .catch(() => {});
+        }, 3000);
+        window.setTimeout(() => { window.clearInterval(poll); setBboxRefitting(false); }, 180000);
+      })
+      .catch(() => setBboxRefitting(false));
+  };
 
   // Super-group list — same trigger shape as the cluster list. The
   // Ungrouped bucket (group_id 0) rides at the end of the families.
@@ -141,6 +183,17 @@ export function FilterCards() {
       }));
     }
     if (filters.group_by === 'cluster') {
+      if (bboxData && bboxData.clusters.length > 0) {
+        return bboxData.clusters.map(c => ({
+          key: String(c.cluster_id),
+          label: c.name || `Cluster #${c.cluster_id}`,
+          count: c.n_assets,
+          countText: `${c.n_assets.toLocaleString()} photos`,
+          latest: c.latest_captured_at ?? null,
+          sampleAssetId: c.sample_asset_id,
+          thumbSrc: c.sample_thumb_url,
+        }));
+      }
       if (!clusterData) return [];
       return clusterData.map(c => ({
         key: String(c.cluster_id),
@@ -164,7 +217,7 @@ export function FilterCards() {
       latest: t.latest_captured_at ?? null,
       sampleAssetId: t.sample_asset_id,
     }));
-  }, [filters.group_by, clusterData, groupData, resultsData]);
+  }, [filters.group_by, clusterData, bboxData, groupData, resultsData]);
 
   const sortedCards = useMemo<Card[]>(() => {
     const arr = [...allCards];
@@ -240,7 +293,7 @@ export function FilterCards() {
   // when reading `.total`. Chain `?.` on every segment.
   const totalAll = resultsData?.pagination?.total ?? allCards.reduce((a, b) => a + b.count, 0);
   const isLoading =
-    (filters.group_by === 'cluster' && !clusterData) ||
+    (filters.group_by === 'cluster' && !bboxData && !clusterData) ||
     (filters.group_by === 'supergroup' && !groupData) ||
     (filters.group_by !== 'cluster' && filters.group_by !== 'supergroup' && !resultsData);
 
@@ -323,15 +376,53 @@ export function FilterCards() {
           grid should always be visible here. */}
       {!isPhotoView && (
         <div className="p-2 sm:p-3">
-          <div className="count-line">
-            <span>{visibleCards.length} of {allCards.length} cards</span>
+          {/* One summary row: pseudo-entries ("All", "Unclustered") as
+              chips on the left — they are not clusters, so they never
+              render as tiles — and the count + refit on the right. */}
+          <div className="flex items-center gap-1.5 mb-2 px-1">
+            <button
+              type="button"
+              className="chip"
+              onClick={goToAll}
+              title={`Show all ${totalAll.toLocaleString()} assets (clear filter)`}
+            >
+              All <span className="chip-count">{totalAll.toLocaleString()}</span>
+            </button>
+            {filters.group_by === 'cluster' && bboxData?.unclustered && (
+              <button
+                type="button"
+                className="chip"
+                onClick={() => setFilters({ cluster_id: -1, page: 0 })}
+                title="Photos whose plant boxes did not join any cluster"
+              >
+                Unclustered <span className="chip-count">{bboxData.unclustered.n_assets.toLocaleString()}</span>
+              </button>
+            )}
+            <span
+              className="ml-auto text-xs text-fg-2 tabular-nums whitespace-nowrap"
+              title={filters.group_by === 'cluster' && bboxData
+                ? `${bboxData.stats.n_assets.toLocaleString()} photos in clusters`
+                : undefined}
+            >
+              {visibleCards.length === allCards.length
+                ? allCards.length.toLocaleString()
+                : `${visibleCards.length.toLocaleString()} / ${allCards.length.toLocaleString()}`}
+              {' '}{GROUP_NOUN[filters.group_by] ?? filters.group_by}
+            </span>
+            {filters.group_by === 'cluster' && bboxData && (
+              <button
+                type="button"
+                onClick={handleRefitBbox}
+                disabled={bboxRefitting}
+                className={`shrink-0 w-7 h-7 inline-flex items-center justify-center rounded-full border border-line2 text-fg-1 text-sm hover:border-accent hover:text-fg disabled:opacity-50 ${bboxRefitting ? 'animate-spin' : ''}`}
+                title={bboxRefitting ? 'Clustering…' : 'Refit clusters'}
+                aria-label="Refit clusters"
+              >
+                ↻
+              </button>
+            )}
           </div>
           <div className="cluster-grid">
-            <ClusterAllCard
-              total={totalAll}
-              active={activeKey == null}
-              onClick={goToAll}
-            />
             {stickyActive && (
               <ClusterCardTile
                 card={stickyActive}
@@ -383,25 +474,13 @@ export function FilterCards() {
   );
 }
 
-function ClusterAllCard({ total, active, onClick }: { total: number; active: boolean; onClick: () => void }) {
-  return (
-    <button
-      type="button"
-      className={active ? 'cluster-card cluster-card-all' : 'cluster-card'}
-      onClick={onClick}
-      title={`Show all ${total.toLocaleString()} assets (clear filter)`}
-    >
-      <div className="absolute inset-0 flex items-center justify-center bg-gradient-to-br from-emerald-900/40 via-teal-900/30 to-indigo-900/40 dark-gradient">
-        <span className={`text-4xl text-accent font-light mt-2 ${active ? 'opacity-100' : 'opacity-50'}`} style={{ textShadow: '0 0 12px rgba(92,192,120,0.4)' }}>*</span>
-      </div>
-      <div className="cluster-card-overlay" aria-hidden="true" />
-      <div className="absolute bottom-0 left-0 right-0 p-2">
-        <h3 className={`cluster-card-label ${active ? 'cluster-card-name-all' : 'cluster-card-name-all'}`}>all</h3>
-        <p className="cluster-card-count">{total.toLocaleString()} items</p>
-      </div>
-    </button>
-  );
-}
+const GROUP_NOUN: Record<string, string> = {
+  cluster: 'clusters',
+  supergroup: 'groups',
+  species: 'species',
+  genus: 'genera',
+  family: 'families',
+};
 
 function ClusterCardTile({ card, active, pinned, onClick }: { card: Card; active: boolean; pinned?: boolean; onClick: () => void }) {
   const borderCls = pinned ? 'border-accent' : active ? 'border-accent ring-1 ring-accent' : 'border-line2 hover:border-accent';
@@ -420,7 +499,8 @@ function ClusterCardTile({ card, active, pinned, onClick }: { card: Card; active
 function ClusterCardOverlay({ card }: { card: Card }) {
   const [imgError, setImgError] = useState(false);
   const [imgLoaded, setImgLoaded] = useState(false);
-  const showImg = card.sampleAssetId && !imgError;
+  const imgSrc = card.thumbSrc || (card.sampleAssetId ? thumbUrl(card.sampleAssetId) : null);
+  const showImg = !!imgSrc && !imgError;
   const fallbackChar = card.label.replace(/^["'(]|["')']$/g, '').charAt(0).toUpperCase() || '·';
   return (
     <>
@@ -430,7 +510,7 @@ function ClusterCardOverlay({ card }: { card: Card }) {
         )}
         {showImg ? (
           <img
-            src={thumbUrl(card.sampleAssetId as string)}
+            src={imgSrc as string}
             alt={card.label}
             loading="lazy"
             decoding="async"
@@ -442,10 +522,15 @@ function ClusterCardOverlay({ card }: { card: Card }) {
           <span className="text-[2.25rem] font-semibold uppercase text-[#444]">{fallbackChar}</span>
         )}
       </div>
+      {card.badge && (
+        <span className="absolute top-1.5 right-1.5 z-10 px-1.5 py-0.5 rounded bg-emerald-950/85 border border-emerald-500/50 text-emerald-300 text-[10px] font-medium leading-none backdrop-blur-sm">
+          {card.badge}
+        </span>
+      )}
       <div className="cluster-card-overlay" aria-hidden="true" />
       <div className="absolute bottom-0 left-0 right-0 p-2">
         <h3 className="cluster-card-label cluster-card-name">{card.label}</h3>
-        <p className="cluster-card-count">{card.count.toLocaleString()} items</p>
+        <p className="cluster-card-count">{card.countText ?? `${card.count.toLocaleString()} items`}</p>
       </div>
     </>
   );

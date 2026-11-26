@@ -1,8 +1,8 @@
 import { lazy, Suspense, useEffect, useState } from 'react';
 import { Header } from './components/Header';
 import { Toolbar } from './components/Toolbar';
-import { ClusterAlbumBar } from './components/ClusterAlbumBar';
 import { Grid } from './components/Grid';
+import { BboxClusterGrid } from './components/BboxClusterGrid';
 import { LocationMapView } from './components/LocationMapView';
 import { Modal } from './components/Modal';
 import { AssetDetail } from './components/AssetDetail';
@@ -201,10 +201,12 @@ export function App() {
             <BotanisensePage />
           </Suspense>
         ) : view === 'browse-content' ? (
-          <>
-            <ClusterAlbumBar />
+          (filters.group_by === 'cluster' && filters.cluster_id != null) ||
+          (filters.group_by === 'supergroup' && filters.supergroup != null) ? (
+            <BboxClusterGrid />
+          ) : (
             <Grid />
-          </>
+          )
         ) : (
           <>
             <Welcome />

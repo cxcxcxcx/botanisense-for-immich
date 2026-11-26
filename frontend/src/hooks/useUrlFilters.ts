@@ -42,7 +42,10 @@ function num(v: string | null): number | undefined {
 
 export function parseUrlFilters(search: string = window.location.search): Filters {
   const sp = new URLSearchParams(search);
-  const group_by = (sp.get('group_by') ?? 'cluster') as GroupBy;
+  const rawGroupBy = sp.get('group_by') ?? 'cluster';
+  // Backwards-compat: map old `?group_by=bbox` or `?group_by=supergroup`
+  // bookmarks seamlessly onto the unified `cluster` view.
+  const group_by = (rawGroupBy === 'bbox' || rawGroupBy === 'supergroup' ? 'cluster' : rawGroupBy) as GroupBy;
   // Default sort lives on DEFAULT_FILTERS so a single source of truth
   // governs both URL parsing and localStorage seeding. Falling back
   // hard-coded here would silently diverge from the default pill.
@@ -53,7 +56,7 @@ export function parseUrlFilters(search: string = window.location.search): Filter
     group_by, sort, q, page,
     page_size: 60,
   };
-  if (group_by === 'cluster')  f.cluster_id = num(sp.get('cluster_id'));
+  if (group_by === 'cluster')  f.cluster_id = num(sp.get('cluster_id')) ?? num(sp.get('bbox_cluster_id'));
   if (group_by === 'supergroup') f.supergroup = num(sp.get('supergroup'));
   if (group_by === 'species')  { const v = sp.get('species');  if (v !== null) f.species  = v; }
   if (group_by === 'genus')    { const v = sp.get('genus');    if (v !== null) f.genus    = v; }

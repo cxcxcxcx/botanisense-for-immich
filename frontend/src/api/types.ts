@@ -684,3 +684,110 @@ export interface BboxNeighborsResponse {
   model_version: string;
   include_photos: boolean;
 }
+
+// ---- Box-level clustering ------------------------------------------------
+
+export interface BboxClusterSummary {
+  cluster_id: number;
+  name: string;
+  n_boxes: number;
+  n_photo_fallbacks?: number;
+  n_assets: number;
+  n_new_assets: number;
+  latest_captured_at: string | null;
+  sample_detection_id: number | null;
+  sample_asset_id: string;
+  sample_thumb_url: string;
+  sample_label: string;
+  top_species: { species: string; common_name: string | null; count: number }[];
+  top_genus: { genus: string; count: number }[];
+}
+
+export interface BboxClustersStats {
+  n_clusters: number;
+  n_boxes: number;
+  n_photo_fallbacks?: number;
+  n_assets: number;
+  n_unclustered_assets?: number;
+  n_new_assets: number;
+  n_noise: number;
+  n_boxes_at_fit: number;
+  fitted_at: string | null;
+}
+
+export interface BboxClustersResponse {
+  clusters: BboxClusterSummary[];
+  unclustered?: BboxClusterSummary | null;
+  stats: BboxClustersStats;
+}
+
+export interface BboxClusterBox {
+  detection_id: number;
+  label: string;
+  yolo_score: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  area: number;
+  thumb_url: string;
+  species: string;
+  common_name: string;
+  species_score: number | null;
+}
+
+export interface BboxClusterItem {
+  kind?: 'box' | 'photo';
+  detection_id: number | null;
+  asset_id: string;
+  original_file_name: string;
+  captured_at: string | null;
+  label: string;
+  yolo_score: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  area: number;
+  thumb_url: string;
+  whole_cluster_id: number | null;
+  is_new_asset: boolean;
+  has_person: boolean | null;
+  species: string;
+  common_name: string;
+  species_score: number | null;
+  kingdom: string;
+  family: string;
+  genus: string;
+  n_boxes: number;
+  boxes: BboxClusterBox[];
+}
+
+export interface BboxClusterItemsResponse {
+  cluster: {
+    cluster_id: number;
+    name: string;
+    n_boxes: number;
+    n_assets: number;
+    n_new_assets: number;
+    top_species: { species: string; common_name: string | null; count: number }[];
+    top_genus: { genus: string; count: number }[];
+  };
+  items: BboxClusterItem[];
+  pagination: Pagination;
+}
+
+export interface BboxClusteringStatus {
+  fitted: boolean;
+  state: Record<string, unknown> | null;
+  n_bbox_embeddings: number;
+  running: boolean;
+  latest_job: {
+    status: string;
+    n_clusters: number | null;
+    n_boxes: number | null;
+    n_clustered: number | null;
+    n_noise: number | null;
+    error: string | null;
+  } | null;
+}

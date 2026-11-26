@@ -79,31 +79,41 @@ export function Header({ view }: Props) {
   }, []);
   const isMobileEngine = !!engine?.id && engine.id.startsWith('mobile');
 
+  // Publish the header's live height as --header-h so the page-level
+  // sticky bars (.sticky-toolbar / .back-bar) stick just below it
+  // instead of sliding underneath (the header is also sticky, z-50).
+  const headerRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    const el = headerRef.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const ro = new ResizeObserver(() => {
+      root.style.setProperty('--header-h', `${el.getBoundingClientRect().height}px`);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   return (
-    <header className="sticky top-0 z-50 bg-bg/95 backdrop-blur flex flex-wrap items-center gap-3 py-1.5 px-4 border-b border-line">
-      {/* Brand identity: the app icon.
-          Wordmark + "for Immich" subtitle on mobile, one line on sm:
-          and up. Sits on the left, takes only as much space as it
-          needs. */}
+    <header ref={headerRef} className="sticky top-0 z-50 bg-bg/95 backdrop-blur flex flex-nowrap items-center gap-2 sm:gap-3 py-1.5 px-3 sm:px-4 border-b border-line">
+      {/* Brand identity: app icon spanning the two-line stacked wordmark
+          (BotaniSense on top, smaller "for Immich" underneath) so both
+          left and right icons vertically span the two text lines on one row. */}
       <a
         href="#browse"
-        className="flex items-center gap-2 no-underline text-inherit"
+        className="flex items-center gap-2 no-underline text-inherit min-w-0 shrink-0"
         title="BotaniSense for Immich — home"
       >
-        <BrandMark size={28} />
-        <span className="flex flex-col leading-tight">
+        <BrandMark size={30} />
+        <span className="flex flex-col justify-center leading-none">
           <span className="wordmark">BotaniSense</span>
-          <span className="wordmark-sub hidden sm:inline">for Immich</span>
-        </span>
-        <span className="sm:hidden text-fg-1 text-[0.7rem] uppercase tracking-wider ml-1">
-          · for Immich
+          <span className="wordmark-sub">for Immich</span>
         </span>
       </a>
 
-      {/* Right-side group: tab strip + optional engine badge.
-          The KNN-unavailable indicator lives in the Run page (KnnAlert
-          banner at the top), not here — keeping the header simple. */}
-      <div className="flex items-center gap-2 ml-auto">
+      {/* Right-side group: tab strip + theme + info, vertically centered
+          across the same two-line height as the brand lockup. */}
+      <div className="flex items-center gap-1.5 sm:gap-2 ml-auto shrink-0">
         {isMobileEngine && (
           <span
             className="hidden sm:inline-flex items-center gap-1 text-[0.65rem] uppercase tracking-wider text-accent border border-accent/40 rounded px-1.5 py-[2px]"
@@ -112,11 +122,11 @@ export function Header({ view }: Props) {
             S0 mobile
           </span>
         )}
-        <div className="inline-flex gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
+        <div className="inline-flex gap-0.5 sm:gap-1 p-[3px] bg-bg-1 border border-line2 rounded-lg" role="tablist" aria-label="View">
           <button
             role="tab"
             aria-selected={active === 'browse-list'}
-            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2.5 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'browse-list' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
+            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'browse-list' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
             onClick={() => navigate(browseTarget)}
           >
             <BrowseIcon />
@@ -125,7 +135,7 @@ export function Header({ view }: Props) {
           <button
             role="tab"
             aria-selected={active === 'map'}
-            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2.5 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'map' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
+            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'map' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
             onClick={() => navigate('map')}
           >
             <MapIcon />
@@ -136,7 +146,7 @@ export function Header({ view }: Props) {
               role="tab"
               aria-selected={active === 'botanisense'}
               title="BotaniSense diary"
-              className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2.5 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'botanisense' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
+              className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'botanisense' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
               onClick={() => navigate('botanisense')}
             >
               <DiaryIcon />
@@ -146,7 +156,7 @@ export function Header({ view }: Props) {
           <button
             role="tab"
             aria-selected={active === 'run'}
-            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2.5 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'run' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
+            className={`flex items-center gap-1.5 border border-transparent rounded-md cursor-pointer py-[3px] px-2 sm:px-3 text-[0.8rem] sm:text-xs ${active === 'run' ? 'bg-accent text-bg border-accent' : 'bg-transparent text-fg-0 hover:text-fg hover:border-[#444]'}`}
             onClick={() => navigate('run')}
           >
             <RunIcon />
@@ -162,7 +172,7 @@ export function Header({ view }: Props) {
           type="button"
           aria-label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
           title={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'}
-          className="ml-1 p-1.5 rounded border border-line2 text-fg-1 hover:text-fg hover:border-accent"
+          className="p-1.5 rounded border border-line2 text-fg-1 hover:text-fg hover:border-accent"
           onClick={() => setTheme(t => (t === 'dark' ? 'light' : 'dark'))}
         >
           {theme === 'dark' ? <SunIcon /> : <MoonIcon />}

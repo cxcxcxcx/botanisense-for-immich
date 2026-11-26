@@ -8,26 +8,26 @@ import { mergeDetectionsForDisplay } from '../lib/bbox';
 // color (high signal); hands get yellow (visible-but-not-person);
 // plants/flowers default to green.
 const COLOR_FOR: Record<string, string> = {
-  person: '#ff7a45',
-  face:   '#5fa8ff',
-  human:  '#5fc8c8',
-  hand:   '#ffd84d',
-  plant:  '#5f5',
-  leaf:   '#5f5',
-  flower: '#5f5',
-  tree:   '#5f5',
-  shrub:  '#5f5',
-  succulent: '#5f5',
-  cactus: '#5f5',
-  herb: '#5f5',
-  grass: '#5f5',
-  stem: '#5f5',
-  branch: '#5f5',
-  bloom: '#5f5',
-  petal: '#5f5',
-  seedling: '#5f5',
+  person:    'rgba(255, 168, 128, 0.78)',
+  face:      'rgba(145, 198, 255, 0.78)',
+  human:     'rgba(145, 218, 218, 0.78)',
+  hand:      'rgba(255, 224, 130, 0.78)',
+  plant:     'rgba(255, 255, 255, 0.72)',
+  leaf:      'rgba(255, 255, 255, 0.72)',
+  flower:    'rgba(255, 255, 255, 0.72)',
+  tree:      'rgba(255, 255, 255, 0.72)',
+  shrub:     'rgba(255, 255, 255, 0.72)',
+  succulent: 'rgba(255, 255, 255, 0.72)',
+  cactus:    'rgba(255, 255, 255, 0.72)',
+  herb:      'rgba(255, 255, 255, 0.72)',
+  grass:     'rgba(255, 255, 255, 0.72)',
+  stem:      'rgba(255, 255, 255, 0.72)',
+  branch:    'rgba(255, 255, 255, 0.72)',
+  bloom:     'rgba(255, 255, 255, 0.72)',
+  petal:     'rgba(255, 255, 255, 0.72)',
+  seedling:  'rgba(255, 255, 255, 0.72)',
 };
-const DEFAULT_COLOR = '#888';
+const DEFAULT_COLOR = 'rgba(220, 220, 220, 0.65)';
 
 interface Props {
   // Image URL (same-origin or CORS-enabled; we don't read pixels).
@@ -203,11 +203,12 @@ export function BboxImage({
       // adjacent same-label boxes as one union region, with the member
       // count in the label. The raw detections remain in the debug list.
       const display = mergeDetectionsForDisplay(visible);
-      const stroke = 2 * s;
+      const stroke = 1.25 * s;
       const fontSize = 10 * s;
-      const pad = 2 * s;
+      const padX = 4 * s;
+      const padY = 2 * s;
       ctx.lineWidth = stroke;
-      ctx.font = `600 ${fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`;
+      ctx.font = `500 ${fontSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
       ctx.textBaseline = 'top';
 
       for (const d of display) {
@@ -216,22 +217,42 @@ export function BboxImage({
         const by = mapY(d.y);
         const bw = d.w * drawW;
         const bh = d.h * drawH;
+        const radius = Math.min(bw, bh) * 0.04;
+
+        ctx.save();
+        ctx.shadowColor = 'rgba(0, 0, 0, 0.55)';
+        ctx.shadowBlur = 3 * s;
+        ctx.shadowOffsetY = 0.5 * s;
         ctx.strokeStyle = color;
-        ctx.strokeRect(bx, by, bw, bh);
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(bx, by, bw, bh, radius);
+        } else {
+          ctx.rect(bx, by, bw, bh);
+        }
+        ctx.stroke();
+        ctx.restore();
 
         const count = d.group_count > 1 ? ` ×${d.group_count}` : '';
         const label = `${d.label}${count} ${Math.round(d.score * 100)}%`;
         const tw = ctx.measureText(label).width;
-        const chipH = fontSize + pad * 2;
-        let cx = Math.max(0, bx);
-        let cy = Math.max(0, by);
+        const chipH = fontSize + padY * 2;
+        const chipR = 3 * s;
+        let cx = Math.max(2 * s, bx + 3 * s);
+        let cy = Math.max(2 * s, by + 3 * s);
         const maxW = (fit === 'cover' ? rect.width : cw);
-        let cwChip = tw + pad * 2;
+        let cwChip = tw + padX * 2;
         if (cx + cwChip > maxW) cwChip = Math.max(0, maxW - cx);
-        ctx.fillStyle = color;
-        ctx.fillRect(cx, cy, cwChip, chipH);
-        ctx.fillStyle = '#000';
-        ctx.fillText(label, cx + pad, cy + pad);
+        ctx.fillStyle = 'rgba(15, 20, 25, 0.56)';
+        ctx.beginPath();
+        if (typeof ctx.roundRect === 'function') {
+          ctx.roundRect(cx, cy, cwChip, chipH, chipR);
+        } else {
+          ctx.rect(cx, cy, cwChip, chipH);
+        }
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.88)';
+        ctx.fillText(label, cx + padX, cy + padY);
       }
     };
 
