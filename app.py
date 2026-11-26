@@ -40,6 +40,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -1148,6 +1149,7 @@ _cors_origins = (
     if _cors_env is not None
     else ["http://localhost:5173", "http://127.0.0.1:5173"]
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -1288,6 +1290,8 @@ async def _cluster_similarity_index() -> tuple[list[int], "np.ndarray"]:
 
     def _build():
         with storage.connect(DB_PATH) as conn:
+            if storage.has_bbox_clusters(conn):
+                return clusters.bbox_cluster_centroids(conn)
             return clusters.cluster_centroids(conn)
 
     index = await asyncio.to_thread(_build)
@@ -1318,8 +1322,26 @@ async def related_clusters_endpoint(
     if not neighbors:
         return {"related": [], "cluster_id": cluster_id}
 
-    payload = await _clusters_payload(None)
-    by_id = {r["cluster_id"]: r for r in payload.get("clusters", [])}
+    def _has_bbox() -> bool:
+        with storage.connect(DB_PATH) as conn:
+            return storage.has_bbox_clusters(conn)
+
+    if await asyncio.to_thread(_has_bbox):
+        summary = await _bbox_clusters_payload()
+        by_id = {
+            c["cluster_id"]: {
+                "cluster_id": c["cluster_id"],
+                "name": c["name"],
+                "n": c["n_assets"],
+                "sample_asset_id": c["sample_asset_id"],
+                "sample_thumbnail_url": c["sample_thumb_url"],
+                "top_genus": c.get("top_genus", []),
+            }
+            for c in summary.get("clusters", [])
+        }
+    else:
+        payload = await _clusters_payload(None)
+        by_id = {r["cluster_id"]: r for r in payload.get("clusters", [])}
     related = []
     for nb in neighbors:
         meta = by_id.get(nb["cluster_id"], {})
@@ -1339,6 +1361,27 @@ async def related_clusters_endpoint(
 # is the "Ungrouped" bucket (clusters with no close siblings); real
 # families are numbered from 1 in the families list's (stable) order.
 UNGROUPED_GROUP_ID = 0
+
+
+async def _unified_or_legacy_cluster_meta() -> dict[int, dict]:
+    """Return {cluster_id: {cluster_id, name, n, sample_asset_id, sample_thumbnail_url, top_genus}}
+    from the cached unified box+photo summary when populated, else legacy whole-image clusters."""
+    summary = await bbox_clusters_endpoint()
+    unified_list = summary.get("clusters") or []
+    if unified_list:
+        return {
+            c["cluster_id"]: {
+                "cluster_id": c["cluster_id"],
+                "name": c["name"],
+                "n": c["n_assets"],
+                "sample_asset_id": c["sample_asset_id"],
+                "sample_thumbnail_url": c["sample_thumb_url"],
+                "top_genus": c.get("top_genus", []),
+            }
+            for c in unified_list
+        }
+    payload = await _clusters_payload(None)
+    return {r["cluster_id"]: r for r in payload.get("clusters", [])}
 
 
 async def _cluster_group_index() -> tuple[list[list[int]], list[int]]:
@@ -1363,7 +1406,7 @@ async def _cluster_group_index() -> tuple[list[list[int]], list[int]]:
         return clusters.build_cluster_groups(cluster_ids, centroids)
 
     families, solo = await asyncio.to_thread(_build)
-    meta_by_id = {r["cluster_id"]: r for r in (await _clusters_payload(None)).get("clusters", [])}
+    meta_by_id = await _unified_or_legacy_cluster_meta()
     n_of = lambda member_ids: sum(
         int((meta_by_id.get(cid) or {}).get("n") or 0) for cid in member_ids
     )
@@ -1464,8 +1507,7 @@ async def cluster_groups_endpoint() -> dict:
     between the two endpoints.
     """
     families, solo = await _cluster_group_index()
-    payload = await _clusters_payload(None)
-    meta_by_id = {r["cluster_id"]: r for r in payload.get("clusters", [])}
+    meta_by_id = await _unified_or_legacy_cluster_meta()
     groups = []
     for idx, member_ids in enumerate(families, start=1):
         card = _group_card(idx, member_ids, meta_by_id)
@@ -1479,12 +1521,214 @@ async def cluster_groups_endpoint() -> dict:
     return {"groups": groups, "ungrouped": ungrouped}
 
 
+@app.get("/api/cluster-groups/{group_id}/items")
+async def cluster_group_items_endpoint(
+    group_id: int,
+    page: int = Query(default=0, ge=0),
+    page_size: int = Query(default=60, ge=1, le=200),
+    sort: str = Query(default="score", pattern="^(score|time|area|yolo)$"),
+) -> dict:
+    """Paginated unified box+photo items for a super-group (fast, ~25 KB)."""
+    families, solo = await _cluster_group_index()
+    member_ids = _resolve_group_clusters(group_id, families, solo)
+    meta_by_id = await _unified_or_legacy_cluster_meta()
+    card = _group_card(group_id, member_ids, meta_by_id) if member_ids else None
+    if card is not None and group_id == UNGROUPED_GROUP_ID:
+        card["name"] = "Ungrouped"
+
+    def _build() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            res = storage.get_bbox_cluster_items(
+                conn,
+                cluster_id=member_ids,
+                page=page,
+                page_size=page_size,
+                sort=sort,
+                dedupe_assets=True,
+            )
+            if card is not None:
+                res["cluster"]["name"] = card["name"]
+                res["cluster"]["cluster_id"] = group_id
+            return res
+
+    return await asyncio.to_thread(_build)
+
+
 def _invalidate_clusters_cache() -> None:
     """Drop the /api/clusters cache. Called after a pipeline run
     (HDBSCAN may have reassigned cluster_ids) and on demand."""
     with _clusters_cache_lock:
         _clusters_cache.clear()
         _cluster_sim_cache.clear()
+    # Box-cluster cards embed names/samples/counts that a run or a bulk
+    # remove can change too.
+    _invalidate_bbox_clusters_cache()
+
+
+# ---- Box-level clustering (/api/bbox-clusters) ---------------------------
+
+_bbox_clusters_cache_lock = threading.Lock()
+_bbox_clusters_cache: dict | None = None
+_bbox_clustering_jobs_lock = threading.Lock()
+_bbox_clustering_jobs: dict[str, dict] = {}
+
+
+def _invalidate_bbox_clusters_cache() -> None:
+    global _bbox_clusters_cache
+    with _bbox_clusters_cache_lock:
+        _bbox_clusters_cache = None
+    with _clusters_cache_lock:
+        _cluster_sim_cache.clear()
+
+
+class BboxClusteringRefitParams(BaseModel):
+    min_cluster_size: int = clusters.BBOX_CLUSTER_MIN_SIZE
+    min_samples: int = clusters.BBOX_CLUSTER_MIN_SAMPLES
+    min_score: float = clusters.BBOX_CLUSTER_MIN_SCORE
+    min_area: float = clusters.BBOX_CLUSTER_MIN_AREA
+    min_assets_per_cluster: int = clusters.BBOX_CLUSTER_MIN_ASSETS
+
+
+def _bbox_clustering_refit_worker(job_id: str, params: BboxClusteringRefitParams) -> None:
+    try:
+        with storage.connect(DB_PATH) as conn:
+            res = clusters.refit_bbox_clusters(
+                conn,
+                min_cluster_size=params.min_cluster_size,
+                min_samples=params.min_samples,
+                min_score=params.min_score,
+                min_area=params.min_area,
+                min_assets_per_cluster=params.min_assets_per_cluster,
+            )
+        _invalidate_bbox_clusters_cache()
+        with _bbox_clustering_jobs_lock:
+            j = _bbox_clustering_jobs.get(job_id)
+            if j is not None:
+                j["status"] = "done"
+                j["n_clusters"] = res["n_clusters"]
+                j["n_boxes"] = res["n_boxes_at_fit"]
+                j["n_clustered"] = res["n_clustered"]
+                j["n_noise"] = res["n_noise"]
+                j["finished_at"] = time.monotonic()
+    except Exception as e:
+        _log.exception("[bbox-clusters] refit failed")
+        with _bbox_clustering_jobs_lock:
+            j = _bbox_clustering_jobs.get(job_id)
+            if j is not None:
+                j["status"] = "error"
+                j["error"] = f"{type(e).__name__}: {e}"
+                j["finished_at"] = time.monotonic()
+
+
+@app.get("/api/bbox-clusters")
+async def bbox_clusters_endpoint() -> dict:
+    """Summary cards for plant-box clusters (cached)."""
+    return await _bbox_clusters_payload()
+
+
+async def _bbox_clusters_payload() -> dict:
+    """bbox_cluster_summary, cached until the next refit / pipeline run.
+    Shared by /api/bbox-clusters and /api/clusters/related."""
+    global _bbox_clusters_cache
+    with _bbox_clusters_cache_lock:
+        if _bbox_clusters_cache is not None:
+            return _bbox_clusters_cache
+
+    def _build() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            return storage.bbox_cluster_summary(conn)
+
+    payload = await asyncio.to_thread(_build)
+    with _bbox_clusters_cache_lock:
+        _bbox_clusters_cache = payload
+    return payload
+
+
+@app.get("/api/bbox-clusters/status")
+async def bbox_clustering_status() -> dict:
+    def _build() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            state = storage.get_bbox_clusterer_state(conn)
+            n_emb_row = conn.execute("SELECT COUNT(*) AS n FROM bbox_embeddings").fetchone()
+            n_emb = int(n_emb_row["n"]) if n_emb_row else 0
+        with _bbox_clustering_jobs_lock:
+            running = any(j.get("status") == "running" for j in _bbox_clustering_jobs.values())
+            latest = (
+                max(_bbox_clustering_jobs.values(), key=lambda j: j.get("started_at") or 0.0)
+                if _bbox_clustering_jobs
+                else None
+            )
+            latest_info = (
+                {
+                    "status": latest.get("status"),
+                    "n_clusters": latest.get("n_clusters"),
+                    "n_boxes": latest.get("n_boxes"),
+                    "n_clustered": latest.get("n_clustered"),
+                    "n_noise": latest.get("n_noise"),
+                    "error": latest.get("error"),
+                }
+                if latest
+                else None
+            )
+        return {
+            "fitted": state is not None,
+            "state": state,
+            "n_bbox_embeddings": n_emb,
+            "running": running,
+            "latest_job": latest_info,
+        }
+
+    return await asyncio.to_thread(_build)
+
+
+@app.post("/api/bbox-clusters/refit")
+async def start_bbox_clustering_refit(params: BboxClusteringRefitParams | None = None) -> dict:
+    """Kick off a background FAISS+HDBSCAN box clustering refit."""
+    p = params or BboxClusteringRefitParams()
+    with _bbox_clustering_jobs_lock:
+        if any(j.get("status") == "running" for j in _bbox_clustering_jobs.values()):
+            raise HTTPException(status_code=409, detail="box clustering refit already running")
+        job_id = uuid.uuid4().hex
+        _bbox_clustering_jobs[job_id] = {
+            "status": "running",
+            "started_at": time.monotonic(),
+            "finished_at": None,
+            "n_clusters": None,
+            "n_boxes": None,
+            "n_clustered": None,
+            "n_noise": None,
+            "error": None,
+        }
+    threading.Thread(
+        target=_bbox_clustering_refit_worker,
+        args=(job_id, p),
+        daemon=True,
+        name=f"bbox-cluster-refit-{job_id[:8]}",
+    ).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/bbox-clusters/{cluster_id}")
+async def bbox_cluster_items_endpoint(
+    cluster_id: int,
+    page: int = Query(default=0, ge=0),
+    page_size: int = Query(default=60, ge=1, le=200),
+    sort: str = Query(default="score", pattern="^(score|time|area|yolo)$"),
+    dedupe_assets: bool = Query(default=True),
+) -> dict:
+    """Paginated plant crops inside one box cluster."""
+    def _build() -> dict:
+        with storage.connect(DB_PATH) as conn:
+            return storage.get_bbox_cluster_items(
+                conn,
+                cluster_id=int(cluster_id),
+                page=page,
+                page_size=page_size,
+                sort=sort,
+                dedupe_assets=dedupe_assets,
+            )
+
+    return await asyncio.to_thread(_build)
 
 
 @app.post("/api/clusters/recompute")
@@ -2672,19 +2916,41 @@ async def bbox_neighbors_route(
     return result
 
 
-_bbox_thumb_cache: OrderedDict[int, tuple[bytes, str]] = OrderedDict()
+_bbox_thumb_cache: OrderedDict[tuple[int, int], tuple[bytes, str]] = OrderedDict()
 _bbox_thumb_lock = asyncio.Lock()
-_BBOX_THUMB_CACHE_MAX = 512
+_BBOX_THUMB_CACHE_MAX = 4096
 
 
-@app.get("/api/bbox/{detection_id}/thumb")
-async def bbox_thumb(detection_id: int) -> Response:
-    """Crop one detection bbox out of its source preview (cached)."""
+def _crop_bbox_jpeg(raw_bytes: bytes, det: dict, max_size: int) -> bytes:
+    """Decode preview image, crop bbox, resize to fit `max_size`, encode JPEG.
+    Runs in a worker thread so PIL work never blocks the asyncio event loop."""
     import io
 
     from PIL import Image
 
-    key = int(detection_id)
+    image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+    W, H = image.size
+    x0 = max(0, int(float(det["x"]) * W))
+    y0 = max(0, int(float(det["y"]) * H))
+    x1 = min(W, int((float(det["x"]) + float(det["w"])) * W))
+    y1 = min(H, int((float(det["y"]) + float(det["h"])) * H))
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("empty bbox")
+    crop = image.crop((x0, y0, x1, y1))
+    if max_size > 0 and (crop.width > max_size or crop.height > max_size):
+        crop.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+    out = io.BytesIO()
+    crop.save(out, format="JPEG", quality=80)
+    return out.getvalue()
+
+
+@app.get("/api/bbox/{detection_id}/thumb")
+async def bbox_thumb(
+    detection_id: int,
+    max_size: int = Query(default=384, ge=64, le=1440),
+) -> Response:
+    """Crop one detection bbox out of its source preview (resized + cached)."""
+    key = (int(detection_id), int(max_size))
     async with _bbox_thumb_lock:
         hit = _bbox_thumb_cache.get(key)
         if hit is not None:
@@ -2702,7 +2968,7 @@ async def bbox_thumb(detection_id: int) -> Response:
 
     def _lookup() -> dict | None:
         with storage.connect(DB_PATH) as conn:
-            return storage.get_detection_with_asset_url(conn, detection_id=key)
+            return storage.get_detection_with_asset_url(conn, detection_id=int(detection_id))
 
     det = await asyncio.to_thread(_lookup)
     if not det:
@@ -2731,20 +2997,11 @@ async def bbox_thumb(detection_id: int) -> Response:
         )
 
     try:
-        image = Image.open(io.BytesIO(r.content)).convert("RGB")
+        body = await asyncio.to_thread(_crop_bbox_jpeg, r.content, det, int(max_size))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"bad preview image: {exc}") from exc
-    W, H = image.size
-    x0 = max(0, int(float(det["x"]) * W))
-    y0 = max(0, int(float(det["y"]) * H))
-    x1 = min(W, int((float(det["x"]) + float(det["w"])) * W))
-    y1 = min(H, int((float(det["y"]) + float(det["h"])) * H))
-    if x1 <= x0 or y1 <= y0:
-        raise HTTPException(status_code=422, detail="empty bbox")
-    crop = image.crop((x0, y0, x1, y1))
-    out = io.BytesIO()
-    crop.save(out, format="JPEG", quality=90, optimize=True)
-    body = out.getvalue()
     media_type = "image/jpeg"
     async with _bbox_thumb_lock:
         _bbox_thumb_cache[key] = (body, media_type)

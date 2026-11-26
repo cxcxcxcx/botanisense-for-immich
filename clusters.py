@@ -733,3 +733,568 @@ def build_cluster_groups(
     families.sort(key=lambda m: (-len(m), m[0]))
     solo = sorted(m[0] for m in groups.values() if len(m) == 1)
     return families, solo
+
+
+# ---------- box-level clustering (plant detections) ----------------------
+#
+# Whole-image clustering only sees one vector per photo, so a plant in a
+# wide garden shot, a photo with people, or a multi-species scene either
+# gets drowned out (Plantae < 0.35 → excluded) or collapsed into one
+# dominant subject. Box-level clustering runs HDBSCAN over the BioCLIP
+# crop embeddings (`bbox_embeddings`) of detected plant/tree/flower boxes
+# whose top-1 species prediction is in Kingdom Plantae.
+#
+# Because there can be 50k–100k+ boxes in 768-D, exact O(N^2) HDBSCAN in
+# 768-D would be slow and memory-heavy. Instead we build a sparse k-NN
+# graph with FAISS (exact FlatIP for small N, IVFFlat for large N; with a
+# scikit-learn fallback if FAISS isn't installed) and pass the symmetrized
+# sparse Euclidean distance matrix into HDBSCAN(metric="precomputed").
+# On 65k boxes × 768-D this finishes in ~50s using ~300 MB RAM.
+
+BBOX_CLUSTER_MIN_SCORE = float(os.environ.get("BBOX_CLUSTER_MIN_SCORE", "0.30"))
+BBOX_CLUSTER_MIN_AREA = float(os.environ.get("BBOX_CLUSTER_MIN_AREA", "0.01"))
+BBOX_CLUSTER_MIN_SIZE = int(os.environ.get("BBOX_CLUSTER_MIN_SIZE", "5"))
+BBOX_CLUSTER_MIN_SAMPLES = int(os.environ.get("BBOX_CLUSTER_MIN_SAMPLES", "3"))
+BBOX_CLUSTER_MIN_ASSETS = int(os.environ.get("BBOX_CLUSTER_MIN_ASSETS", "2"))
+BBOX_CLUSTER_KNN_K = int(os.environ.get("BBOX_CLUSTER_KNN_K", "30"))
+BBOX_MERGE_VIS_SIM = float(os.environ.get("BBOX_MERGE_VIS_SIM", "0.88"))
+BBOX_MERGE_TAX_SIM = float(os.environ.get("BBOX_MERGE_TAX_SIM", "0.70"))
+BBOX_MERGE_TAX_MIN_SHARE = float(os.environ.get("BBOX_MERGE_TAX_MIN_SHARE", "0.60"))
+BBOX_RESCUE_SIM = float(os.environ.get("BBOX_RESCUE_SIM", "0.85"))
+BBOX_RESCUE_PURE_VIS_SIM = float(os.environ.get("BBOX_RESCUE_PURE_VIS_SIM", "0.89"))
+BBOX_RESCUE_DIRECT_NN_SIM = float(os.environ.get("BBOX_RESCUE_DIRECT_NN_SIM", "0.94"))
+
+
+def _knn_sparse_euclidean(vecs: np.ndarray, *, k: int) -> "csr_matrix":
+    """Build a symmetric sparse Euclidean distance matrix from L2-normalized
+    rows using top-k cosine neighbors."""
+    import math
+    from scipy.sparse import csr_matrix
+
+    n, d = vecs.shape
+    k_eff = min(max(2, int(k) + 1), n)
+
+    try:
+        import faiss  # type: ignore
+
+        vecs_c = np.ascontiguousarray(vecs, dtype=np.float32)
+        if n <= 4096:
+            index = faiss.IndexFlatIP(d)
+            index.add(vecs_c)
+        else:
+            nlist = min(256, max(16, int(math.sqrt(n))))
+            quantizer = faiss.IndexFlatIP(d)
+            index = faiss.IndexIVFFlat(quantizer, d, nlist, faiss.METRIC_INNER_PRODUCT)
+            index.train(vecs_c)
+            index.add(vecs_c)
+            index.nprobe = min(32, nlist)
+        sims, idxs = index.search(vecs_c, k_eff)
+    except ImportError:
+        from sklearn.neighbors import NearestNeighbors
+
+        nn = NearestNeighbors(n_neighbors=k_eff, metric="cosine", algorithm="brute")
+        nn.fit(vecs)
+        dists_cos, idxs = nn.kneighbors(vecs)
+        sims = 1.0 - dists_cos
+
+    row_idx = np.repeat(np.arange(n, dtype=np.int32), k_eff)
+    col_idx = idxs.ravel().astype(np.int32)
+    sim_vals = sims.ravel()
+    mask = (col_idx >= 0) & (col_idx != row_idx)
+    row_idx = row_idx[mask]
+    col_idx = col_idx[mask]
+    # Unit vectors: ||u - v|| = sqrt(max(0, 2 - 2 * u·v)). Floor at 1e-6 so
+    # zero-distance duplicate vectors remain explicit nonzeros in CSR.
+    dist_vals = np.sqrt(
+        np.maximum(2.0 - 2.0 * np.clip(sim_vals[mask], -1.0, 1.0), 1e-12)
+    ).astype(np.float64)
+    G = csr_matrix((dist_vals, (row_idx, col_idx)), shape=(n, n))
+    # Symmetrize union of directed k-NN edges: if both (i,j) and (j,i) exist
+    # they have identical distances; if only one exists, max(d, 0) = d.
+    return G.maximum(G.T)
+
+
+def _hybrid_merge_clusters(
+    raw_labels: np.ndarray,
+    vecs: np.ndarray,
+    genera: list[str],
+    asset_ids: list[str],
+    *,
+    min_assets_per_cluster: int,
+    vis_sim: float = BBOX_MERGE_VIS_SIM,
+    tax_sim: float = BBOX_MERGE_TAX_SIM,
+    tax_min_share: float = BBOX_MERGE_TAX_MIN_SHARE,
+) -> np.ndarray:
+    """Stage 2: complete-linkage hybrid merge over HDBSCAN seed clusters.
+
+    Merges seed clusters when ALL pairwise members satisfy either:
+      - pure visual closeness: centroid cosine sim >= `vis_sim` (0.88), OR
+      - same dominant genus (both >= `tax_min_share`) AND centroid sim >= `tax_sim` (0.70).
+
+    Complete-linkage guarantees zero single-linkage chaining (no Mixed mega-blobs).
+    Drops single-asset seed clusters (< `min_assets_per_cluster`) to -1 first.
+    """
+    from scipy.cluster.hierarchy import fcluster, linkage
+    from scipy.spatial.distance import squareform
+
+    by_cl: dict[int, list[int]] = {}
+    for idx, lab in enumerate(raw_labels):
+        li = int(lab)
+        if li < 0:
+            continue
+        by_cl.setdefault(li, []).append(idx)
+
+    valid_cids = sorted(
+        cid for cid, idxs in by_cl.items()
+        if len({asset_ids[i] for i in idxs}) >= int(min_assets_per_cluster)
+    )
+    out = np.full_like(raw_labels, -1)
+    if not valid_cids:
+        return out
+    if len(valid_cids) == 1:
+        for i in by_cl[valid_cids[0]]:
+            out[i] = 0
+        return out
+
+    cents = np.zeros((len(valid_cids), vecs.shape[1]), dtype=np.float32)
+    dom_genus: list[str] = []
+    dom_share: list[float] = []
+    for pos, cid in enumerate(valid_cids):
+        idxs = by_cl[cid]
+        c = vecs[idxs].mean(axis=0)
+        cn = float(np.linalg.norm(c))
+        if cn > 0:
+            c /= cn
+        cents[pos] = c
+        g_counts: dict[str, int] = {}
+        for i in idxs:
+            g = genera[i]
+            if g:
+                g_counts[g] = g_counts.get(g, 0) + 1
+        if g_counts:
+            top_g, top_n = max(g_counts.items(), key=lambda kv: kv[1])
+            dom_genus.append(top_g)
+            dom_share.append(top_n / len(idxs))
+        else:
+            dom_genus.append("")
+            dom_share.append(0.0)
+
+    sim = cents @ cents.T
+    cut = max(1e-6, 1.0 - float(vis_sim))
+    eff_dist = np.clip(1.0 - sim, 0.0, 2.0).astype(np.float64)
+    np.fill_diagonal(eff_dist, 0.0)
+
+    C = len(valid_cids)
+    for i in range(C):
+        if not dom_genus[i] or dom_share[i] < tax_min_share:
+            continue
+        gi = dom_genus[i]
+        for j in range(i + 1, C):
+            if dom_genus[j] == gi and dom_share[j] >= tax_min_share:
+                if float(sim[i, j]) >= tax_sim:
+                    d_eff = min(float(eff_dist[i, j]), cut * 0.9)
+                    eff_dist[i, j] = eff_dist[j, i] = d_eff
+
+    Z = linkage(squareform(eff_dist, checks=False), method="complete")
+    grp = fcluster(Z, t=cut, criterion="distance")
+    remap = {valid_cids[i]: int(grp[i]) for i in range(C)}
+    for idx, lab in enumerate(raw_labels):
+        li = int(lab)
+        if li in remap:
+            out[idx] = remap[li]
+    return out
+
+
+def _rescue_noise_points(
+    labels: np.ndarray,
+    vecs: np.ndarray,
+    genera: list[str],
+    families: list[str],
+    knn_graph: "csr_matrix | None" = None,
+    *,
+    sim_thresh: float = BBOX_RESCUE_SIM,
+    pure_vis_thresh: float = BBOX_RESCUE_PURE_VIS_SIM,
+    direct_nn_sim: float = BBOX_RESCUE_DIRECT_NN_SIM,
+) -> tuple[np.ndarray, int]:
+    """Stage 3: recover isolated noise points that clearly belong to an
+    existing merged cluster, via three clean criteria:
+      1. Direct near-duplicate neighbor in the k-NN graph (`sim >= direct_nn_sim`,
+         default 0.94) that is already in a cluster.
+      2. Pure visual closeness to a cluster centroid (`sim >= pure_vis_thresh`,
+         default 0.89).
+      3. Taxon-compatible centroid match (`sim >= sim_thresh`, default 0.85)
+         where the point's genus is in the cluster's top-3 genera OR its family
+         matches the cluster's dominant family (handles multi-genus clusters
+         like Sedum & Echeveria and low-confidence succulent genera in
+         Crassulaceae).
+    """
+    import math
+
+    by_cl: dict[int, list[int]] = {}
+    for idx, lab in enumerate(labels):
+        li = int(lab)
+        if li >= 0:
+            by_cl.setdefault(li, []).append(idx)
+    if not by_cl:
+        return labels, 0
+
+    out = labels.copy()
+    rescued = 0
+
+    # 3a. Direct k-NN member rescue (uses the Stage 1 sparse Euclidean graph).
+    if knn_graph is not None and direct_nn_sim > 0:
+        max_dist = math.sqrt(max(0.0, 2.0 - 2.0 * float(direct_nn_sim)))
+        noise_idx = np.where(out < 0)[0]
+        indptr = knn_graph.indptr
+        indices = knn_graph.indices
+        data = knn_graph.data
+        for idx in noise_idx:
+            s, e = indptr[idx], indptr[idx + 1]
+            best_d = max_dist
+            best_cid = -1
+            for p in range(s, e):
+                d = float(data[p])
+                if d <= best_d:
+                    nb_lab = int(labels[indices[p]])
+                    if nb_lab >= 0:
+                        best_d = d
+                        best_cid = nb_lab
+            if best_cid >= 0:
+                out[idx] = best_cid
+                rescued += 1
+
+    # 3b. Centroid rescue (pure visual or top-3 genus / dominant family match).
+    cids = sorted(by_cl.keys())
+    cents = np.zeros((len(cids), vecs.shape[1]), dtype=np.float32)
+    top_genera: list[set[str]] = []
+    dom_family: list[str] = []
+    for pos, cid in enumerate(cids):
+        idxs = by_cl[cid]
+        c = vecs[idxs].mean(axis=0)
+        cn = float(np.linalg.norm(c))
+        if cn > 0:
+            c /= cn
+        cents[pos] = c
+        g_counts: dict[str, int] = {}
+        f_counts: dict[str, int] = {}
+        for i in idxs:
+            g = genera[i]
+            if g:
+                g_counts[g] = g_counts.get(g, 0) + 1
+            f = families[i]
+            if f:
+                f_counts[f] = f_counts.get(f, 0) + 1
+        top_g = {g for g, _ in sorted(g_counts.items(), key=lambda kv: -kv[1])[:3]}
+        top_genera.append(top_g)
+        dom_family.append(max(f_counts.items(), key=lambda kv: kv[1])[0] if f_counts else "")
+
+    noise_idx = np.where(out < 0)[0]
+    if noise_idx.size == 0:
+        return out, rescued
+
+    batch_size = 4096
+    for start in range(0, len(noise_idx), batch_size):
+        batch = noise_idx[start : start + batch_size]
+        sims = vecs[batch] @ cents.T
+        best_j = np.argmax(sims, axis=1)
+        best_s = sims[np.arange(len(batch)), best_j]
+        for k, idx in enumerate(batch):
+            sc = float(best_s[k])
+            if sc < sim_thresh:
+                continue
+            j = int(best_j[k])
+            ii = int(idx)
+            if (
+                sc >= pure_vis_thresh
+                or (genera[ii] and genera[ii] in top_genera[j])
+                or (families[ii] and families[ii] == dom_family[j])
+            ):
+                out[ii] = cids[j]
+                rescued += 1
+    return out, rescued
+
+
+def refit_bbox_clusters(
+    conn: sqlite3.Connection,
+    *,
+    min_cluster_size: int = BBOX_CLUSTER_MIN_SIZE,
+    min_samples: int = BBOX_CLUSTER_MIN_SAMPLES,
+    min_score: float = BBOX_CLUSTER_MIN_SCORE,
+    min_area: float = BBOX_CLUSTER_MIN_AREA,
+    min_assets_per_cluster: int = BBOX_CLUSTER_MIN_ASSETS,
+    knn_k: int = BBOX_CLUSTER_KNN_K,
+    model_version: str | None = None,
+    include_photo_fallback: bool = True,
+    enable_hybrid_merge: bool = True,
+    enable_noise_rescue: bool = True,
+) -> dict:
+    """Unified 3-stage crop-first + whole-photo-fallback clustering:
+      1. Seed discovery: FAISS k-NN + HDBSCAN(eps=0) for razor-sharp cores.
+      2. Hybrid complete-linkage merge: reunites burst-split clusters of the
+         same plant (visual sim >= 0.88, OR same dominant genus & sim >= 0.70)
+         without any single-linkage chaining.
+      3. Noise rescue: recovers isolated single-shot photos that have a
+         near-duplicate clustered neighbour (sim >= 0.94), or sit within
+         centroid sim >= 0.89 (pure visual) / >= 0.85 (taxon-compatible).
+    """
+    if model_version is None:
+        mv_row = conn.execute(
+            """
+            SELECT model_version, COUNT(*) AS n
+            FROM bbox_embeddings
+            GROUP BY model_version
+            ORDER BY n DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        model_version = str(mv_row["model_version"]) if mv_row is not None else None
+
+    # Each point is ("box", detection_id, asset_id) or ("photo", asset_id, asset_id).
+    entries: list[tuple[str, int | str, str]] = []
+    genera: list[str] = []
+    families: list[str] = []
+    vec_list: list[np.ndarray] = []
+    expected_dim: int | None = None
+    box_asset_ids: set[str] = set()
+
+    if model_version is not None:
+        rows = conn.execute(
+            """
+            SELECT b.detection_id, b.vector, b.dim, d.asset_id, p.genus, p.family
+            FROM bbox_embeddings b
+            JOIN detections d ON d.id = b.detection_id
+            JOIN bbox_predictions p
+              ON p.detection_id = b.detection_id
+             AND p.rank = 'species' AND p.position = 0
+            WHERE b.model_version = ?
+              AND p.kingdom = 'Plantae'
+              AND d.score >= ?
+              AND (d.w * d.h) >= ?
+            ORDER BY b.detection_id
+            """,
+            (model_version, float(min_score), float(min_area)),
+        ).fetchall()
+
+        for r in rows:
+            vec = np.frombuffer(r["vector"], dtype="<f4")
+            dim = int(r["dim"])
+            if vec.size != dim:
+                continue
+            if expected_dim is None:
+                expected_dim = dim
+            elif dim != expected_dim:
+                continue
+            aid = str(r["asset_id"])
+            box_asset_ids.add(aid)
+            entries.append(("box", int(r["detection_id"]), aid))
+            genera.append(str(r["genus"] or ""))
+            families.append(str(r["family"] or ""))
+            vec_list.append(vec.copy())
+
+    n_box_inputs = len(entries)
+    n_photo_inputs = 0
+
+    if include_photo_fallback:
+        plant_ids = storage.plantae_asset_ids(conn, min_score=CLUSTER_PLANTAE_MIN)
+        pred_rows = conn.execute(
+            "SELECT asset_id, kingdom, genus, family FROM predictions "
+            "WHERE rank = 'species' AND position = 0"
+        ).fetchall()
+        non_plant_top1 = {
+            str(r["asset_id"])
+            for r in pred_rows
+            if r["kingdom"] and r["kingdom"] != "Plantae"
+        }
+        photo_genus = {str(r["asset_id"]): str(r["genus"] or "") for r in pred_rows}
+        photo_family = {str(r["asset_id"]): str(r["family"] or "") for r in pred_rows}
+        fallback_ids = (plant_ids - box_asset_ids) - non_plant_top1
+        if fallback_ids:
+            ids_all, mat_all = storage.all_embeddings(conn)
+            if mat_all.size > 0:
+                if expected_dim is None:
+                    expected_dim = int(mat_all.shape[1])
+                if int(mat_all.shape[1]) == expected_dim:
+                    for i, aid in enumerate(ids_all):
+                        if aid in fallback_ids:
+                            entries.append(("photo", str(aid), str(aid)))
+                            genera.append(photo_genus.get(str(aid), ""))
+                            families.append(photo_family.get(str(aid), ""))
+                            vec_list.append(mat_all[i].copy())
+                            n_photo_inputs += 1
+
+    n = len(entries)
+    mcs = max(2, int(min_cluster_size))
+    ms = max(1, min(int(min_samples), mcs))
+
+    if n < mcs:
+        storage.set_bbox_clusters(conn, {}, photo_to_cluster={})
+        storage.invalidate_bbox_cluster_names(conn)
+        storage.save_bbox_clusterer_state(
+            conn,
+            n_boxes_at_fit=n,
+            n_clusters=0,
+            n_noise=n,
+            min_cluster_size=mcs,
+            min_samples=ms,
+            min_score=min_score,
+            min_area=min_area,
+        )
+        return {
+            "n_boxes_at_fit": n,
+            "n_box_inputs": n_box_inputs,
+            "n_photo_inputs": n_photo_inputs,
+            "n_clusters": 0,
+            "n_clustered": 0,
+            "n_photo_clustered": 0,
+            "n_rescued": 0,
+            "n_noise": n,
+        }
+
+    vecs = np.vstack(vec_list).astype(np.float32, copy=False)
+    norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+    vecs = vecs / np.maximum(norms, 1e-12)
+    asset_ids = [e[2] for e in entries]
+
+    # Stage 1: HDBSCAN(eps=0) on sparse FAISS k-NN graph
+    k_eff = min(max(int(knn_k), mcs * 2), n - 1)
+    G = _knn_sparse_euclidean(vecs, k=k_eff)
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=mcs,
+        min_samples=ms,
+        metric="precomputed",
+        cluster_selection_method="eom",
+    )
+    labels = np.asarray(clusterer.fit_predict(G), dtype=np.int64)
+
+    # Stage 2: complete-linkage hybrid merge
+    if enable_hybrid_merge:
+        labels = _hybrid_merge_clusters(
+            labels,
+            vecs,
+            genera,
+            asset_ids,
+            min_assets_per_cluster=min_assets_per_cluster,
+        )
+
+    # Stage 3: direct k-NN + centroid noise rescue
+    n_rescued = 0
+    if enable_noise_rescue:
+        labels, n_rescued = _rescue_noise_points(labels, vecs, genera, families, knn_graph=G)
+
+    # Group by final label and enforce min_assets_per_cluster.
+    raw_members: dict[int, list[tuple[str, int | str]]] = {}
+    raw_assets: dict[int, set[str]] = {}
+    for idx, lab in enumerate(labels):
+        li = int(lab)
+        if li < 0:
+            continue
+        kind, ident, aid = entries[idx]
+        raw_members.setdefault(li, []).append((kind, ident))
+        raw_assets.setdefault(li, set()).add(aid)
+
+    surviving = [
+        (lab, raw_members[lab], len(raw_assets[lab]))
+        for lab in raw_members
+        if len(raw_assets[lab]) >= int(min_assets_per_cluster)
+    ]
+    surviving.sort(key=lambda item: (-item[2], -len(item[1]), item[0]))
+
+    det_to_cluster: dict[int, int] = {}
+    photo_to_cluster: dict[str, int] = {}
+    for new_cid, (_raw_lab, members, _n_assets) in enumerate(surviving):
+        for kind, ident in members:
+            if kind == "box":
+                det_to_cluster[int(ident)] = new_cid
+            else:
+                photo_to_cluster[str(ident)] = new_cid
+
+    n_clusters = len(surviving)
+    n_clustered = len(det_to_cluster) + len(photo_to_cluster)
+    n_noise = n - n_clustered
+
+    storage.set_bbox_clusters(conn, det_to_cluster, photo_to_cluster=photo_to_cluster)
+    storage.save_bbox_clusterer_state(
+        conn,
+        n_boxes_at_fit=n,
+        n_clusters=n_clusters,
+        n_noise=n_noise,
+        min_cluster_size=mcs,
+        min_samples=ms,
+        min_score=min_score,
+        min_area=min_area,
+    )
+    names = storage.compute_bbox_cluster_names(conn)
+    storage.save_bbox_cluster_names(conn, names)
+
+    _log.info(
+        f"[bbox-clusters] 3-stage refit  boxes={n_box_inputs}  photo_fallback={n_photo_inputs}  "
+        f"n_clusters={n_clusters}  clustered={n_clustered} (boxes={len(det_to_cluster)}, "
+        f"photos={len(photo_to_cluster)}, rescued={n_rescued})  "
+        f"noise={n_noise} ({100.0 * n_noise / n:.1f}%)"
+    )
+
+    return {
+        "n_boxes_at_fit": n,
+        "n_box_inputs": n_box_inputs,
+        "n_photo_inputs": n_photo_inputs,
+        "n_clusters": n_clusters,
+        "n_clustered": n_clustered,
+        "n_photo_clustered": len(photo_to_cluster),
+        "n_rescued": n_rescued,
+        "n_noise": n_noise,
+    }
+
+
+def bbox_cluster_centroids(conn: sqlite3.Connection) -> tuple[list[int], "np.ndarray"]:
+    """Compute one L2-normalized centroid vector per unified box+photo cluster.
+
+    Returns (cluster_ids_asc, centroids) where centroids is (C, D) float32,
+    matching the contract of `cluster_centroids()` so `nearest_clusters()`
+    and `build_cluster_groups()` work identically over unified clusters.
+    """
+    box_rows = conn.execute(
+        """
+        SELECT bc.cluster_id, b.vector, b.dim
+        FROM bbox_clusters bc
+        JOIN bbox_embeddings b ON b.detection_id = bc.detection_id
+        """
+    ).fetchall()
+    photo_rows = conn.execute(
+        """
+        SELECT bp.cluster_id, e.vector, e.dim
+        FROM bbox_cluster_photos bp
+        JOIN embeddings e ON e.asset_id = bp.asset_id
+        """
+    ).fetchall()
+
+    if not box_rows and not photo_rows:
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    sums: dict[int, np.ndarray] = {}
+    expected_dim: int | None = None
+    for rows in (box_rows, photo_rows):
+        for r in rows:
+            vec = np.frombuffer(r["vector"], dtype="<f4")
+            dim = int(r["dim"])
+            if vec.size != dim:
+                continue
+            if expected_dim is None:
+                expected_dim = dim
+            elif dim != expected_dim:
+                continue
+            cid = int(r["cluster_id"])
+            acc = sums.get(cid)
+            if acc is None:
+                sums[cid] = vec.astype(np.float32, copy=True)
+            else:
+                acc += vec
+
+    if not sums or expected_dim is None:
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    cluster_ids = sorted(sums.keys())
+    centroids = np.vstack([sums[cid] for cid in cluster_ids]).astype(np.float32, copy=False)
+    norms = np.linalg.norm(centroids, axis=1, keepdims=True)
+    safe = np.where(norms > 0, norms, 1.0)
+    centroids = centroids / safe.astype(np.float32)
+    return cluster_ids, centroids

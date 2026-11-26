@@ -331,6 +331,48 @@ CREATE TABLE IF NOT EXISTS location_guesses (
 );
 CREATE INDEX IF NOT EXISTS idx_location_guesses_confidence
   ON location_guesses(confidence);
+
+-- Box-level clustering: HDBSCAN over plant detection crop embeddings
+-- (`bbox_embeddings`), scoped to Plantae boxes above score/area floors.
+-- Separate from whole-image `assets.cluster_id` so one photo with
+-- multiple plants can belong to multiple box clusters, and photos whose
+-- whole-image Plantae score was too low still contribute their plant crops.
+CREATE TABLE IF NOT EXISTS bbox_clusters (
+  detection_id INTEGER PRIMARY KEY REFERENCES detections(id) ON DELETE CASCADE,
+  cluster_id   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bbox_clusters_cid ON bbox_clusters(cluster_id);
+
+-- Whole-photo fallback members of the unified box+photo clustering:
+-- plant photos (Plantae >= floor) that had NO qualifying detection box
+-- enter the same 768-D BioCLIP-2 clustering as virtual whole-image boxes.
+CREATE TABLE IF NOT EXISTS bbox_cluster_photos (
+  asset_id   TEXT PRIMARY KEY REFERENCES assets(asset_id) ON DELETE CASCADE,
+  cluster_id INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bbox_cluster_photos_cid ON bbox_cluster_photos(cluster_id);
+
+CREATE TABLE IF NOT EXISTS bbox_cluster_names (
+  cluster_id       INTEGER PRIMARY KEY,
+  name             TEXT NOT NULL,
+  n_boxes          INTEGER NOT NULL,
+  n_assets         INTEGER NOT NULL,
+  top_species_json TEXT NOT NULL DEFAULT '[]',
+  top_genus_json   TEXT NOT NULL DEFAULT '[]',
+  computed_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS bbox_clusterer_state (
+  id                INTEGER PRIMARY KEY CHECK (id = 1),
+  n_boxes_at_fit    INTEGER NOT NULL,
+  n_clusters        INTEGER NOT NULL,
+  n_noise           INTEGER NOT NULL,
+  min_cluster_size  INTEGER NOT NULL,
+  min_samples       INTEGER NOT NULL,
+  min_score         REAL NOT NULL,
+  min_area          REAL NOT NULL,
+  fitted_at         TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 
@@ -1459,6 +1501,19 @@ _PEOPLE_FILTER_SQL = {
 }
 
 
+def has_bbox_clusters(conn: sqlite3.Connection) -> bool:
+    """True when the unified box+photo clustering tables hold at least one row."""
+    row = conn.execute(
+        "SELECT 1 FROM bbox_clusters LIMIT 1"
+    ).fetchone()
+    if row is not None:
+        return True
+    row2 = conn.execute(
+        "SELECT 1 FROM bbox_cluster_photos LIMIT 1"
+    ).fetchone()
+    return row2 is not None
+
+
 def get_assets_in_cluster(
     conn: sqlite3.Connection,
     cluster_id: int,
@@ -1469,15 +1524,28 @@ def get_assets_in_cluster(
     for bulk-add idempotency). Used by the per-cluster album sync
     worker to drive PUT /api/albums/{id}/assets.
 
-    `people_filter`:
-      - None (default): no filter — every asset in the cluster
-      - 0: only assets with no person detected (or unscanned)
-      - 1: only assets with a detected person
-    The unscanned-NULL case is treated as "without people" so the
-    gate doesn't silently drop photos whose person stage hasn't run
-    yet.
+    Uses the unified box+photo clusters when populated; falls back to
+    legacy `assets.cluster_id` on DBs that have not been migrated yet.
     """
     extra = _PEOPLE_FILTER_SQL[people_filter]
+    if has_bbox_clusters(conn):
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT a.asset_id
+            FROM assets a
+            WHERE a.asset_id IN (
+              SELECT d.asset_id FROM bbox_clusters bc
+              JOIN detections d ON d.id = bc.detection_id
+              WHERE bc.cluster_id = ?
+              UNION
+              SELECT bp.asset_id FROM bbox_cluster_photos bp
+              WHERE bp.cluster_id = ?
+            ){extra}
+            ORDER BY a.asset_id ASC
+            """,
+            (int(cluster_id), int(cluster_id)),
+        ).fetchall()
+        return [r["asset_id"] for r in rows]
     rows = conn.execute(
         f"""
         SELECT asset_id FROM assets
@@ -1499,6 +1567,23 @@ def count_assets_in_cluster(
     preview endpoint. Same `people_filter` semantics as
     `get_assets_in_cluster`."""
     extra = _PEOPLE_FILTER_SQL[people_filter]
+    if has_bbox_clusters(conn):
+        row = conn.execute(
+            f"""
+            SELECT COUNT(DISTINCT a.asset_id) AS n
+            FROM assets a
+            WHERE a.asset_id IN (
+              SELECT d.asset_id FROM bbox_clusters bc
+              JOIN detections d ON d.id = bc.detection_id
+              WHERE bc.cluster_id = ?
+              UNION
+              SELECT bp.asset_id FROM bbox_cluster_photos bp
+              WHERE bp.cluster_id = ?
+            ){extra}
+            """,
+            (int(cluster_id), int(cluster_id)),
+        ).fetchone()
+        return int(row["n"]) if row else 0
     row = conn.execute(
         f"SELECT COUNT(*) AS n FROM assets WHERE cluster_id = ?{extra}",
         (int(cluster_id),),
@@ -4659,3 +4744,742 @@ def _max_iso(a: str | None, b: str | None) -> str | None:
     if b is None:
         return a
     return a if a > b else b
+
+
+# ---------- bbox_clusters (plant-box clustering) -------------------------
+
+
+def set_bbox_clusters(
+    conn: sqlite3.Connection,
+    det_to_cluster: dict[int, int],
+    *,
+    photo_to_cluster: dict[str, int] | None = None,
+) -> None:
+    """Replace the unified box+photo clustering assignment atomically."""
+    conn.execute("DELETE FROM bbox_clusters")
+    conn.execute("DELETE FROM bbox_cluster_photos")
+    if det_to_cluster:
+        conn.executemany(
+            "INSERT INTO bbox_clusters (detection_id, cluster_id) VALUES (?, ?)",
+            [(int(did), int(cid)) for did, cid in det_to_cluster.items()],
+        )
+    if photo_to_cluster:
+        conn.executemany(
+            "INSERT INTO bbox_cluster_photos (asset_id, cluster_id) VALUES (?, ?)",
+            [(str(aid), int(cid)) for aid, cid in photo_to_cluster.items()],
+        )
+
+
+def save_bbox_clusterer_state(
+    conn: sqlite3.Connection,
+    *,
+    n_boxes_at_fit: int,
+    n_clusters: int,
+    n_noise: int,
+    min_cluster_size: int,
+    min_samples: int,
+    min_score: float,
+    min_area: float,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO bbox_clusterer_state (
+          id, n_boxes_at_fit, n_clusters, n_noise,
+          min_cluster_size, min_samples, min_score, min_area, fitted_at
+        )
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(id) DO UPDATE SET
+          n_boxes_at_fit   = excluded.n_boxes_at_fit,
+          n_clusters       = excluded.n_clusters,
+          n_noise          = excluded.n_noise,
+          min_cluster_size = excluded.min_cluster_size,
+          min_samples      = excluded.min_samples,
+          min_score        = excluded.min_score,
+          min_area         = excluded.min_area,
+          fitted_at        = datetime('now')
+        """,
+        (
+            int(n_boxes_at_fit),
+            int(n_clusters),
+            int(n_noise),
+            int(min_cluster_size),
+            int(min_samples),
+            float(min_score),
+            float(min_area),
+        ),
+    )
+
+
+def get_bbox_clusterer_state(conn: sqlite3.Connection) -> dict | None:
+    row = conn.execute(
+        """
+        SELECT n_boxes_at_fit, n_clusters, n_noise,
+               min_cluster_size, min_samples, min_score, min_area, fitted_at
+        FROM bbox_clusterer_state
+        WHERE id = 1
+        """
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def invalidate_bbox_cluster_names(conn: sqlite3.Connection) -> None:
+    conn.execute("DELETE FROM bbox_cluster_names")
+
+
+def compute_bbox_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
+    """Aggregate top-1 species/genus predictions per unified cluster
+    (bbox_predictions for box members + predictions for fallback photo members)
+    using the same 4-rule naming heuristic as compute_cluster_names()."""
+    rows = conn.execute(
+        """
+        SELECT bc.cluster_id AS cid, d.asset_id,
+               p.species, p.common_name, p.genus
+        FROM bbox_clusters bc
+        JOIN detections d ON d.id = bc.detection_id
+        LEFT JOIN bbox_predictions p
+          ON p.detection_id = bc.detection_id
+         AND p.rank = 'species' AND p.position = 0
+        UNION ALL
+        SELECT bp.cluster_id AS cid, bp.asset_id,
+               p.species, p.common_name, p.genus
+        FROM bbox_cluster_photos bp
+        LEFT JOIN predictions p
+          ON p.asset_id = bp.asset_id
+         AND p.rank = 'species' AND p.position = 0
+        """
+    ).fetchall()
+
+    by_cluster: dict[int, list] = {}
+    for r in rows:
+        by_cluster.setdefault(int(r["cid"]), []).append(r)
+
+    out: dict[int, dict] = {}
+    for cid, items in by_cluster.items():
+        total = len(items)
+        if total == 0:
+            continue
+        assets_set: set[str] = set()
+        species: dict[str, dict] = {}
+        genus: dict[str, int] = {}
+        pred_total = 0
+        for r in items:
+            assets_set.add(str(r["asset_id"]))
+            sp = r["species"]
+            ge = r["genus"]
+            if sp or ge:
+                pred_total += 1
+            if sp:
+                entry = species.setdefault(
+                    sp, {"species": sp, "common_name": r["common_name"] or "", "count": 0}
+                )
+                entry["count"] += 1
+            if ge:
+                genus[ge] = genus.get(ge, 0) + 1
+
+        denom = pred_total or total
+        sp_sorted = sorted(species.values(), key=lambda d: -d["count"])
+        ge_sorted = sorted(genus.items(), key=lambda kv: -kv[1])
+
+        g1, g1_n = ge_sorted[0] if ge_sorted else ("", 0)
+        g2, g2_n = ge_sorted[1] if len(ge_sorted) >= 2 else ("", 0)
+        g3, g3_n = ge_sorted[2] if len(ge_sorted) >= 3 else ("", 0)
+
+        g1_share = g1_n / denom
+        g2_share = g2_n / denom
+        g3_share = g3_n / denom
+
+        top_sp = sp_sorted[0] if sp_sorted else None
+        sp_share = (top_sp["count"] / denom) if top_sp else 0.0
+
+        if g2_share >= 0.25 and g3_share >= 0.20:
+            name = f"{g1}, {g2} & {g3}"
+        elif g2_share >= 0.25:
+            name = f"{g1} & {g2}"
+        elif g1_share < 0.50:
+            name = "Mixed"
+        elif sp_share >= 0.65 and top_sp:
+            cn = top_sp["common_name"]
+            name = cn if cn else top_sp["species"]
+        else:
+            name = g1 or f"Box cluster #{cid}"
+
+        out[cid] = {
+            "name": name,
+            "n_boxes": total,
+            "n_assets": len(assets_set),
+            "top_species": sp_sorted[:3],
+            "top_genus": [{"genus": g, "count": c} for g, c in ge_sorted[:3]],
+        }
+    return out
+
+
+def save_bbox_cluster_names(conn: sqlite3.Connection, names: dict[int, dict]) -> None:
+    import json as _json
+
+    conn.execute("DELETE FROM bbox_cluster_names")
+    if names:
+        conn.executemany(
+            """
+            INSERT INTO bbox_cluster_names
+              (cluster_id, name, n_boxes, n_assets, top_species_json, top_genus_json, computed_at)
+            VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+            """,
+            [
+                (
+                    int(cid),
+                    str(info["name"]),
+                    int(info["n_boxes"]),
+                    int(info["n_assets"]),
+                    _json.dumps(info.get("top_species") or []),
+                    _json.dumps(info.get("top_genus") or []),
+                )
+                for cid, info in names.items()
+            ],
+        )
+
+
+def ensure_bbox_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
+    import json as _json
+
+    rows = conn.execute(
+        """
+        SELECT cluster_id, name, n_boxes, n_assets, top_species_json, top_genus_json
+        FROM bbox_cluster_names
+        """
+    ).fetchall()
+    if rows:
+        out: dict[int, dict] = {}
+        for r in rows:
+            out[int(r["cluster_id"])] = {
+                "name": r["name"],
+                "n_boxes": int(r["n_boxes"]),
+                "n_assets": int(r["n_assets"]),
+                "top_species": _json.loads(r["top_species_json"] or "[]"),
+                "top_genus": _json.loads(r["top_genus_json"] or "[]"),
+            }
+        return out
+    names = compute_bbox_cluster_names(conn)
+    if names:
+        save_bbox_cluster_names(conn, names)
+    return names
+
+
+def _unclustered_params() -> dict:
+    """Eligibility thresholds for the virtual "Unclustered" bucket — the
+    same ones the refit applies, so the bucket is exactly the eligible
+    photos the refit left out. Lazy import: clusters imports storage."""
+    import clusters
+
+    return {
+        "min_score": clusters.BBOX_CLUSTER_MIN_SCORE,
+        "min_area": clusters.BBOX_CLUSTER_MIN_AREA,
+        "plantae_min": clusters.CLUSTER_PLANTAE_MIN,
+    }
+
+
+def bbox_cluster_summary(conn: sqlite3.Connection) -> dict:
+    """Summary list of all unified box+photo clusters + corpus-level stats.
+
+    Picks the cleanest representative thumbnail per cluster (preferring a
+    high-confidence non-person box crop; falling back to a whole-photo
+    thumbnail for photo-only clusters). Also tracks `n_new_assets` — how
+    many distinct photos had `assets.cluster_id IS NULL`.
+    """
+    box_rows = conn.execute(
+        """
+        SELECT bc.cluster_id, bc.detection_id, d.asset_id, d.label,
+               d.score AS det_score, (d.w * d.h) AS area,
+               a.captured_at, a.cluster_id AS whole_cluster_id,
+               COALESCE(a.has_person, 0) AS has_person,
+               COALESCE(p.score, 0.0) AS sp_score
+        FROM bbox_clusters bc
+        JOIN detections d ON d.id = bc.detection_id
+        JOIN assets a ON a.asset_id = d.asset_id
+        LEFT JOIN bbox_predictions p
+          ON p.detection_id = bc.detection_id
+         AND p.rank = 'species' AND p.position = 0
+        """
+    ).fetchall()
+
+    photo_rows = conn.execute(
+        """
+        SELECT bp.cluster_id, bp.asset_id,
+               a.captured_at, a.cluster_id AS whole_cluster_id,
+               COALESCE(a.has_person, 0) AS has_person,
+               COALESCE(p.score, 0.0) AS sp_score
+        FROM bbox_cluster_photos bp
+        JOIN assets a ON a.asset_id = bp.asset_id
+        LEFT JOIN predictions p
+          ON p.asset_id = bp.asset_id
+         AND p.rank = 'species' AND p.position = 0
+        """
+    ).fetchall()
+
+    names = ensure_bbox_cluster_names(conn)
+    state = get_bbox_clusterer_state(conn)
+
+    if not box_rows and not photo_rows:
+        return {
+            "clusters": [],
+            "stats": {
+                "n_clusters": 0,
+                "n_boxes": 0,
+                "n_photo_fallbacks": 0,
+                "n_assets": 0,
+                "n_new_assets": 0,
+                "n_noise": state["n_noise"] if state else 0,
+                "n_boxes_at_fit": state["n_boxes_at_fit"] if state else 0,
+                "fitted_at": state["fitted_at"] if state else None,
+            },
+        }
+
+    clusters_agg: dict[int, dict] = {}
+    all_assets: set[str] = set()
+    all_new_assets: set[str] = set()
+
+    def _ensure_agg(cid: int) -> dict:
+        agg = clusters_agg.get(cid)
+        if agg is None:
+            agg = {
+                "cluster_id": cid,
+                "n_boxes": 0,
+                "n_photo_fallbacks": 0,
+                "assets": set(),
+                "new_assets": set(),
+                "latest_captured_at": None,
+                "best_key": None,
+                "sample_detection_id": None,
+                "sample_asset_id": "",
+                "sample_thumb_url": "",
+                "sample_label": "",
+            }
+            clusters_agg[cid] = agg
+        return agg
+
+    for r in box_rows:
+        cid = int(r["cluster_id"])
+        aid = str(r["asset_id"])
+        did = int(r["detection_id"])
+        is_new = r["whole_cluster_id"] is None
+        all_assets.add(aid)
+        if is_new:
+            all_new_assets.add(aid)
+
+        agg = _ensure_agg(cid)
+        agg["n_boxes"] += 1
+        agg["assets"].add(aid)
+        if is_new:
+            agg["new_assets"].add(aid)
+        agg["latest_captured_at"] = _max_iso(agg["latest_captured_at"], r["captured_at"])
+
+        quality = float(r["sp_score"] or 0.0) * float(r["det_score"] or 0.0)
+        area_bonus = min(float(r["area"] or 0.0), 0.5)
+        # Prefer box crops (is_box=1) over fallback photos for cluster cover.
+        cand_key = (1, 0 if r["has_person"] else 1, round(quality, 4), round(area_bonus, 4), -did)
+        if agg["best_key"] is None or cand_key > agg["best_key"]:
+            agg["best_key"] = cand_key
+            agg["sample_detection_id"] = did
+            agg["sample_asset_id"] = aid
+            agg["sample_thumb_url"] = f"/api/bbox/{did}/thumb"
+            agg["sample_label"] = r["label"]
+
+    for r in photo_rows:
+        cid = int(r["cluster_id"])
+        aid = str(r["asset_id"])
+        is_new = r["whole_cluster_id"] is None
+        all_assets.add(aid)
+        if is_new:
+            all_new_assets.add(aid)
+
+        agg = _ensure_agg(cid)
+        agg["n_photo_fallbacks"] += 1
+        agg["assets"].add(aid)
+        if is_new:
+            agg["new_assets"].add(aid)
+        agg["latest_captured_at"] = _max_iso(agg["latest_captured_at"], r["captured_at"])
+
+        quality = float(r["sp_score"] or 0.0)
+        cand_key = (0, 0 if r["has_person"] else 1, round(quality, 4), 0.0, 0)
+        if agg["best_key"] is None or cand_key > agg["best_key"]:
+            agg["best_key"] = cand_key
+            agg["sample_detection_id"] = None
+            agg["sample_asset_id"] = aid
+            agg["sample_thumb_url"] = f"/thumb/{aid}?size=thumbnail"
+            agg["sample_label"] = "photo"
+
+    out_clusters: list[dict] = []
+    for cid, agg in clusters_agg.items():
+        info = names.get(cid, {})
+        out_clusters.append(
+            {
+                "cluster_id": cid,
+                "name": info.get("name") or f"Cluster #{cid}",
+                "n_boxes": agg["n_boxes"],
+                "n_photo_fallbacks": agg["n_photo_fallbacks"],
+                "n_assets": len(agg["assets"]),
+                "n_new_assets": len(agg["new_assets"]),
+                "latest_captured_at": agg["latest_captured_at"],
+                "sample_detection_id": agg["sample_detection_id"],
+                "sample_asset_id": agg["sample_asset_id"],
+                "sample_thumb_url": agg["sample_thumb_url"],
+                "sample_label": agg["sample_label"],
+                "top_species": (info.get("top_species") or [])[:2],
+                "top_genus": (info.get("top_genus") or [])[:2],
+            }
+        )
+
+    out_clusters.sort(key=lambda c: (-c["n_assets"], -c["n_boxes"], c["cluster_id"]))
+
+    # Compute unclustered eligible plant photos count + sample so the UI can
+    # surface a 1-click "Unclustered" bucket (cluster_id = -1).
+    uncl_row = conn.execute(
+        """
+        WITH clustered AS (
+          SELECT DISTINCT d.asset_id FROM bbox_clusters bc JOIN detections d ON d.id = bc.detection_id
+          UNION
+          SELECT asset_id FROM bbox_cluster_photos
+        ),
+        uncl_boxes AS (
+          SELECT d.id AS detection_id, d.asset_id, d.score AS det_score,
+                 COALESCE(p.score, 0.0) AS sp_score, a.captured_at
+          FROM bbox_embeddings b
+          JOIN detections d ON d.id = b.detection_id
+          JOIN assets a ON a.asset_id = d.asset_id
+          JOIN bbox_predictions p ON p.detection_id = b.detection_id AND p.rank='species' AND p.position=0
+          WHERE p.kingdom='Plantae' AND d.score >= :min_score AND (d.w * d.h) >= :min_area
+            AND d.asset_id NOT IN (SELECT asset_id FROM clustered)
+        ),
+        uncl_whole AS (
+          SELECT t.asset_id, a.captured_at
+          FROM taxon_scores t
+          JOIN assets a ON a.asset_id = t.asset_id
+          LEFT JOIN predictions p ON p.asset_id = t.asset_id AND p.rank='species' AND p.position=0
+          WHERE t.rank='kingdom' AND t.taxon_name='Plantae' AND t.score >= :plantae_min
+            AND (p.kingdom IS NULL OR p.kingdom = '' OR p.kingdom = 'Plantae')
+            AND t.asset_id NOT IN (SELECT asset_id FROM clustered)
+        ),
+        uncl_all AS (
+          SELECT asset_id, captured_at FROM uncl_boxes
+          UNION
+          SELECT asset_id, captured_at FROM uncl_whole
+        )
+        SELECT COUNT(DISTINCT asset_id) AS n_assets,
+               MAX(captured_at) AS latest_captured_at,
+               (SELECT detection_id FROM uncl_boxes ORDER BY sp_score * det_score DESC LIMIT 1) AS sample_did,
+               (SELECT asset_id FROM uncl_all ORDER BY captured_at DESC LIMIT 1) AS sample_aid
+        FROM uncl_all
+        """,
+        _unclustered_params(),
+    ).fetchone()
+    n_uncl = int(uncl_row["n_assets"]) if uncl_row and uncl_row["n_assets"] else 0
+    unclustered = None
+    if n_uncl > 0:
+        sdid = uncl_row["sample_did"]
+        said = uncl_row["sample_aid"]
+        unclustered = {
+            "cluster_id": -1,
+            "name": "Unclustered",
+            "n_boxes": 0,
+            "n_photo_fallbacks": 0,
+            "n_assets": n_uncl,
+            "n_new_assets": 0,
+            "latest_captured_at": uncl_row["latest_captured_at"],
+            "sample_detection_id": int(sdid) if sdid is not None else None,
+            "sample_asset_id": str(said) if said else "",
+            "sample_thumb_url": (
+                f"/api/bbox/{int(sdid)}/thumb"
+                if sdid is not None
+                else (f"/thumb/{said}?size=thumbnail" if said else "")
+            ),
+            "sample_label": "unclustered",
+            "top_species": [],
+            "top_genus": [],
+        }
+
+    return {
+        "clusters": out_clusters,
+        "unclustered": unclustered,
+        "stats": {
+            "n_clusters": len(out_clusters),
+            "n_boxes": len(box_rows),
+            "n_photo_fallbacks": len(photo_rows),
+            "n_assets": len(all_assets),
+            "n_unclustered_assets": n_uncl,
+            "n_new_assets": len(all_new_assets),
+            "n_noise": state["n_noise"] if state else 0,
+            "n_boxes_at_fit": state["n_boxes_at_fit"] if state else (len(box_rows) + len(photo_rows)),
+            "fitted_at": state["fitted_at"] if state else None,
+        },
+    }
+
+
+def get_bbox_cluster_items(
+    conn: sqlite3.Connection,
+    cluster_id: int | list[int],
+    *,
+    page: int = 0,
+    page_size: int = 60,
+    sort: str = "score",
+    dedupe_assets: bool = True,
+) -> dict:
+    """Paginated items belonging to one unified box+photo cluster (or a list
+    of cluster_ids for a super-group).
+
+    Box members from the same photo are merged into a single photo entry
+    carrying `boxes: [...]` (`kind='box'`). Whole-photo fallback members
+    appear as clean full-photo entries (`kind='photo'`, `boxes=[]`).
+    """
+    cids = [int(c) for c in cluster_id] if isinstance(cluster_id, (list, tuple, set)) else [int(cluster_id)]
+    if not cids:
+        return {
+            "cluster": {
+                "cluster_id": -1,
+                "name": "",
+                "n_boxes": 0,
+                "n_photo_fallbacks": 0,
+                "n_assets": 0,
+                "n_new_assets": 0,
+                "top_species": [],
+                "top_genus": [],
+            },
+            "items": [],
+            "pagination": {"page": 0, "page_size": page_size, "total": 0, "total_pages": 0},
+        }
+    placeholders = ",".join("?" for _ in cids)
+    if cids == [-1]:
+        # Virtual "Unclustered" bucket: eligible plant photos where NONE of
+        # their boxes (nor whole-photo fallback) landed in any cluster.
+        rows = conn.execute(
+            """
+            WITH clustered AS (
+              SELECT DISTINCT d.asset_id FROM bbox_clusters bc JOIN detections d ON d.id = bc.detection_id
+              UNION
+              SELECT asset_id FROM bbox_cluster_photos
+            )
+            SELECT b.detection_id, d.asset_id, d.label, d.score AS yolo_score,
+                   d.x, d.y, d.w, d.h,
+                   a.original_file_name, a.captured_at, a.cluster_id AS whole_cluster_id,
+                   a.has_person,
+                   p.species, p.common_name, p.score AS sp_score,
+                   p.kingdom, p.family, p.genus
+            FROM bbox_embeddings b
+            JOIN detections d ON d.id = b.detection_id
+            JOIN assets a ON a.asset_id = d.asset_id
+            JOIN bbox_predictions p
+              ON p.detection_id = b.detection_id
+             AND p.rank = 'species' AND p.position = 0
+            WHERE p.kingdom = 'Plantae'
+              AND d.score >= :min_score AND (d.w * d.h) >= :min_area
+              AND d.asset_id NOT IN (SELECT asset_id FROM clustered)
+            """,
+            _unclustered_params(),
+        ).fetchall()
+        box_aids_uncl = {str(r["asset_id"]) for r in rows}
+        photo_rows_raw = conn.execute(
+            """
+            WITH clustered AS (
+              SELECT DISTINCT d.asset_id FROM bbox_clusters bc JOIN detections d ON d.id = bc.detection_id
+              UNION
+              SELECT asset_id FROM bbox_cluster_photos
+            )
+            SELECT t.asset_id,
+                   a.original_file_name, a.captured_at, a.cluster_id AS whole_cluster_id,
+                   a.has_person,
+                   p.species, p.common_name, p.score AS sp_score,
+                   p.kingdom, p.family, p.genus
+            FROM taxon_scores t
+            JOIN assets a ON a.asset_id = t.asset_id
+            LEFT JOIN predictions p
+              ON p.asset_id = t.asset_id
+             AND p.rank = 'species' AND p.position = 0
+            WHERE t.rank = 'kingdom' AND t.taxon_name = 'Plantae' AND t.score >= :plantae_min
+              AND (p.kingdom IS NULL OR p.kingdom = '' OR p.kingdom = 'Plantae')
+              AND t.asset_id NOT IN (SELECT asset_id FROM clustered)
+            """,
+            _unclustered_params(),
+        ).fetchall()
+        photo_rows = [r for r in photo_rows_raw if str(r["asset_id"]) not in box_aids_uncl]
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT bc.detection_id, d.asset_id, d.label, d.score AS yolo_score,
+                   d.x, d.y, d.w, d.h,
+                   a.original_file_name, a.captured_at, a.cluster_id AS whole_cluster_id,
+                   a.has_person,
+                   p.species, p.common_name, p.score AS sp_score,
+                   p.kingdom, p.family, p.genus
+            FROM bbox_clusters bc
+            JOIN detections d ON d.id = bc.detection_id
+            JOIN assets a ON a.asset_id = d.asset_id
+            LEFT JOIN bbox_predictions p
+              ON p.detection_id = bc.detection_id
+             AND p.rank = 'species' AND p.position = 0
+            WHERE bc.cluster_id IN ({placeholders})
+            """,
+            cids,
+        ).fetchall()
+
+        photo_rows = conn.execute(
+            f"""
+            SELECT bp.asset_id,
+                   a.original_file_name, a.captured_at, a.cluster_id AS whole_cluster_id,
+                   a.has_person,
+                   p.species, p.common_name, p.score AS sp_score,
+                   p.kingdom, p.family, p.genus
+            FROM bbox_cluster_photos bp
+            JOIN assets a ON a.asset_id = bp.asset_id
+            LEFT JOIN predictions p
+              ON p.asset_id = bp.asset_id
+             AND p.rank = 'species' AND p.position = 0
+            WHERE bp.cluster_id IN ({placeholders})
+            """,
+            cids,
+        ).fetchall()
+
+    raw_boxes: list[dict] = []
+    assets_seen: set[str] = set()
+    new_assets_seen: set[str] = set()
+    for r in rows:
+        aid = str(r["asset_id"])
+        assets_seen.add(aid)
+        if r["whole_cluster_id"] is None:
+            new_assets_seen.add(aid)
+        did = int(r["detection_id"])
+        area = float(r["w"]) * float(r["h"])
+        raw_boxes.append(
+            {
+                "kind": "box",
+                "detection_id": did,
+                "asset_id": aid,
+                "original_file_name": r["original_file_name"],
+                "captured_at": r["captured_at"],
+                "label": r["label"],
+                "yolo_score": round(float(r["yolo_score"]), 4),
+                "x": float(r["x"]),
+                "y": float(r["y"]),
+                "w": float(r["w"]),
+                "h": float(r["h"]),
+                "area": round(area, 4),
+                "thumb_url": f"/api/bbox/{did}/thumb",
+                "whole_cluster_id": r["whole_cluster_id"],
+                "is_new_asset": r["whole_cluster_id"] is None,
+                "has_person": None if r["has_person"] is None else bool(r["has_person"]),
+                "species": r["species"] or "",
+                "common_name": r["common_name"] or "",
+                "species_score": round(float(r["sp_score"]), 4) if r["sp_score"] is not None else None,
+                "kingdom": r["kingdom"] or "",
+                "family": r["family"] or "",
+                "genus": r["genus"] or "",
+            }
+        )
+
+    def _box_brief(b: dict) -> dict:
+        return {
+            "detection_id": b["detection_id"],
+            "label": b["label"],
+            "yolo_score": b["yolo_score"],
+            "x": b["x"],
+            "y": b["y"],
+            "w": b["w"],
+            "h": b["h"],
+            "area": b["area"],
+            "thumb_url": b["thumb_url"],
+            "species": b["species"],
+            "common_name": b["common_name"],
+            "species_score": b["species_score"],
+        }
+
+    if dedupe_assets:
+        by_asset: dict[str, list[dict]] = {}
+        for b in raw_boxes:
+            by_asset.setdefault(b["asset_id"], []).append(b)
+        items: list[dict] = []
+        for aid, blist in by_asset.items():
+            blist.sort(key=lambda x: (-(x["species_score"] or 0.0), -x["yolo_score"], -x["area"]))
+            best = dict(blist[0])
+            best["n_boxes"] = len(blist)
+            best["boxes"] = [_box_brief(b) for b in blist]
+            items.append(best)
+    else:
+        items = [dict(b, n_boxes=1, boxes=[_box_brief(b)]) for b in raw_boxes]
+
+    for r in photo_rows:
+        aid = str(r["asset_id"])
+        assets_seen.add(aid)
+        if r["whole_cluster_id"] is None:
+            new_assets_seen.add(aid)
+        items.append(
+            {
+                "kind": "photo",
+                "detection_id": None,
+                "asset_id": aid,
+                "original_file_name": r["original_file_name"],
+                "captured_at": r["captured_at"],
+                "label": "photo",
+                "yolo_score": 0.0,
+                "x": 0.0,
+                "y": 0.0,
+                "w": 1.0,
+                "h": 1.0,
+                "area": 1.0,
+                "thumb_url": f"/thumb/{aid}?size=thumbnail",
+                "whole_cluster_id": r["whole_cluster_id"],
+                "is_new_asset": r["whole_cluster_id"] is None,
+                "has_person": None if r["has_person"] is None else bool(r["has_person"]),
+                "species": r["species"] or "",
+                "common_name": r["common_name"] or "",
+                "species_score": round(float(r["sp_score"]), 4) if r["sp_score"] is not None else None,
+                "kingdom": r["kingdom"] or "",
+                "family": r["family"] or "",
+                "genus": r["genus"] or "",
+                "n_boxes": 0,
+                "boxes": [],
+            }
+        )
+
+    if sort == "time":
+        with_time = sorted([x for x in items if x["captured_at"]], key=lambda x: x["captured_at"], reverse=True)
+        without_time = [x for x in items if not x["captured_at"]]
+        items = with_time + without_time
+    elif sort == "area":
+        items.sort(key=lambda x: (-x["area"], -(x["species_score"] or 0.0)))
+    elif sort == "yolo":
+        items.sort(key=lambda x: (-x["yolo_score"], -(x["species_score"] or 0.0)))
+    else:  # 'score' default
+        items.sort(key=lambda x: (-(x["species_score"] or 0.0), -x["yolo_score"]))
+
+    total = len(items)
+    ps = max(1, min(int(page_size), 200))
+    pg = max(0, int(page))
+    total_pages = max(1, (total + ps - 1) // ps) if total else 0
+    start = pg * ps
+    page_items = items[start : start + ps]
+
+    names = ensure_bbox_cluster_names(conn)
+    primary_cid = cids[0]
+    if cids == [-1]:
+        cluster_name = "Unclustered"
+        info = {}
+    else:
+        info = names.get(primary_cid, {}) if len(cids) == 1 else {}
+        cluster_name = info.get("name") or f"Cluster #{primary_cid}"
+
+    return {
+        "cluster": {
+            "cluster_id": primary_cid,
+            "name": cluster_name,
+            "n_boxes": len(rows),
+            "n_photo_fallbacks": len(photo_rows),
+            "n_assets": len(assets_seen),
+            "n_new_assets": len(new_assets_seen),
+            "top_species": (info.get("top_species") or [])[:3],
+            "top_genus": (info.get("top_genus") or [])[:3],
+        },
+        "items": page_items,
+        "pagination": {
+            "page": pg,
+            "page_size": ps,
+            "total": total,
+            "total_pages": total_pages,
+        },
+    }
