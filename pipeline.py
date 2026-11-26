@@ -218,16 +218,25 @@ def _resolve_classifier() -> "object | None":
 
     ENGINE=teacher (default) → TreeOfLifeClassifier (BioCLIP-2, ~6 GB).
     ENGINE=mobile-* → MobileEngine (BioCLIP-Mobile ONNX package + label
-    table, ~1.2 GB; see mobile_engine.py). Both satisfy the same
-    duck-type surface, so every stage below is engine-agnostic."""
+    table, ~1.2 GB; see mobile_engine.py). ENGINE=coreml / auto → on
+    macOS with the Core ML package, CoreMLEngine (the teacher with its
+    image tower on the ANE/GPU; see coreml_engine.py), else the teacher.
+    All satisfy the same duck-type surface, so every stage below is
+    engine-agnostic."""
     global _clf_cache
     if _clf_cache is not None:
         return _clf_cache
     with _clf_lock:
         if _clf_cache is None:
+            from coreml_engine import select_engine
             from mobile_engine import resolve_engine_name
 
-            if resolve_engine_name().startswith("mobile"):
+            if select_engine(resolve_engine_name()) == "coreml":
+                engine = _load_coreml_engine()
+                if engine is not None:
+                    _clf_cache = engine
+                    return _clf_cache
+            elif resolve_engine_name().startswith("mobile"):
                 from mobile_engine import MobileEngine
 
                 _t0 = time.monotonic()
@@ -271,6 +280,30 @@ def _resolve_classifier() -> "object | None":
             )
     return _clf_cache
 
+
+def _load_coreml_engine() -> "object | None":
+    """CoreMLEngine if it loads and passes its golden gate, else None
+    (caller falls back to the torch teacher). Never raises."""
+    try:
+        from coreml_engine import CoreMLEngine
+
+        _t0 = time.monotonic()
+        engine = CoreMLEngine()
+        ok, mean, low = engine.self_check()
+    except Exception as e:  # noqa: BLE001 — any load failure → teacher
+        _log.info("[model] Core ML engine failed to load (%s) — using BioCLIP-2 torch", e)
+        return None
+    if not ok:
+        _log.info(
+            "[model] Core ML golden gate FAILED (cos mean %.6f / min %.6f) "
+            "— using BioCLIP-2 torch", mean, low,
+        )
+        return None
+    _log.info(
+        "[model] ENGINE=coreml  version=%s  golden cos %.6f/%.6f  (ready in %.1fs)",
+        engine.version_key(), mean, low, time.monotonic() - _t0,
+    )
+    return engine
 
 
 # Shared pipeline state. Thread-safe: the pipeline thread writes under
