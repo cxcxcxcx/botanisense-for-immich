@@ -673,13 +673,11 @@ def _chunk_log(
         eta_seconds=remaining,
     )
 BBOX_BIOCLIP_MIN = 0.15
-# The Linux pipeline can re-classify each crop, but it only writes
-# bbox_predictions — it does NOT write the bbox_embeddings used by the
-# Similar panel. On the teacher model that pass is also the heaviest
-# stage in the run (tens of thousands of crops, ~11 GB peak); the Mac
-# CoreML worker computes both predictions and embeddings far faster.
-# Set BBOX_BIOCLIP_ENABLED=0 on teacher instances that use the Mac box
-# backfill, so a normal run cannot OOM here.
+# The crop pass encodes each plant box once and writes both
+# bbox_predictions and bbox_embeddings (box clustering + Similar). On the
+# CPU teacher it is the longest stage of a first run (tens of thousands
+# of crops); BBOX_BIOCLIP_ENABLED=0 skips it, e.g. on an instance whose
+# boxes are filled by scripts/bbox_backfill_mac.py instead.
 BBOX_BIOCLIP_ENABLED = os.environ.get(
     "BBOX_BIOCLIP_ENABLED", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
@@ -811,6 +809,21 @@ PLANT_BATCH_MAJORITY = 0.30      # 30% of the batch must be candidates to contin
 PLANT_MIN_BATCH_FOR_BOUNDARY = 24
 
 
+BBOX_TEACHER_MODEL_VERSION = "teacher:bioclip-2"
+
+
+def _embedding_model_version(clf) -> str:
+    """bbox_embeddings.model_version for vectors from `clf`. The PyTorch
+    teacher and the Core ML export share one space (cos ~.9997), so both
+    use the version scripts/bbox_backfill_mac.py writes; the mobile
+    student is a different space and is keyed by its package."""
+    from mobile_engine import MobileEngine  # light: numpy + PIL only
+
+    if isinstance(clf, MobileEngine):
+        return f"mobile:{clf.version_key()}"
+    return BBOX_TEACHER_MODEL_VERSION
+
+
 def _classify_features(
     clf,
     feats,
@@ -845,6 +858,13 @@ def _classify_features(
 
 
 _PIL_DRAFT_SIZE = 448  # ~2x the model's 224px input — decode-cheap
+# Box crops are cut from the preview BEFORE the 224px squash, so they
+# need the full preview: at the 448 draft a median plant box came out
+# ~96px (64 real boxes, scripts/verify_bbox_encode_once.py: cos .83 vs
+# the full-preview Core ML vectors, species top-1 20% agreement). Immich
+# previews are 1440px on the SHORT side (1920 for 4:3, 2560 for 16:9);
+# the cap only guards against an original served in their place.
+_BBOX_DECODE_SIZE = 2560
 
 
 def _yolo_decode_size() -> int:
@@ -2884,12 +2904,16 @@ def run_pipeline(
                     # Plant crops go through BioCLIP as before.
                     if d["label"] in PERSON_LABELS or d["label"] == HAND_LABEL:
                         continue
+                    # Cached = predictions AND an embedding. Boxes that
+                    # only have predictions (written before this stage
+                    # stored embeddings) are re-encoded once so box
+                    # clustering / Similar can see them.
                     if storage.bbox_predictions_have_detection(
                         conn,
                         detection_id=d["id"],
                         rank=rank_name,
                         need=BBOX_BIOCLIP_TOP_K,
-                    ):
+                    ) and storage.bbox_embedding_exists(conn, detection_id=d["id"]):
                         continue
                     all_bbox_targets.append((asset.id, d["id"], d))
 
@@ -2908,6 +2932,7 @@ def run_pipeline(
             if all_bbox_targets:
                 if clf is None:
                     clf = classifier if classifier is not None else _resolve_classifier()
+                bbox_model_version = _embedding_model_version(clf)
                 _log.info(
                     f"[bbox-bioclip] starting  {len(all_bbox_targets)} detections, "
                     f"{bbox_total_chunks} chunks of {batch_size}"
@@ -2928,8 +2953,7 @@ def run_pipeline(
                     # One thumbnail open per asset; we crop multiple
                     # bboxes from the same image in the inner loop.
                     crops: list[Image.Image] = []
-                    crop_paths: list[str] = []
-                    crop_meta: list[tuple[int, Path]] = []  # (det_id, src_path)
+                    crop_meta: list[tuple[int, str]] = []  # (det_id, src asset)
                     by_src: dict[str, Image.Image] = {}
                     try:
                         for src, det_id, d in chunk:
@@ -2939,7 +2963,9 @@ def run_pipeline(
                                         f"/api/assets/{src}/thumbnail"
                                         f"?size={THUMBNAIL_SIZE}"
                                     )
-                                    by_src[src] = _decode_preview(blob)
+                                    by_src[src] = _decode_preview(
+                                        blob, max_size=_BBOX_DECODE_SIZE
+                                    )
                                 except Exception as e:
                                     # Skip this source image's crops; the
                                     # detections stay uncached so the
@@ -2957,11 +2983,7 @@ def run_pipeline(
                             y1 = min(H, int((d["y"] + d["h"]) * H))
                             if x1 <= x0 or y1 <= y0:
                                 continue
-                            crop = full.crop((x0, y0, x1, y1))
-                            crop_path = tmp / f"bbox_{det_id}.jpg"
-                            crop.save(crop_path, format="JPEG", quality=90)
-                            crops.append(crop)
-                            crop_paths.append(str(crop_path))
+                            crops.append(full.crop((x0, y0, x1, y1)))
                             crop_meta.append((det_id, src))
                     finally:
                         for im in by_src.values():
@@ -2971,35 +2993,34 @@ def run_pipeline(
                         i = j
                         continue
 
-                    # We don't need the embeddings here — clf.predict
-                    # below recomputes them internally. Just classify.
-                    raw = clf.predict(
-                        images=crop_paths, rank=rank_enum, k=BBOX_BIOCLIP_TOP_K
+                    # Encode once: persist the crop embedding (box
+                    # clustering + Similar) and classify from the same
+                    # features — never clf.predict(), which re-encodes.
+                    try:
+                        feats = clf.create_image_features(crops, normalize=True)
+                    finally:
+                        n_crops = len(crops)
+                        for im in crops:
+                            _close_image(im)
+                    keys = [str(det_id) for det_id, _src in crop_meta]
+                    raw = _classify_features(
+                        clf, feats, keys, rank_enum=rank_enum, k=BBOX_BIOCLIP_TOP_K
                     )
-                    preds_by_file = _group_predictions(raw, BBOX_BIOCLIP_TOP_K)
-
-                    for (det_id, _src), crop_path in zip(crop_meta, crop_paths):
-                        rows = preds_by_file.get(str(crop_path), [])
-                        if not rows:
-                            rows = _rows_for_image(preds_by_file, str(crop_path))
+                    preds_by_key = _group_predictions(raw, BBOX_BIOCLIP_TOP_K)
+                    feats_np = feats.detach().cpu().numpy().astype("<f4")
+                    for e, (det_id, _src) in enumerate(crop_meta):
                         storage.replace_bbox_predictions(
                             conn,
                             detection_id=det_id,
                             rank=rank_name,
-                            rows=rows,
+                            rows=preds_by_key.get(keys[e], []),
                         )
-
-                    n_crops = len(crops)
-                    for im in crops:
-                        _close_image(im)
-                    # The JPEGs are only needed as clf.predict() inputs.
-                    # Unlink per-chunk so the scratch dir holds one batch
-                    # at a time instead of every crop for the whole run.
-                    for cp in crop_paths:
-                        try:
-                            os.unlink(cp)
-                        except OSError:
-                            pass
+                        storage.upsert_bbox_embedding(
+                            conn,
+                            detection_id=det_id,
+                            model_version=bbox_model_version,
+                            vector=feats_np[e],
+                        )
                     _chunk_log(
                         "bbox-bioclip",
                         (i // batch_size) + 1,
@@ -3009,7 +3030,7 @@ def run_pipeline(
                         items_done=j,
                     )
                     conn.commit()  # per-chunk checkpoint (see search-loop note)
-                    del crops, raw, preds_by_file
+                    del crops, feats, feats_np, raw, preds_by_key
                     gc.collect()
                     i = j
             if bbox_total_chunks:

@@ -87,18 +87,13 @@ class _FakeClassifier:
 
     Mirrors the real TreeOfLifeClassifier surface the pipeline uses:
     create_image_features + get_txt_embeddings + create_probabilities +
-    format_*_probs (the encode-once path), plus predict() for the bbox
-    stage which still classifies from file paths.
+    format_*_probs (the encode-once path). predict() re-encodes, so no
+    stage may call it — the fake fails loudly if one does.
     """
     model_str = "fake-bioclip"
     device = "cpu"
 
     def __init__(self):
-        self.predict_calls = 0
-        # Total crop paths handed to predict() across all calls —
-        # predict() is only used by the bbox stage, so this counts
-        # bbox crops BioCLIP actually classified.
-        self.predict_images = 0
         self.create_image_features_calls = 0
         # Total number of IMAGES passed through encode_image across all
         # calls — the encode-once regression test asserts this equals the
@@ -163,27 +158,13 @@ class _FakeClassifier:
         return rows[:k]
 
     def predict(self, images, *, rank, k):
-        self.predict_calls += 1
-        self.predict_images += len(images)
-        # Match the real API: returns a flat list of dicts with file_name.
-        # Plantae scores are kept above the boundary threshold
-        # (PLANT_MIN_PROB=0.90) so discover_plantae_assets accepts them.
-        out = []
-        for path in images:
-            name = Path(path).name
-            for pos in range(k):
-                out.append(
-                    {
-                        "file_name": path,
-                        "kingdom": "Plantae",
-                        "family": f"Fam-{name}-{pos}",
-                        "genus": f"Gen-{name}-{pos}",
-                        "species": f"Species-{name}-{pos}",
-                        "common_name": f"common-{pos}",
-                        "score": 0.95 - pos * 0.1,
-                    }
-                )
-        return out
+        raise AssertionError("clf.predict() re-encodes; use _classify_features")
+
+
+def _bbox_embedded(db) -> int:
+    """Crops the bbox stage encoded (one embedding row per crop)."""
+    with storage.connect(db) as conn:
+        return conn.execute("SELECT COUNT(*) FROM bbox_embeddings").fetchone()[0]
 
 
 def _fake_yolo(images, *, conf):
@@ -330,8 +311,9 @@ def test_species_stage_reuses_search_embeddings():
                     db_path=db,
                     batch_size=2,
                 )
-                assert clf.images_encoded == 8, (
-                    f"expected 8 encodes (all in search batches of 4), "
+                # + 5 plant crops in the bbox stage (one box per asset).
+                assert clf.images_encoded == 8 + 5, (
+                    f"expected 8 search encodes + 5 bbox crops, "
                     f"got {clf.images_encoded} — the species stage is "
                     f"re-encoding images it should reuse"
                 )
@@ -342,6 +324,12 @@ def test_species_stage_reuses_search_embeddings():
                         "SELECT COUNT(*) AS n FROM embeddings"
                     ).fetchone()["n"]
                     assert n_emb == 8, n_emb
+                    # The bbox stage persisted each crop's vector under
+                    # the teacher model_version.
+                    rows = conn.execute(
+                        "SELECT model_version, dim FROM bbox_embeddings"
+                    ).fetchall()
+                    assert [tuple(r) for r in rows] == [("teacher:bioclip-2", 8)] * 5
 
                 # Fully cached re-run: no image touches the vision tower.
                 clf.images_encoded = 0
@@ -357,6 +345,37 @@ def test_species_stage_reuses_search_embeddings():
                 assert clf.images_encoded == 0, (
                     f"cached re-run encoded {clf.images_encoded} images"
                 )
+        finally:
+            pipeline._clf_cache = None
+
+
+def test_bbox_stage_backfills_embedding_for_prediction_only_boxes():
+    """Boxes whose predictions predate stored crop embeddings are encoded
+    once more (to gain a bbox_embeddings row); boxes with both are cached."""
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "state.db")
+        pipeline._clf_cache = None
+        clf = _FakeClassifier()
+        kw = dict(base_url="http://fake", api_key="fake", query="q",
+                  n_samples=5, top_k=3, db_path=db, batch_size=2)
+        try:
+            with mock.patch.object(pipeline, "ImmichClient", _FakeImmichClient), \
+                 mock.patch.object(pipeline, "TreeOfLifeClassifier", lambda: clf), \
+                 mock.patch.object(pipeline.yolo, "detect", _fake_yolo), \
+                 mock.patch.object(pipeline.yolo, "get_model", lambda: None), \
+                 mock.patch.object(pipeline.yolo, "unload_model", lambda: None):
+                pipeline.run_pipeline(**kw)
+                assert _bbox_embedded(db) == 5
+                with storage.connect(db) as conn:
+                    conn.execute(
+                        "DELETE FROM bbox_embeddings WHERE detection_id IN "
+                        "(SELECT detection_id FROM bbox_embeddings LIMIT 2)"
+                    )
+                    conn.commit()
+                clf.images_encoded = 0
+                pipeline.run_pipeline(**kw)
+                assert clf.images_encoded == 2, clf.images_encoded
+                assert _bbox_embedded(db) == 5
         finally:
             pipeline._clf_cache = None
 
@@ -599,7 +618,7 @@ def test_yolo_stage_persists_person_boxes_and_has_person():
                 # person (0.8) and hand (0.6) crops all clear
                 # BBOX_BIOCLIP_MIN=0.15 but are skipped (BioCLIP is
                 # plant-focused). Pre-fix this was 15.
-                assert clf.predict_images == 5, clf.predict_images
+                assert _bbox_embedded(db) == 5
 
                 # And a cached re-run scans nothing at all — neither
                 # stage re-opens an image.
@@ -687,7 +706,7 @@ def test_yolo_stage_yunet_rescue_flips_suppressed_photo():
 
                 # bbox stage classifies only the plant crop — face is a
                 # PERSON_LABELS member and is excluded like person/hand.
-                assert clf.predict_images == 5, clf.predict_images
+                assert _bbox_embedded(db) == 5
         finally:
             pipeline._clf_cache = None
 
@@ -739,8 +758,10 @@ def test_species_classifies_assets_with_stored_embedding_only():
                     batch_size=2,
                 )
             assert out.n_new == 5, out
-            assert clf.images_encoded == 0, (
-                f"species stage encoded {clf.images_encoded} images "
+            # The only encodes allowed are the bbox stage's plant crops.
+            n_crops = _bbox_embedded(db)
+            assert clf.images_encoded == n_crops, (
+                f"species stage encoded {clf.images_encoded - n_crops} images "
                 f"despite stored embeddings"
             )
             with storage.connect(db) as conn:

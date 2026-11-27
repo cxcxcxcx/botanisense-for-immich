@@ -2528,6 +2528,32 @@ def replace_bbox_predictions(
     )
 
 
+def upsert_bbox_embedding(
+    conn: sqlite3.Connection,
+    *,
+    detection_id: int,
+    model_version: str,
+    vector: np.ndarray,
+) -> None:
+    """Store one crop's L2-normalized image embedding (same row format as
+    scripts/bbox_backfill_mac.py writes)."""
+    arr = np.asarray(vector, dtype="<f4").reshape(-1)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO bbox_embeddings
+          (detection_id, model_version, dim, vector, computed_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        """,
+        (detection_id, model_version, arr.size, arr.tobytes()),
+    )
+
+
+def bbox_embedding_exists(conn: sqlite3.Connection, *, detection_id: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM bbox_embeddings WHERE detection_id=?", (detection_id,)
+    ).fetchone() is not None
+
+
 def bbox_predictions_have_detection(
     conn: sqlite3.Connection, *, detection_id: int, rank: str, need: int
 ) -> bool:
