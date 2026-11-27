@@ -1,6 +1,6 @@
 # Mac 原生加速方案：CoreML BioCLIP-2 编码器（v0.2 候选）
 
-状态：第 0–3 步完成（2026-11-26），门 1–3 已过；第 4 步（HF 上传）、第 5 步（发版）需用户拍板。
+状态：第 0–3 步完成（2026-11-26），门 1–3 已过。第 4 步：HF 已上传（2026-11-26，`cxcxcxcx/bioclip-2-coreml` commit `19254e4b`，model card 源文件在 `release/hf-bioclip-2-coreml/`），app 内下载与 sha256/golden 自检未做。第 5 步（发版）未开始。
 
 ## 目标与边界
 
@@ -133,7 +133,7 @@ LICENSE                   # MIT
 | 1 | 补齐导出脚本（真实 crop golden、manifest），重新生成 b16，跑门 1 | 可复现的产物 + 一致性数字 | 0.5 天 |
 | 2 | `coreml_engine.py` + `ENGINE=coreml/auto` + 单元测试 | PR（Linux CI 绿） | 1 天 |
 | 3 | 在 Mac 上原生跑全流程，过门 2、3；修 MPS 上的问题 | 对比报告（放进 `docs/`） | 1 天 |
-| 4 | HF 仓库 + model card + app 内下载与自检 | HF 仓库（**等用户批准再上传**） | 0.5 天 |
+| 4 | HF 仓库 + model card + app 内下载与自检 | HF 仓库（已上传 `19254e4b`；app 内下载未做） | 0.5 天 |
 | 5 | README Mac 章节 + launchd 脚本 + CHANGELOG | v0.2 发布材料 | 0.5 天 |
 
 合计约 **4 个工作日**。步骤 0–3 在私有分支完成，不对外发布；步骤 4 起需要用户确认。
