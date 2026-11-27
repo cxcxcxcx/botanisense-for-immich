@@ -4,7 +4,7 @@ All notable changes to BotaniSense for Immich are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project does **not** follow Semantic Versioning until v1.0.
 
-## Unreleased
+## 0.2.0 — 2026-11-27
 
 ### Features
 
