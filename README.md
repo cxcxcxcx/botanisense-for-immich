@@ -240,11 +240,12 @@ shines. Below ~1 000 photos the run-once latency dominates; above
   [native install](#on-a-mac-run-natively-apple-silicon)
 - An **Immich instance** with an admin API key — see
   [Immich → Administration → Settings → API Keys][immich-keys]
-- **~7 GB free RAM** during a pipeline run (measured peak 6.7–7.6 GB in
+- **~7 GB free RAM** during a pipeline run (measured peak ~6.7 GB in
   the pipeline's child process: BioCLIP-2 weights + species label table
-  ≈ 5.6 GB, plus the detector and the per-chunk image buffers that
-  overlap with it). The web server itself stays at ~250 MB idle and
-  peaks around 0.8 GB while a cluster page loads its crops.
+  ≈ 5.6 GB, plus per-chunk image buffers and allocator overhead; the
+  detector is unloaded before BioCLIP loads). The web server itself
+  stays at ~250 MB idle and peaks around 0.8 GB while a cluster page
+  loads its crops.
 - **~10 GB free disk**: ~2.5 GB for the Docker image, ~4.3 GB for the
   BioCLIP-2 artifacts (model weights + species label table, downloaded
   on first run into `data/huggingface/`), and the SQLite state DB
@@ -377,7 +378,7 @@ status, logs) is fetched per-component, with one SSE connection
   zero-shot predictions are available.
 - **~7 GB resident during a pipeline run.** The BioCLIP-2 child
   process holds the weights + label table for the duration (measured
-  peak 6.7–7.6 GB); uvicorn itself stays at ~250 MB.
+  peak ~6.7 GB); uvicorn itself stays at ~250 MB.
 - **Tested against Immich ≥ 1.111.** Earlier versions may lack
   `/api/search/smart` and the album endpoints this app depends on.
 - **No telemetry.** The app phones home to nobody — no update checks,

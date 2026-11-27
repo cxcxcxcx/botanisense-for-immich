@@ -36,24 +36,25 @@ and the project does **not** follow Semantic Versioning until v1.0.
 
 ### Changed
 
-- **Memory peaks are lower.** Measured on a 24k-photo library, a full
-  run peaked at 7.7–8.9 GB before and 6.4–7.6 GB after: the person
-  stage left the detector loaded while the box classifier loaded on
-  top of it (the two now never coexist), the detector's `unload_model`
-  gives its pages back with `malloc_trim`, thumbnail decoding uses one
-  reused thread pool instead of a fresh one per chunk, and the web
-  server's crop decoding is capped at 4 threads (browsing two clusters
-  used to grow uvicorn from ~250 MB to ~1.4 GB and keep it there;
-  it now plateaus under ~0.8 GB). The README memory requirement went
-  from ~6 GB to ~7 GB to match the real peak.
+- **Memory peaks are lower.** Replaying the same run on a 24k-photo
+  library, the pipeline process peaked at 7.7 GB before and 6.7 GB
+  after: the person stage left the detector loaded while the box
+  classifier loaded on top of it (the two now never coexist), the
+  detector's `unload_model` gives its pages back with `malloc_trim`,
+  thumbnail decoding uses one reused thread pool instead of a fresh
+  one per chunk, and the web server's crop decoding is capped at 4
+  threads (browsing two clusters used to grow uvicorn from ~250 MB to
+  ~1.4 GB and keep it there; it now plateaus under ~0.8 GB). The
+  README memory requirement went from ~6 GB to ~7 GB: the old figure
+  counted BioCLIP alone.
 
 - **Box species predictions are more accurate.** Boxes are now cropped
   from the full Immich preview instead of a 448 px decode (median crop
   96 → 430 px). On 64 real boxes, top-1 species agreement with a
   full-resolution reference went from 20% to 100%. Each crop is
   encoded once and its embedding is stored (`bbox_embeddings`), which
-  box clustering needs; existing boxes get an embedding on the next
-  run.
+  box clustering needs. The first run after upgrading re-encodes every
+  existing plant box once, so it is long (see the v0.2.0 release notes).
 - **Removed cluster → Immich album sync.** Album names came from photo
   clusters while members came from box clusters, so the albums were
   never coherent. Albums an older version created can still be listed
