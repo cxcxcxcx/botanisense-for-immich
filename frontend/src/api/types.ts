@@ -368,12 +368,25 @@ export interface HealthDb {
 // 'teacher' = BioCLIP-2 (production default); 'mobile-*' = BioCLIP-Mobile
 // package (compose.s0.yml A/B instance). Only non-teacher engines get a
 // header badge so two side-by-side tabs are distinguishable.
+// ENGINE=auto/coreml (native macOS): `resolved` is what the worker would
+// pick now, `loaded` what the last model load actually used (null before
+// the first run) — Core ML can still fall back to torch at load.
+export interface HealthEngineLoaded {
+  engine: 'coreml' | 'teacher';
+  version?: string;
+  golden?: [number, number];
+  fallback_reason?: string | null;
+  at?: string;
+}
 export interface HealthEngine {
   id?: string;
   yolo_backend?: string;
   package?: string | null;
   code_rev?: string | null;
   error?: string | null;
+  resolved?: string;
+  unavailable_reason?: string | null;
+  loaded?: HealthEngineLoaded | null;
 }
 export interface Health {
   immich?: HealthImmich;

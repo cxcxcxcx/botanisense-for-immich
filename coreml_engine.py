@@ -25,6 +25,15 @@ Selection (`select_engine`): ENGINE=coreml requires the package; ENGINE=
 auto picks coreml on macOS when the package and coremltools are present,
 otherwise the torch teacher. A load or golden-gate failure falls back to
 the teacher with one `[model]` log line saying why.
+
+Download (`ensure_package`): on macOS with coremltools, a missing package
+is fetched once from Hugging Face (HF_REPO at the pinned HF_REVISION,
+~625 MB) and its sha256 checked before it is moved into place, so a
+present manifest.json always means a complete, verified package. The
+fetch runs as `python -m coreml_engine fetch <dir>` in a child whose env
+drops HF_HUB_OFFLINE — pipeline_worker sets that flag before
+huggingface_hub is imported, and the hub reads it once at import.
+COREML_AUTO_DOWNLOAD=0 turns the download off.
 """
 
 from __future__ import annotations
@@ -34,6 +43,9 @@ import logging
 import math
 import os
 import platform
+import shutil
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -44,6 +56,12 @@ _log = logging.getLogger("pipeline")
 COS_MEAN_GATE = 0.999
 COS_MIN_GATE = 0.998
 _COMPUTE_UNITS = {"all": "ALL", "cpu_gpu": "CPU_AND_GPU", "cpu": "CPU_ONLY"}
+
+HF_REPO = "cxcxcxcx/bioclip-2-coreml"
+HF_REVISION = "19254e4bec083c46c28e1148faa174deeb03f4a3"
+# sha256 of encoder_b16.mlpackage at HF_REVISION (same as its manifest).
+PACKAGE_SHA256 = "fc11f66c798cb4dca7d89a315f27c926d5917153ec7d63ccba87bf10ef3670f8"
+_FETCH_PATTERNS = ["encoder_b16.mlpackage/*", "golden.npz", "manifest.json", "LICENSE"]
 
 
 def default_package_dir() -> str:
@@ -58,26 +76,138 @@ def coreml_available() -> bool:
     return True
 
 
+def unavailable_reason(*, system: str | None = None,
+                       package_dir: str | Path | None = None,
+                       have_coremltools: bool | None = None) -> str | None:
+    """Why the Core ML engine can't load here, or None if it can."""
+    system = system or platform.system()
+    pkg = Path(package_dir or default_package_dir())
+    if have_coremltools is None:
+        have_coremltools = coreml_available()
+    if system != "Darwin":
+        return "not macOS"
+    if not have_coremltools:
+        return "coremltools not installed (uv sync --extra mac)"
+    if not (pkg / "manifest.json").exists():
+        return f"no package at {pkg}"
+    return None
+
+
 def select_engine(engine: str, *, system: str | None = None,
                   package_dir: str | Path | None = None,
-                  have_coremltools: bool | None = None) -> str:
+                  have_coremltools: bool | None = None,
+                  quiet: bool = False) -> str:
     """Map $ENGINE to the engine that should actually load: 'coreml',
     'teacher' or the mobile-* value unchanged. Pure apart from the
     defaults, so the auto rules are unit-testable on Linux."""
     if engine not in ("auto", "coreml"):
         return engine
-    system = system or platform.system()
-    pkg = Path(package_dir or default_package_dir())
-    if have_coremltools is None:
-        have_coremltools = coreml_available()
-    if system == "Darwin" and have_coremltools and (pkg / "manifest.json").exists():
+    why = unavailable_reason(system=system, package_dir=package_dir,
+                             have_coremltools=have_coremltools)
+    if why is None:
         return "coreml"
-    if engine == "coreml":
-        why = ("not macOS" if system != "Darwin" else
-               "coremltools not installed" if not have_coremltools else
-               f"no package at {pkg}")
+    if engine == "coreml" and not quiet:
         _log.info("[model] ENGINE=coreml unavailable (%s) — using BioCLIP-2 torch", why)
     return "teacher"
+
+
+def status_path() -> Path:
+    """Where the pipeline worker records which engine it actually loaded
+    for ENGINE=auto/coreml (the choice is made in the worker, at model
+    load) — /api/health reads it back."""
+    return Path(default_package_dir()).parent / "engine_loaded.json"
+
+
+def record_loaded(engine: str, **info) -> None:
+    """Best-effort write of status_path(); never raises."""
+    try:
+        p = status_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"engine": engine, **info,
+                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S")}))
+    except OSError:
+        pass
+
+
+def read_loaded() -> dict | None:
+    try:
+        return json.loads(status_path().read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def sha256_dir(path: Path) -> str:
+    """Hash of every file under `path` (relative names + bytes, sorted) —
+    the manifest's `sha256` (scripts/export_teacher_coreml.py)."""
+    import hashlib
+
+    h = hashlib.sha256()
+    for f in sorted(p for p in path.rglob("*") if p.is_file()):
+        h.update(str(f.relative_to(path)).encode())
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_package(dest: str | Path, *, expected_sha256: str = PACKAGE_SHA256) -> None:
+    """Download the package from HF into `dest`: fetched into
+    `<dest>.partial`, verified, then renamed, so `dest` only ever holds
+    a complete package. Raises on a hash mismatch."""
+    from huggingface_hub import snapshot_download
+
+    dest = Path(dest)
+    part = dest.with_name(dest.name + ".partial")
+    # Resumes an interrupted fetch: snapshot_download skips files whose
+    # size/etag already match.
+    snapshot_download(HF_REPO, revision=HF_REVISION, local_dir=part,
+                      allow_patterns=_FETCH_PATTERNS)
+    manifest = json.loads((part / "manifest.json").read_text())
+    got = sha256_dir(part / manifest.get("file", "encoder_b16.mlpackage"))
+    if got != expected_sha256 or got != manifest.get("sha256"):
+        shutil.rmtree(part, ignore_errors=True)
+        raise RuntimeError(f"Core ML package sha256 mismatch: got {got[:12]}, "
+                           f"expected {expected_sha256[:12]}")
+    shutil.rmtree(part / ".cache", ignore_errors=True)
+    if dest.exists():
+        shutil.rmtree(dest)
+    part.rename(dest)
+
+
+def ensure_package(package_dir: str | Path | None = None, *, system: str | None = None,
+                   have_coremltools: bool | None = None) -> bool:
+    """True if a verified package is in place, downloading it first when
+    it's missing and this machine could use it. Never raises."""
+    pkg = Path(package_dir or default_package_dir())
+    if (pkg / "manifest.json").exists():
+        return True
+    if (system or platform.system()) != "Darwin":
+        return False
+    if not (coreml_available() if have_coremltools is None else have_coremltools):
+        return False
+    if os.environ.get("COREML_AUTO_DOWNLOAD", "1").strip().lower() in ("0", "false", "no"):
+        return False
+    _log.info("[model] downloading the Core ML encoder (%s, ~625 MB, once) into %s",
+              HF_REPO, pkg)
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE")}
+    t0 = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "coreml_engine", "fetch", str(pkg)],
+            cwd=Path(__file__).parent, env=env, capture_output=True, text=True,
+            timeout=3600,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        _log.info("[model] Core ML download failed (%s) — using BioCLIP-2 torch", e)
+        return False
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-1:] or ["?"]
+        _log.info("[model] Core ML download failed (%s) — using BioCLIP-2 torch", tail[0])
+        return False
+    _log.info("[model] Core ML encoder downloaded and verified in %.0fs",
+              time.monotonic() - t0)
+    return (pkg / "manifest.json").exists()
 
 
 def encode_batched(predict, x: np.ndarray, batch: int) -> np.ndarray:
@@ -199,3 +329,15 @@ def CoreMLEngine(*args, **kwargs):  # noqa: N802 — factory standing in for the
     if _CLS is None:
         _CLS = _make_class()
     return _CLS(*args, **kwargs)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) == 2 and argv[0] == "fetch":
+        fetch_package(argv[1])
+        return 0
+    print("usage: python -m coreml_engine fetch <package_dir>", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

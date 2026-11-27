@@ -178,11 +178,21 @@ export function Header({ view }: Props) {
           {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
         </button>
         <AboutMenu
-          detail={engine ? `engine ${engine.id}, detector ${engine.yolo_backend ?? '?'}` : undefined}
+          detail={engine ? `engine ${engineLabel(engine)}, detector ${engine.yolo_backend ?? '?'}` : undefined}
         />
       </div>
     </header>
   );
+}
+
+// "auto → Core ML" etc. for ENGINE=auto/coreml, so a Mac user can see
+// whether the accelerated encoder is actually in use.
+function engineLabel(e: HealthEngine): string {
+  if (e.id !== 'auto' && e.id !== 'coreml') return e.id ?? '?';
+  const used = e.loaded?.engine ?? e.resolved;
+  const name = used === 'coreml' ? 'Core ML' : 'BioCLIP-2 torch';
+  const why = used !== 'coreml' && (e.loaded?.fallback_reason ?? e.unavailable_reason);
+  return `${e.id} → ${name}${why ? ` (${why})` : ''}`;
 }
 
 // About / feedback popover: version, GitHub, issue links and the

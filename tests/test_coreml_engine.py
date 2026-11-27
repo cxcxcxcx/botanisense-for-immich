@@ -12,6 +12,12 @@ import pytest
 import coreml_engine as ce
 
 
+@pytest.fixture(autouse=True)
+def _isolated_package_dir(tmp_path, monkeypatch):
+    # record_loaded() writes next to the package dir — keep it out of data/.
+    monkeypatch.setenv("COREML_PACKAGE", str(tmp_path / "models" / "bioclip-2-coreml"))
+
+
 @pytest.fixture
 def pkg(tmp_path):
     (tmp_path / "manifest.json").write_text(json.dumps({"batch": 16}))
@@ -101,3 +107,89 @@ def test_load_coreml_engine_rejects_failed_gate(monkeypatch):
 
     monkeypatch.setattr(ce, "CoreMLEngine", boom)
     assert pipeline._load_coreml_engine() is None
+
+
+def test_load_coreml_engine_records_fallback_reason(monkeypatch):
+    import pipeline
+
+    def boom():
+        raise RuntimeError("no ANE")
+
+    monkeypatch.setattr(ce, "CoreMLEngine", boom)
+    assert pipeline._load_coreml_engine() is None
+    loaded = ce.read_loaded()
+    assert loaded["engine"] == "teacher"
+    assert "no ANE" in loaded["fallback_reason"]
+
+
+def _write_files(root, files):
+    for rel, data in files.items():
+        f = root / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_bytes(data)
+
+
+def _fake_snapshot(files):
+    def snapshot_download(repo, *, revision, local_dir, allow_patterns):
+        assert repo == ce.HF_REPO and revision == ce.HF_REVISION
+        root = ce.Path(local_dir)
+        _write_files(root, files)
+        (root / ".cache").mkdir(exist_ok=True)
+        sha = ce.sha256_dir(root / "encoder_b16.mlpackage")
+        (root / "manifest.json").write_text(
+            json.dumps({"file": "encoder_b16.mlpackage", "sha256": sha})
+        )
+    return snapshot_download
+
+
+def test_fetch_package_verifies_then_moves_into_place(tmp_path, monkeypatch):
+    import huggingface_hub
+
+    files = {"encoder_b16.mlpackage/Manifest.json": b"{}",
+             "encoder_b16.mlpackage/Data/w.bin": b"weights"}
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", _fake_snapshot(files))
+    _write_files(tmp_path / "stage", files)
+    want = ce.sha256_dir(tmp_path / "stage" / "encoder_b16.mlpackage")
+
+    dest = tmp_path / "pkg"
+    ce.fetch_package(dest, expected_sha256=want)
+    assert (dest / "manifest.json").exists()
+    assert not (dest / ".cache").exists()
+    assert not (tmp_path / "pkg.partial").exists()
+
+    # A corrupted / unexpected download never lands in `dest`.
+    dest2 = tmp_path / "pkg2"
+    with pytest.raises(RuntimeError, match="sha256 mismatch"):
+        ce.fetch_package(dest2, expected_sha256="0" * 64)
+    assert not dest2.exists() and not (tmp_path / "pkg2.partial").exists()
+
+
+def test_ensure_package_only_downloads_on_a_mac_that_can_use_it(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(ce.subprocess, "run", lambda *a, **k: calls.append((a, k)))
+    d = tmp_path / "missing"
+    assert ce.ensure_package(d, system="Linux", have_coremltools=True) is False
+    assert ce.ensure_package(d, system="Darwin", have_coremltools=False) is False
+    monkeypatch.setenv("COREML_AUTO_DOWNLOAD", "0")
+    assert ce.ensure_package(d, system="Darwin", have_coremltools=True) is False
+    assert calls == []
+
+
+def test_ensure_package_fetches_in_child_without_offline_flag(tmp_path, monkeypatch):
+    d = tmp_path / "pkg"
+    seen = {}
+
+    def fake_run(cmd, *, env, **kw):
+        seen["cmd"], seen["env"] = cmd, env
+        d.mkdir()
+        (d / "manifest.json").write_text("{}")
+        return ce.subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    monkeypatch.setattr(ce.subprocess, "run", fake_run)
+    assert ce.ensure_package(d, system="Darwin", have_coremltools=True) is True
+    assert seen["cmd"][1:] == ["-m", "coreml_engine", "fetch", str(d)]
+    assert "HF_HUB_OFFLINE" not in seen["env"]
+    # Already present → no second download.
+    monkeypatch.setattr(ce.subprocess, "run", lambda *a, **k: pytest.fail("refetched"))
+    assert ce.ensure_package(d, system="Darwin", have_coremltools=True) is True

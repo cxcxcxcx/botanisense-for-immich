@@ -228,14 +228,21 @@ def _resolve_classifier() -> "object | None":
         return _clf_cache
     with _clf_lock:
         if _clf_cache is None:
-            from coreml_engine import select_engine
+            import coreml_engine
             from mobile_engine import resolve_engine_name
 
-            if select_engine(resolve_engine_name()) == "coreml":
+            wants_coreml = resolve_engine_name() in ("auto", "coreml")
+            if wants_coreml:
+                coreml_engine.ensure_package()
+            if coreml_engine.select_engine(resolve_engine_name()) == "coreml":
                 engine = _load_coreml_engine()
                 if engine is not None:
                     _clf_cache = engine
                     return _clf_cache
+            elif wants_coreml:
+                coreml_engine.record_loaded(
+                    "teacher", fallback_reason=coreml_engine.unavailable_reason()
+                )
             elif resolve_engine_name().startswith("mobile"):
                 from mobile_engine import MobileEngine
 
@@ -284,6 +291,8 @@ def _resolve_classifier() -> "object | None":
 def _load_coreml_engine() -> "object | None":
     """CoreMLEngine if it loads and passes its golden gate, else None
     (caller falls back to the torch teacher). Never raises."""
+    import coreml_engine
+
     try:
         from coreml_engine import CoreMLEngine
 
@@ -292,16 +301,23 @@ def _load_coreml_engine() -> "object | None":
         ok, mean, low = engine.self_check()
     except Exception as e:  # noqa: BLE001 — any load failure → teacher
         _log.info("[model] Core ML engine failed to load (%s) — using BioCLIP-2 torch", e)
+        coreml_engine.record_loaded("teacher", fallback_reason=f"load failed: {e}")
         return None
     if not ok:
         _log.info(
             "[model] Core ML golden gate FAILED (cos mean %.6f / min %.6f) "
             "— using BioCLIP-2 torch", mean, low,
         )
+        coreml_engine.record_loaded(
+            "teacher", fallback_reason=f"golden gate failed ({mean:.6f}/{low:.6f})"
+        )
         return None
     _log.info(
         "[model] ENGINE=coreml  version=%s  golden cos %.6f/%.6f  (ready in %.1fs)",
         engine.version_key(), mean, low, time.monotonic() - _t0,
+    )
+    coreml_engine.record_loaded(
+        "coreml", version=engine.version_key(), golden=[round(mean, 6), round(low, 6)]
     )
     return engine
 

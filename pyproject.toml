@@ -30,6 +30,14 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
 ]
 
+[project.optional-dependencies]
+# Native macOS (Apple Silicon): ENGINE=auto/coreml runs the BioCLIP-2
+# image encoder through Core ML (GPU + Neural Engine), ~3x the CPU path.
+# Inference only — coremltools' numpy<2.4 limit applies to conversion.
+mac = [
+    "coremltools>=9.0; sys_platform == 'darwin'",
+]
+
 [tool.uv]
 package = false
 

@@ -1938,6 +1938,14 @@ def _engine_health() -> dict:
         except (OSError, ValueError):
             info["package"] = None
             info["error"] = "manifest unreadable"
+    elif engine in ("auto", "coreml"):
+        import coreml_engine
+
+        # The worker picks the engine at model load; until a run has
+        # loaded one, report what it would pick.
+        info["resolved"] = coreml_engine.select_engine(engine, quiet=True)
+        info["unavailable_reason"] = coreml_engine.unavailable_reason()
+        info["loaded"] = coreml_engine.read_loaded()
     return info
 
 
