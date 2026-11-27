@@ -1,6 +1,6 @@
 # Mac 原生加速方案：CoreML BioCLIP-2 编码器（v0.2 候选）
 
-状态：第 0–3 步完成（2026-11-26），门 1–3 已过。第 4 步：HF 已上传（2026-11-26，`cxcxcxcx/bioclip-2-coreml` commit `19254e4b`，model card 源文件在 `release/hf-bioclip-2-coreml/`），app 内下载与 sha256/golden 自检未做。第 5 步（发版）未开始。
+状态：第 0–5 步完成（2026-11-26），门 1–3 已过。HF 仓库 `cxcxcxcx/bioclip-2-coreml` commit `19254e4b`（model card 源文件在 `release/hf-bioclip-2-coreml/`）；app 首次运行自动下载 + sha256 + golden 自检（5b08a04）；README Mac 章节、`scripts/macos/install_launchd.sh`、CHANGELOG 已写，并在 Mac 上照 README 从空目录装了一遍。还没发版（打 tag / Release 要用户确认）。
 
 ## 目标与边界
 
@@ -133,8 +133,8 @@ LICENSE                   # MIT
 | 1 | 补齐导出脚本（真实 crop golden、manifest），重新生成 b16，跑门 1 | 可复现的产物 + 一致性数字 | 0.5 天 |
 | 2 | `coreml_engine.py` + `ENGINE=coreml/auto` + 单元测试 | PR（Linux CI 绿） | 1 天 |
 | 3 | 在 Mac 上原生跑全流程，过门 2、3；修 MPS 上的问题 | 对比报告（放进 `docs/`） | 1 天 |
-| 4 | HF 仓库 + model card + app 内下载与自检 | HF 仓库（已上传 `19254e4b`；app 内下载未做） | 0.5 天 |
-| 5 | README Mac 章节 + launchd 脚本 + CHANGELOG | v0.2 发布材料 | 0.5 天 |
+| 4 | HF 仓库 + model card + app 内下载与自检 | HF 仓库（`19254e4b`）+ app 首次运行下载与自检（完成） | 0.5 天 |
+| 5 | README Mac 章节 + launchd 脚本 + CHANGELOG | v0.2 发布材料（完成，未发版） | 0.5 天 |
 
 合计约 **4 个工作日**。步骤 0–3 在私有分支完成，不对外发布；步骤 4 起需要用户确认。
 
@@ -227,7 +227,9 @@ LICENSE                   # MIT
 
 **后续项**：
 
-1. bbox-bioclip 阶段改成"编码一次"：裁剪 → `create_image_features` → 写 `bbox_embeddings` → 从特征分类。新的框聚类依赖 `bbox_embeddings`，现在只有回填脚本在写；这样也能去掉 `predict()` 的瓶颈，并让框级 cos 门可测。
+1. **完成（f80b77f）**：bbox-bioclip 阶段改成"编码一次"：裁剪 → `create_image_features` → 写 `bbox_embeddings` → 从特征分类。新的框聚类依赖 `bbox_embeddings`，现在只有回填脚本在写；这样也能去掉 `predict()` 的瓶颈，并让框级 cos 门可测。
+   - 顺带修掉一个精度问题：旧阶段从 448px 的 draft 解码上裁框，中位 crop 只有 96px；改成从完整预览（`_BBOX_DECODE_SIZE=2560`）裁，中位 430px。64 个真实框对 Mac 回填参考：cos 旧 .833（最低 .601）→ 新 .99999；species top-1 一致 20% → 100%（`scripts/verify_bbox_encode_once.py`）。
+   - 从空目录全新安装实测（M4，30 张图、195 个框，Immich 走 ssh 隧道）：bbox-bioclip 8.3 框/s（含取预览和 2560 解码），首次运行下载 + 编译约 1.5 分钟。
 2. `pipeline.TreeOfLifeClassifier` 是模块级懒加载：直接调 `_resolve_classifier()` 走 teacher 分支会 KeyError，worker 因为先访问了这个属性才没事。冒烟脚本已照 worker 的做法先访问一次；`_resolve_classifier` 本身改成用 `getattr` 更稳。
 
 ## 部署定位（2026-11-26 用户决定）

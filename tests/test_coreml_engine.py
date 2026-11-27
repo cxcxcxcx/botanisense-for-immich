@@ -175,6 +175,20 @@ def test_ensure_package_only_downloads_on_a_mac_that_can_use_it(tmp_path, monkey
     assert calls == []
 
 
+def test_will_download_only_when_the_next_load_fetches(tmp_path, monkeypatch):
+    monkeypatch.delenv("COREML_AUTO_DOWNLOAD", raising=False)
+    d = tmp_path / "pkg"
+    assert ce.will_download(d, system="Darwin", have_coremltools=True) is True
+    assert ce.will_download(d, system="Linux", have_coremltools=True) is False
+    assert ce.will_download(d, system="Darwin", have_coremltools=False) is False
+    monkeypatch.setenv("COREML_AUTO_DOWNLOAD", "no")
+    assert ce.will_download(d, system="Darwin", have_coremltools=True) is False
+    monkeypatch.delenv("COREML_AUTO_DOWNLOAD")
+    d.mkdir()
+    (d / "manifest.json").write_text("{}")
+    assert ce.will_download(d, system="Darwin", have_coremltools=True) is False
+
+
 def test_ensure_package_fetches_in_child_without_offline_flag(tmp_path, monkeypatch):
     d = tmp_path / "pkg"
     seen = {}

@@ -66,6 +66,69 @@ To enable the optional KNN reclassification, see
 Contributing or developing from source (Python + Node)? See
 [DEVELOPMENT.md](DEVELOPMENT.md).
 
+### On a Mac: run natively (Apple Silicon)
+
+On a Mac, skip Docker. Docker Desktop / colima run a Linux VM that
+can't reach the GPU or Neural Engine, so BioCLIP-2 runs on the CPU.
+Run natively instead and the image encoder goes through Core ML
+([`cxcxcxcx/bioclip-2-coreml`][coreml-hf], downloaded and checksummed
+automatically on the first run). That is at least 3× faster than torch
+on the same Mac's CPU (M4: 23.7 vs 8.0 crops/s) and gives the same
+results: embedding cosine ≥ .998 against the PyTorch model.
+
+Needs Apple Silicon, macOS 15 or later, and [Homebrew](https://brew.sh).
+Copy-paste:
+
+```bash
+brew install uv node git
+git clone https://github.com/cxcxcxcx/botanisense-for-immich
+cd botanisense-for-immich
+
+# Python 3.13 is pinned in .python-version; uv fetches it if needed.
+# --extra mac adds coremltools — without it the app falls back to CPU.
+uv sync --frozen --extra mac
+(cd frontend && npm ci && npm run build)
+
+# Foreground run. Open http://<this-mac's-IP>:8765 from any LAN device.
+ENGINE=auto HF_HOME="$PWD/data/huggingface" \
+  .venv/bin/python -m uvicorn app:app --host 0.0.0.0 --port 8765
+```
+
+To keep it running in the background, with a start at login and a
+restart if it crashes (run this in Terminal on the Mac itself; over ssh
+launchd can't start it until the next login):
+
+```bash
+scripts/macos/install_launchd.sh               # PORT=8780 … for another port
+tail -f data/server.log
+scripts/macos/install_launchd.sh --uninstall   # stop + remove
+```
+
+- **Check the engine:** the ⓘ menu in the header should say
+  `auto → Core ML` (before the first run: `auto → Core ML (downloads on
+  first run)`). If it says `auto → BioCLIP-2 torch (…)` it names the
+  reason, e.g.
+  coremltools missing (re-run `uv sync --frozen --extra mac`) or the
+  model failed its self-check. `/api/health` → `engine` shows the same.
+- **First pipeline run downloads** the Core ML encoder (~625 MB, 1.1 GB
+  once compiled) and the BioCLIP-2 species label table (2.5 GB) into
+  `data/`, then the run starts; about 2 minutes on a fast connection. `COREML_AUTO_DOWNLOAD=0`
+  turns the encoder download off, e.g. on a machine without internet
+  where you copy `data/models/bioclip-2-coreml/` in by hand.
+- **Immich on another machine:** macOS Local Network privacy can block
+  the background (launchd) process from reaching LAN addresses. The
+  pipeline then fails with `No route to host`, while the same command
+  works from Terminal. Allow it once under System Settings → Privacy &
+  Security → Local Network. Immich on the same Mac (`127.0.0.1`) is
+  never affected.
+- **Memory:** a run needs ~6 GB free, the same as with Docker. A 16 GB
+  Mac is fine.
+- **Update:** `git pull && uv sync --frozen --extra mac &&
+  (cd frontend && npm ci && npm run build)`, then restart (re-run
+  `install_launchd.sh` for the background service).
+
+[coreml-hf]: https://huggingface.co/cxcxcxcx/bioclip-2-coreml
+
 ---
 
 ## Features
@@ -173,7 +236,8 @@ shines. Below ~1 000 photos the run-once latency dominates; above
 
 ## Prerequisites
 
-- **Docker** (with Compose v2) — the only install path
+- **Docker** (with Compose v2), or on a Mac the
+  [native install](#on-a-mac-run-natively-apple-silicon)
 - An **Immich instance** with an admin API key — see
   [Immich → Administration → Settings → API Keys][immich-keys]
 - **~6 GB free RAM** during a pipeline run (measured ~5.9 GB: BioCLIP-2
@@ -216,6 +280,9 @@ Two surfaces, both optional:
 | `TOP_K` | `5` | Species predictions per asset |
 | `BATCH_SIZE` | `16` | Inference batch size |
 | `DB_PATH` | `data/state.db` | SQLite location |
+| `ENGINE` | `teacher` | `auto` = Core ML on a native Mac, else PyTorch; `coreml` forces it (falls back if unavailable) |
+| `COREML_COMPUTE_UNITS` | `all` | `all` (GPU + Neural Engine), `cpu_gpu` (slower, closer to PyTorch), `cpu` |
+| `COREML_AUTO_DOWNLOAD` | `1` | `0` = never download the Core ML encoder |
 | `HOST`, `PORT` | `0.0.0.0`, `8765` | Server bind |
 | `RUN_ON_STARTUP` | `0` (off) | Run the pipeline once at boot |
 | `PIPELINE_CRON` | _(off)_ | Daily pipeline run at HH:MM |

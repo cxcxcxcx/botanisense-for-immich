@@ -386,6 +386,8 @@ export interface HealthEngine {
   error?: string | null;
   resolved?: string;
   unavailable_reason?: string | null;
+  /** Core ML package not fetched yet; the next run downloads it. */
+  pending_download?: boolean;
   loaded?: HealthEngineLoaded | null;
 }
 export interface Health {

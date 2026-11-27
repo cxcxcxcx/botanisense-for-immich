@@ -191,7 +191,9 @@ function engineLabel(e: HealthEngine): string {
   if (e.id !== 'auto' && e.id !== 'coreml') return e.id ?? '?';
   const used = e.loaded?.engine ?? e.resolved;
   const name = used === 'coreml' ? 'Core ML' : 'BioCLIP-2 torch';
-  const why = used !== 'coreml' && (e.loaded?.fallback_reason ?? e.unavailable_reason);
+  const why = used !== 'coreml'
+    ? e.loaded?.fallback_reason ?? e.unavailable_reason
+    : !e.loaded && e.pending_download && 'downloads on first run';
   return `${e.id} → ${name}${why ? ` (${why})` : ''}`;
 }
 

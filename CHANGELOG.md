@@ -4,6 +4,50 @@ All notable changes to BotaniSense for Immich are documented here.
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com/),
 and the project does **not** follow Semantic Versioning until v1.0.
 
+## Unreleased
+
+### Features
+
+- **Native Mac install with Core ML.** On Apple Silicon (macOS 15+),
+  `ENGINE=auto` runs the BioCLIP-2 image encoder through Core ML
+  (GPU / Neural Engine): at least 3× faster than torch on the same
+  Mac's CPU (M4: 23.7 vs 8.0 crops/s), embedding cosine ≥ .998 against
+  the PyTorch model. The first run downloads the encoder from
+  [`cxcxcxcx/bioclip-2-coreml`](https://huggingface.co/cxcxcxcx/bioclip-2-coreml)
+  (~625 MB), checks its sha256 and a golden self-test, and falls back
+  to torch with the reason shown if anything fails
+  (`COREML_AUTO_DOWNLOAD=0` turns the download off,
+  `COREML_COMPUTE_UNITS` picks `all` / `cpu_gpu` / `cpu`). New
+  `uv sync --extra mac` adds coremltools; Python is pinned to 3.13.
+  README has copy-paste steps, and `scripts/macos/install_launchd.sh`
+  runs it as a login service. Docker stays the default on Linux and
+  is unchanged.
+- **Engine badge.** The header's ⓘ menu and `/api/health` → `engine`
+  show which encoder is in use (`auto → Core ML`, or the torch
+  fallback and why).
+- **Box clusters.** Plant boxes are clustered crop-first (FAISS kNN →
+  HDBSCAN → merge → rescue), with whole-photo fallback for plant
+  photos without a usable box. Browse them in the UI, including an
+  Unclustered bucket; related clusters and the grid's cluster filter
+  use them when present. The refit runs in a child process, so its
+  working set (~1.9 GB on a 69k-box library) leaves uvicorn when it's
+  done, and a fit only reads embeddings from the model it was fitted
+  with.
+
+### Changed
+
+- **Box species predictions are more accurate.** Boxes are now cropped
+  from the full Immich preview instead of a 448 px decode (median crop
+  96 → 430 px). On 64 real boxes, top-1 species agreement with a
+  full-resolution reference went from 20% to 100%. Each crop is
+  encoded once and its embedding is stored (`bbox_embeddings`), which
+  box clustering needs; existing boxes get an embedding on the next
+  run.
+- **Removed cluster → Immich album sync.** Album names came from photo
+  clusters while members came from box clusters, so the albums were
+  never coherent. Albums an older version created can still be listed
+  and deleted.
+
 ## 0.1.0 — 2026-11-24
 
 First public release. The codebase has been under active private

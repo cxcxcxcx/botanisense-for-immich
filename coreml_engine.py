@@ -174,6 +174,21 @@ def fetch_package(dest: str | Path, *, expected_sha256: str = PACKAGE_SHA256) ->
     part.rename(dest)
 
 
+def will_download(package_dir: str | Path | None = None, *, system: str | None = None,
+                  have_coremltools: bool | None = None) -> bool:
+    """The package is missing only because nothing has fetched it yet:
+    ensure_package() will download it at the next model load."""
+    pkg = Path(package_dir or default_package_dir())
+    if (pkg / "manifest.json").exists():
+        return False
+    if (system or platform.system()) != "Darwin":
+        return False
+    if not (coreml_available() if have_coremltools is None else have_coremltools):
+        return False
+    return os.environ.get("COREML_AUTO_DOWNLOAD", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
 def ensure_package(package_dir: str | Path | None = None, *, system: str | None = None,
                    have_coremltools: bool | None = None) -> bool:
     """True if a verified package is in place, downloading it first when
@@ -181,11 +196,7 @@ def ensure_package(package_dir: str | Path | None = None, *, system: str | None 
     pkg = Path(package_dir or default_package_dir())
     if (pkg / "manifest.json").exists():
         return True
-    if (system or platform.system()) != "Darwin":
-        return False
-    if not (coreml_available() if have_coremltools is None else have_coremltools):
-        return False
-    if os.environ.get("COREML_AUTO_DOWNLOAD", "1").strip().lower() in ("0", "false", "no"):
+    if not will_download(pkg, system=system, have_coremltools=have_coremltools):
         return False
     _log.info("[model] downloading the Core ML encoder (%s, ~625 MB, once) into %s",
               HF_REPO, pkg)

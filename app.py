@@ -1943,8 +1943,13 @@ def _engine_health() -> dict:
 
         # The worker picks the engine at model load; until a run has
         # loaded one, report what it would pick.
-        info["resolved"] = coreml_engine.select_engine(engine, quiet=True)
-        info["unavailable_reason"] = coreml_engine.unavailable_reason()
+        if coreml_engine.will_download():
+            info["resolved"] = "coreml"
+            info["unavailable_reason"] = None
+            info["pending_download"] = True
+        else:
+            info["resolved"] = coreml_engine.select_engine(engine, quiet=True)
+            info["unavailable_reason"] = coreml_engine.unavailable_reason()
         info["loaded"] = coreml_engine.read_loaded()
     return info
 
