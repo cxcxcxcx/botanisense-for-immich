@@ -11,6 +11,7 @@ import { SortPicker } from './SortPicker';
 import { getBboxClusterItems, getClusterGroupItems, getClusterGroups } from '../api/endpoints';
 import type { BboxClusterBox, BboxClusterItem, BboxClusterItemsResponse, ClusterGroup } from '../api/types';
 import { useApp, useFilters } from '../state/AppContext';
+import { usePersistedState } from '../hooks/usePersistedState';
 import { useUrlFilters } from '../hooks/useUrlFilters';
 import { navigate } from '../hooks/useRoute';
 import { formatPct } from '../lib/format';
@@ -27,6 +28,15 @@ const SORT_OPTIONS: { value: BboxSort; label: string }[] = [
   { value: 'yolo',  label: 'Detector score ↓' },
 ];
 
+// The Level-2 sort is a per-browser view preference, NOT part of the
+// URL contract (a link you share shouldn't carry someone else's
+// ordering). Persisted to localStorage so opening a second cluster keeps
+// the ordering the user picked in the first one instead of snapping back
+// to 'score'.
+const SORT_STORAGE_KEY = 'clusterdetail:sort';
+const isBboxSort = (v: unknown): v is BboxSort =>
+  v === 'score' || v === 'time' || v === 'area' || v === 'yolo';
+
 export function BboxClusterGrid() {
   const filters = useFilters();
   const setFilters = useUrlFilters();
@@ -34,7 +44,7 @@ export function BboxClusterGrid() {
 
   const isSuper = filters.group_by === 'supergroup' && filters.supergroup != null;
   const targetId = isSuper ? filters.supergroup : filters.cluster_id;
-  const [sort, setSort] = useState<BboxSort>('score');
+  const [sort, setSort] = usePersistedState<BboxSort>(SORT_STORAGE_KEY, 'score', isBboxSort);
   const [data, setData] = useState<BboxClusterItemsResponse | null>(null);
   const [groupsData, setGroupsData] = useState<ClusterGroup[] | null>(null);
   const [items, setItems] = useState<BboxClusterItem[]>([]);
