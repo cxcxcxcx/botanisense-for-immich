@@ -906,6 +906,15 @@ def _decode_preview(blob: bytes, max_size: int = _PIL_DRAFT_SIZE) -> Image.Image
     return img
 
 
+# One pool for the whole worker, not one per chunk. Every new thread
+# gets its own glibc malloc arena and arenas are never returned to the
+# OS — a per-chunk pool grew the arena count 8 → 13 over one measured
+# run. One reused pool holds at one set of 16 threads for the whole run.
+_THUMB_POOL = concurrent.futures.ThreadPoolExecutor(
+    max_workers=16, thread_name_prefix="thumb"
+)
+
+
 def fetch_thumbs(client, jobs, tag: str, max_size: int | None = None) -> tuple[dict, set]:
     """Download + decode thumbnails in parallel (IO-bound threads).
 
@@ -930,17 +939,15 @@ def fetch_thumbs(client, jobs, tag: str, max_size: int | None = None) -> tuple[d
         except Exception as e:  # noqa: BLE001 — containment
             return (key, None, e)
 
-    with concurrent.futures.ThreadPoolExecutor(
-            max_workers=min(16, max(4, len(jobs)))) as ex:
-        for key, pil, err in ex.map(_one, jobs):
-            if err is not None:
-                dead.add(key)
-                _log.warning(
-                    "[%s] %s: %s: %s — skipping asset",
-                    tag, key, type(err).__name__, err,
-                )
-            else:
-                out[key] = pil
+    for key, pil, err in _THUMB_POOL.map(_one, jobs):
+        if err is not None:
+            dead.add(key)
+            _log.warning(
+                "[%s] %s: %s: %s — skipping asset",
+                tag, key, type(err).__name__, err,
+            )
+        else:
+            out[key] = pil
     return out, dead
 
 
@@ -2877,6 +2884,15 @@ def run_pipeline(
                         f"{n_remaining} still unscanned total"
                     )
             finally:
+                # The person stage reloads the detector, and the bbox
+                # stage loads BioCLIP right after. Without this the two
+                # models coexist: replaying a run (out/memprobe/
+                # replay_run.sh) showed 4.5 GB detector+BioCLIP growing
+                # to 7.6 GB in bbox-bioclip instead of the ~5.6 GB a
+                # BioCLIP-only process needs.
+                if n_total:
+                    _log.info("[person] unloading YOLO weights")
+                    _yolo.unload_model()
                 _stage_end("person")
 
             # ---- Bbox BioCLIP: re-classify each crop ----

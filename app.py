@@ -32,6 +32,7 @@ import traceback
 import tracemalloc
 import uuid
 from collections import deque, OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -2951,6 +2952,17 @@ async def bbox_neighbors_route(
 _bbox_thumb_cache: OrderedDict[tuple[int, int], tuple[bytes, str]] = OrderedDict()
 _bbox_thumb_lock = asyncio.Lock()
 _BBOX_THUMB_CACHE_MAX = 4096
+# A cluster page fires ~60 thumb requests at once. Each decodes a full
+# preview (~0.7 MB JPEG → ~15 MB RGB). Decoding on the default
+# asyncio thread pool spreads that over up to 20 workers, and glibc gives
+# every thread its own malloc arena that never shrinks: uvicorn went
+# 394 → 1400 MB browsing two clusters. A dedicated 4-thread pool keeps it
+# to 4 arenas and ~385 MB peak on the same replay (out/memprobe/
+# bbox_thumb_rss.py); the Immich download stays fully async. The KNN
+# reference proxy shares this pool — it decodes the same way.
+_img_decode_pool = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="img-decode"
+)
 
 
 def _crop_bbox_jpeg(raw_bytes: bytes, det: dict, max_size: int) -> bytes:
@@ -3029,7 +3041,9 @@ async def bbox_thumb(
         )
 
     try:
-        body = await asyncio.to_thread(_crop_bbox_jpeg, r.content, det, int(max_size))
+        body = await asyncio.get_running_loop().run_in_executor(
+            _img_decode_pool, _crop_bbox_jpeg, r.content, det, int(max_size)
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
@@ -4424,8 +4438,8 @@ async def knn_ref_thumb(url: str = Query(..., description="reference image URL")
     # is CPU-bound, so it goes to a worker thread rather than blocking
     # the event loop. A source we can't decode is served through
     # unchanged — better a big image than none.
-    body, media_type = await asyncio.to_thread(
-        _shrink_ref_image, body, media_type
+    body, media_type = await asyncio.get_running_loop().run_in_executor(
+        _img_decode_pool, _shrink_ref_image, body, media_type
     )
 
     async with _ref_thumb_cache_lock:

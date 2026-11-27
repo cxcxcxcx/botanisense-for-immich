@@ -59,7 +59,7 @@ or a `.env` file instead — environment variables pin the connection.
 
 The image contains the backend and the built web UI (~2.5 GB; CPU-only
 torch). BioCLIP-2 downloads into `./data/` on the first pipeline run
-(needs ~6 GB free RAM while it runs — see [Prerequisites](#prerequisites)).
+(needs ~7 GB free RAM while it runs — see [Prerequisites](#prerequisites)).
 To enable the optional KNN reclassification, see
 [KNN reclassification](#knn-reclassification-debug-tool-not-recommended).
 
@@ -121,8 +121,8 @@ scripts/macos/install_launchd.sh --uninstall   # stop + remove
   works from Terminal. Allow it once under System Settings → Privacy &
   Security → Local Network. Immich on the same Mac (`127.0.0.1`) is
   never affected.
-- **Memory:** a run needs ~6 GB free, the same as with Docker. A 16 GB
-  Mac is fine.
+- **Memory:** a run needs ~7 GB free, the same as with Docker. A 16 GB
+  Mac is fine as long as nothing else large is running.
 - **Update:** `git pull && uv sync --frozen --extra mac &&
   (cd frontend && npm ci && npm run build)`, then restart (re-run
   `install_launchd.sh` for the background service).
@@ -240,9 +240,11 @@ shines. Below ~1 000 photos the run-once latency dominates; above
   [native install](#on-a-mac-run-natively-apple-silicon)
 - An **Immich instance** with an admin API key — see
   [Immich → Administration → Settings → API Keys][immich-keys]
-- **~6 GB free RAM** during a pipeline run (measured ~5.9 GB: BioCLIP-2
-  weights + species label table live in the child process). The web
-  server itself stays at ~250 MB.
+- **~7 GB free RAM** during a pipeline run (measured peak 6.7–7.6 GB in
+  the pipeline's child process: BioCLIP-2 weights + species label table
+  ≈ 5.6 GB, plus the detector and the per-chunk image buffers that
+  overlap with it). The web server itself stays at ~250 MB idle and
+  peaks around 0.8 GB while a cluster page loads its crops.
 - **~10 GB free disk**: ~2.5 GB for the Docker image, ~4.3 GB for the
   BioCLIP-2 artifacts (model weights + species label table, downloaded
   on first run into `data/huggingface/`), and the SQLite state DB
@@ -373,9 +375,9 @@ status, logs) is fetched per-component, with one SSE connection
   official, ~20 GB, or self-built — see
   [KNN reclassification](#knn-reclassification-debug-tool-not-recommended)), only
   zero-shot predictions are available.
-- **~6 GB resident during a pipeline run.** The BioCLIP-2 child
+- **~7 GB resident during a pipeline run.** The BioCLIP-2 child
   process holds the weights + label table for the duration (measured
-  ~5.9 GB); uvicorn itself stays at ~250 MB.
+  peak 6.7–7.6 GB); uvicorn itself stays at ~250 MB.
 - **Tested against Immich ≥ 1.111.** Earlier versions may lack
   `/api/search/smart` and the album endpoints this app depends on.
 - **No telemetry.** The app phones home to nobody — no update checks,

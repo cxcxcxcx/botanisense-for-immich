@@ -129,6 +129,14 @@ def unload_model() -> None:
     import gc
 
     gc.collect()
+    # Hand the detector's freed arena pages back before the next stage
+    # loads BioCLIP — see yolo_rtmdet.unload_model.
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def letterbox(img: Image.Image) -> tuple[np.ndarray, float, float, float]:

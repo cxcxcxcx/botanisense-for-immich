@@ -128,6 +128,16 @@ def unload_model() -> None:
     import gc
 
     gc.collect()
+    # The next stage (bbox BioCLIP) loads ~5.6 GB right after this call.
+    # gc alone leaves the detector's tensors in glibc arenas — measured
+    # 222 MB resident vs 153 after malloc_trim on a 16-image detect
+    # (out/memprobe/unload_yolo.py), and up to ~2 GB in a real run.
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def letterbox(img: Image.Image) -> tuple[np.ndarray, int, int]:
