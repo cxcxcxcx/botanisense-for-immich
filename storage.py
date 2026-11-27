@@ -47,7 +47,6 @@ import os
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
@@ -371,6 +370,7 @@ CREATE TABLE IF NOT EXISTS bbox_clusterer_state (
   min_samples       INTEGER NOT NULL,
   min_score         REAL NOT NULL,
   min_area          REAL NOT NULL,
+  model_version     TEXT,
   fitted_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -405,6 +405,9 @@ def init_db(path: str | Path) -> None:
             # detection. The yolo stage stamps has_person in the same
             # write — one forward pass covers both markers.
             ("ALTER TABLE assets ADD COLUMN yolo_scanned_at TEXT", "yolo_scanned_at"),
+            # bbox_embeddings model_version the box clusters were fit
+            # on; every cluster-side bbox_embeddings read filters to it.
+            ("ALTER TABLE bbox_clusterer_state ADD COLUMN model_version TEXT", "model_version"),
         ]:
             try:
                 conn.execute(stmt)
@@ -1378,35 +1381,6 @@ def get_cluster_album(
     return dict(row) if row else None
 
 
-def set_cluster_album(
-    conn: sqlite3.Connection,
-    *,
-    cluster_id: int,
-    album_id: str,
-    album_url: str,
-    n_assets: int,
-    reused: bool,
-) -> None:
-    """UPSERT one mapping. `reused` is a bool (stored as 0/1) so the UI
-    can show "(reused existing album)" after the second click."""
-    conn.execute(
-        """
-        INSERT INTO cluster_albums
-          (cluster_id, album_id, album_url, n_assets, reused_existing,
-           created_at, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now'))
-        ON CONFLICT(cluster_id) DO UPDATE SET
-          album_id       = excluded.album_id,
-          album_url      = excluded.album_url,
-          n_assets       = excluded.n_assets,
-          reused_existing = excluded.reused_existing,
-          last_synced_at = datetime('now')
-        """,
-        (int(cluster_id), album_id, album_url, int(n_assets), 1 if reused else 0),
-    )
-    conn.commit()
-
-
 def delete_cluster_album(
     conn: sqlite3.Connection, cluster_id: int
 ) -> bool:
@@ -1457,31 +1431,6 @@ def set_plantae_overrides(conn: sqlite3.Connection, asset_ids: list[str], value:
     return cur.rowcount
 
 
-def insert_cluster_album(conn: sqlite3.Connection, row: dict) -> None:
-    """Insert a single cluster_albums row. Used by the undo path
-    (UX-14) to recreate a mapping that was just bulk-removed. The
-    Immich album itself is NOT restored — only the local mapping —
-    because bulk-remove already DELETEd the album server-side. The
-    user has to re-sync to recreate the actual album."""
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO cluster_albums
-            (cluster_id, album_id, album_url, n_assets, reused_existing,
-             created_at, last_synced_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            int(row["cluster_id"]),
-            row["album_id"],
-            row["album_url"],
-            int(row["n_assets"]),
-            int(row.get("reused_existing", 0)),
-            row.get("created_at") or datetime.now(timezone.utc).isoformat(),
-            row.get("last_synced_at") or datetime.now(timezone.utc).isoformat(),
-        ),
-    )
-
-
 # People-filter SQL fragment. `None` means "no filter" (default).
 # `0` means "without people" — treats unscanned (NULL) assets as
 # without-people so the gate stays inclusive while a YOLO person
@@ -1512,117 +1461,6 @@ def has_bbox_clusters(conn: sqlite3.Connection) -> bool:
         "SELECT 1 FROM bbox_cluster_photos LIMIT 1"
     ).fetchone()
     return row2 is not None
-
-
-def get_assets_in_cluster(
-    conn: sqlite3.Connection,
-    cluster_id: int,
-    *,
-    people_filter: int | None = None,
-) -> list[str]:
-    """Asset_ids belonging to a cluster, in alphabetical order (stable
-    for bulk-add idempotency). Used by the per-cluster album sync
-    worker to drive PUT /api/albums/{id}/assets.
-
-    Uses the unified box+photo clusters when populated; falls back to
-    legacy `assets.cluster_id` on DBs that have not been migrated yet.
-    """
-    extra = _PEOPLE_FILTER_SQL[people_filter]
-    if has_bbox_clusters(conn):
-        rows = conn.execute(
-            f"""
-            SELECT DISTINCT a.asset_id
-            FROM assets a
-            WHERE a.asset_id IN (
-              SELECT d.asset_id FROM bbox_clusters bc
-              JOIN detections d ON d.id = bc.detection_id
-              WHERE bc.cluster_id = ?
-              UNION
-              SELECT bp.asset_id FROM bbox_cluster_photos bp
-              WHERE bp.cluster_id = ?
-            ){extra}
-            ORDER BY a.asset_id ASC
-            """,
-            (int(cluster_id), int(cluster_id)),
-        ).fetchall()
-        return [r["asset_id"] for r in rows]
-    rows = conn.execute(
-        f"""
-        SELECT asset_id FROM assets
-        WHERE cluster_id = ?{extra}
-        ORDER BY asset_id ASC
-        """,
-        (int(cluster_id),),
-    ).fetchall()
-    return [r["asset_id"] for r in rows]
-
-
-def count_assets_in_cluster(
-    conn: sqlite3.Connection,
-    cluster_id: int,
-    *,
-    people_filter: int | None = None,
-) -> int:
-    """SQL COUNT(*) variant. Cheap; used by the per-cluster sync
-    preview endpoint. Same `people_filter` semantics as
-    `get_assets_in_cluster`."""
-    extra = _PEOPLE_FILTER_SQL[people_filter]
-    if has_bbox_clusters(conn):
-        row = conn.execute(
-            f"""
-            SELECT COUNT(DISTINCT a.asset_id) AS n
-            FROM assets a
-            WHERE a.asset_id IN (
-              SELECT d.asset_id FROM bbox_clusters bc
-              JOIN detections d ON d.id = bc.detection_id
-              WHERE bc.cluster_id = ?
-              UNION
-              SELECT bp.asset_id FROM bbox_cluster_photos bp
-              WHERE bp.cluster_id = ?
-            ){extra}
-            """,
-            (int(cluster_id), int(cluster_id)),
-        ).fetchone()
-        return int(row["n"]) if row else 0
-    row = conn.execute(
-        f"SELECT COUNT(*) AS n FROM assets WHERE cluster_id = ?{extra}",
-        (int(cluster_id),),
-    ).fetchone()
-    return int(row["n"]) if row else 0
-
-
-def cluster_has_species_predictions(
-    conn: sqlite3.Connection, cluster_id: int
-) -> bool:
-    """True iff at least one asset in this cluster has a species-rank
-    prediction row. Used to filter "junk drawer" clusters — clusters
-    where the species classifier bailed out and only kingdom-rank
-    scores were written — out of bulk album-sync operations. Without
-    this filter a single cluster holding 50%+ of all photos (typically
-    HDBSCAN's "cluster of last resort" for scattered kingdom-only
-    points) would dominate the sync and produce one giant album of
-    unlabeled photos.
-
-    Note: species-rank predictions live in the `predictions` table,
-    not `taxon_scores`. The kingdom stage writes to `taxon_scores`
-    with rank='kingdom'; the species stage writes top-k species to
-    `predictions` with rank='species'. The two tables have different
-    shapes (taxon_scores is one-row-per-prediction, predictions is
-    top-k with `position`). Checking `predictions` is the right
-    signal that the species stage actually ran and produced at least
-    one usable label for the cluster.
-    """
-    row = conn.execute(
-        """
-        SELECT EXISTS(
-            SELECT 1 FROM predictions p
-            JOIN assets a ON p.asset_id = a.asset_id
-            WHERE a.cluster_id = ? AND p.rank = 'species'
-        ) AS has_any
-        """,
-        (int(cluster_id),),
-    ).fetchone()
-    return bool(row["has_any"]) if row else False
 
 
 # ---------- kingdom helpers ----------------------------------------------
@@ -4780,14 +4618,16 @@ def save_bbox_clusterer_state(
     min_samples: int,
     min_score: float,
     min_area: float,
+    model_version: str | None = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO bbox_clusterer_state (
           id, n_boxes_at_fit, n_clusters, n_noise,
-          min_cluster_size, min_samples, min_score, min_area, fitted_at
+          min_cluster_size, min_samples, min_score, min_area,
+          model_version, fitted_at
         )
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(id) DO UPDATE SET
           n_boxes_at_fit   = excluded.n_boxes_at_fit,
           n_clusters       = excluded.n_clusters,
@@ -4796,6 +4636,7 @@ def save_bbox_clusterer_state(
           min_samples      = excluded.min_samples,
           min_score        = excluded.min_score,
           min_area         = excluded.min_area,
+          model_version    = excluded.model_version,
           fitted_at        = datetime('now')
         """,
         (
@@ -4806,6 +4647,7 @@ def save_bbox_clusterer_state(
             int(min_samples),
             float(min_score),
             float(min_area),
+            model_version,
         ),
     )
 
@@ -4814,7 +4656,8 @@ def get_bbox_clusterer_state(conn: sqlite3.Connection) -> dict | None:
     row = conn.execute(
         """
         SELECT n_boxes_at_fit, n_clusters, n_noise,
-               min_cluster_size, min_samples, min_score, min_area, fitted_at
+               min_cluster_size, min_samples, min_score, min_area,
+               model_version, fitted_at
         FROM bbox_clusterer_state
         WHERE id = 1
         """
@@ -4964,17 +4807,46 @@ def ensure_bbox_cluster_names(conn: sqlite3.Connection) -> dict[int, dict]:
     return names
 
 
-def _unclustered_params() -> dict:
+def _unclustered_params(conn: sqlite3.Connection) -> dict:
     """Eligibility thresholds for the virtual "Unclustered" bucket — the
-    same ones the refit applies, so the bucket is exactly the eligible
-    photos the refit left out. Lazy import: clusters imports storage."""
+    same ones (and the same embedding space) the refit applies, so the
+    bucket is exactly the eligible photos the refit left out. Lazy
+    import: clusters imports storage."""
     import clusters
 
     return {
+        "model_version": bbox_cluster_model_version(conn),
         "min_score": clusters.BBOX_CLUSTER_MIN_SCORE,
         "min_area": clusters.BBOX_CLUSTER_MIN_AREA,
         "plantae_min": clusters.CLUSTER_PLANTAE_MIN,
     }
+
+
+def dominant_bbox_model_version(conn: sqlite3.Connection) -> str | None:
+    """The bbox_embeddings model_version with the most rows (None if the
+    table is empty). The default space a box-cluster refit fits on."""
+    row = conn.execute(
+        """
+        SELECT model_version, COUNT(*) AS n
+        FROM bbox_embeddings
+        GROUP BY model_version
+        ORDER BY n DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return str(row["model_version"]) if row is not None else None
+
+
+def bbox_cluster_model_version(conn: sqlite3.Connection) -> str | None:
+    """model_version the current box clusters were fit on. Fits from
+    before the column existed fall back to the dominant version, which is
+    what the refit picked then."""
+    row = conn.execute(
+        "SELECT model_version FROM bbox_clusterer_state WHERE id = 1"
+    ).fetchone()
+    if row is not None and row["model_version"]:
+        return str(row["model_version"])
+    return dominant_bbox_model_version(conn)
 
 
 def bbox_cluster_summary(conn: sqlite3.Connection) -> dict:
@@ -5147,6 +5019,7 @@ def bbox_cluster_summary(conn: sqlite3.Connection) -> dict:
           JOIN assets a ON a.asset_id = d.asset_id
           JOIN bbox_predictions p ON p.detection_id = b.detection_id AND p.rank='species' AND p.position=0
           WHERE p.kingdom='Plantae' AND d.score >= :min_score AND (d.w * d.h) >= :min_area
+            AND b.model_version = :model_version
             AND d.asset_id NOT IN (SELECT asset_id FROM clustered)
         ),
         uncl_whole AS (
@@ -5169,7 +5042,7 @@ def bbox_cluster_summary(conn: sqlite3.Connection) -> dict:
                (SELECT asset_id FROM uncl_all ORDER BY captured_at DESC LIMIT 1) AS sample_aid
         FROM uncl_all
         """,
-        _unclustered_params(),
+        _unclustered_params(conn),
     ).fetchone()
     n_uncl = int(uncl_row["n_assets"]) if uncl_row and uncl_row["n_assets"] else 0
     unclustered = None
@@ -5270,9 +5143,10 @@ def get_bbox_cluster_items(
              AND p.rank = 'species' AND p.position = 0
             WHERE p.kingdom = 'Plantae'
               AND d.score >= :min_score AND (d.w * d.h) >= :min_area
+              AND b.model_version = :model_version
               AND d.asset_id NOT IN (SELECT asset_id FROM clustered)
             """,
-            _unclustered_params(),
+            _unclustered_params(conn),
         ).fetchall()
         box_aids_uncl = {str(r["asset_id"]) for r in rows}
         photo_rows_raw = conn.execute(
@@ -5296,7 +5170,7 @@ def get_bbox_cluster_items(
               AND (p.kingdom IS NULL OR p.kingdom = '' OR p.kingdom = 'Plantae')
               AND t.asset_id NOT IN (SELECT asset_id FROM clustered)
             """,
-            _unclustered_params(),
+            _unclustered_params(conn),
         ).fetchall()
         photo_rows = [r for r in photo_rows_raw if str(r["asset_id"]) not in box_aids_uncl]
     else:

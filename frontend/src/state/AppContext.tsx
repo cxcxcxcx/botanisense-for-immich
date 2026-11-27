@@ -83,7 +83,7 @@ export interface ModalState {
   assetId: string | null;
 }
 
-export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'cluster' | 'sync-all' | 'purge-missing' | 'person-backfill';
+export type JobKind = 'plants' | 'fungi' | 'kingdom' | 'purge-missing' | 'person-backfill';
 
 // Up to 5 sample rows from /api/assets/purge-missing, used by the
 // confirm modal so the user can spot-check filenames before purging.
@@ -107,7 +107,7 @@ export type JobPanelState =
   | { kind: 'idle' }
   | {
       kind: Exclude<JobKind, 'idle'>;
-      payload: { clusterId?: number; kingdom?: string };
+      payload: { kingdom?: string };
       state: 'confirm' | 'preview-error' | 'running' | 'done' | 'error';
       progress: JobProgress;
       jobId: string | null;
@@ -149,7 +149,7 @@ export type Action =
   | { type: 'OPEN_MODAL'; assetId: string }
   | { type: 'CLOSE_MODAL' }
   | { type: 'SET_FILTERS_COLLAPSED'; collapsed: boolean }
-  | { type: 'OPEN_JOB'; kind: Exclude<JobKind, 'idle'>; payload: { clusterId?: number; kingdom?: string } }
+  | { type: 'OPEN_JOB'; kind: Exclude<JobKind, 'idle'>; payload: { kingdom?: string } }
   | { type: 'JOB_PREVIEW_OK'; total: number; sample?: PurgeMissingSample[] }
   | { type: 'JOB_PREVIEW_ERR'; errorMsg: string }
   | { type: 'JOB_STARTED'; jobId: string; total: number }

@@ -44,7 +44,8 @@ def test_refit_bbox_clusters_and_summary(tmp_path):
         base_b = np.array([0.0, 1.0, 0.0, 0.0] + [0.0] * 12, dtype=np.float32)
 
         def add_box(asset_id: str, label: str, det_score: float, w: float, h: float,
-                    vec: np.ndarray, kingdom: str, species: str, common: str, genus: str, sp_score: float):
+                    vec: np.ndarray, kingdom: str, species: str, common: str, genus: str, sp_score: float,
+                    model_version: str = "teacher:bioclip-2"):
             cur = conn.execute(
                 "INSERT INTO detections (asset_id, label, score, x, y, w, h) VALUES (?, ?, ?, 0.1, 0.1, ?, ?)",
                 (asset_id, label, det_score, w, h),
@@ -52,8 +53,8 @@ def test_refit_bbox_clusters_and_summary(tmp_path):
             did = int(cur.lastrowid)
             v = vec / np.linalg.norm(vec)
             conn.execute(
-                "INSERT INTO bbox_embeddings (detection_id, model_version, dim, vector) VALUES (?, 'teacher:bioclip-2', ?, ?)",
-                (did, len(v), v.astype("<f4").tobytes()),
+                "INSERT INTO bbox_embeddings (detection_id, model_version, dim, vector) VALUES (?, ?, ?, ?)",
+                (did, model_version, len(v), v.astype("<f4").tobytes()),
             )
             conn.execute(
                 """
@@ -171,3 +172,95 @@ def test_refit_bbox_clusters_and_summary(tmp_path):
         assert summary["unclustered"]["n_assets"] == 1
         uncl = storage.get_bbox_cluster_items(conn, -1)
         assert [it["asset_id"] for it in uncl["items"]] == ["asset-late"]
+
+        # Embeddings from another model live in a different vector space:
+        # an eligible box encoded by another engine must not leak into the
+        # Unclustered bucket or the centroids of the teacher-fit clusters.
+        assert storage.get_bbox_clusterer_state(conn)["model_version"] == "teacher:bioclip-2"
+        cids_before, cents_before = clusters.bbox_cluster_centroids(conn)
+        storage.upsert_asset(
+            conn, asset_id="asset-other-mv", original_file_name="other.jpg",
+            original_url="/a/o", thumbnail_url="/t/o", captured_at="2026-05-12T12:00:00Z",
+        )
+        did = add_box("asset-other-mv", "flower", 0.85, 0.25, 0.25, base_b, "Plantae",
+                      "Acer palmatum", "Japanese maple", "Acer", 0.88, model_version="mobile-v0")
+        conn.execute(
+            "INSERT INTO bbox_clusters (detection_id, cluster_id) VALUES (?, ?)",
+            (did, cids_before[0]),
+        )
+        summary = storage.bbox_cluster_summary(conn)
+        assert summary["unclustered"]["n_assets"] == 1
+        cids_after, cents_after = clusters.bbox_cluster_centroids(conn)
+        assert cids_after == cids_before
+        np.testing.assert_allclose(cents_after, cents_before)
+
+
+def test_bbox_clusterer_state_model_version_migration(tmp_path):
+    """A DB created before bbox_clusterer_state.model_version existed gets
+    the column on init; an old fit row reads back NULL and the effective
+    version falls back to the dominant bbox_embeddings one."""
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    storage.init_db(db)
+    with sqlite3.connect(db) as raw:
+        raw.execute("DROP TABLE bbox_clusterer_state")
+        raw.execute(
+            """
+            CREATE TABLE bbox_clusterer_state (
+              id INTEGER PRIMARY KEY CHECK (id = 1),
+              n_boxes_at_fit INTEGER NOT NULL, n_clusters INTEGER NOT NULL,
+              n_noise INTEGER NOT NULL, min_cluster_size INTEGER NOT NULL,
+              min_samples INTEGER NOT NULL, min_score REAL NOT NULL,
+              min_area REAL NOT NULL,
+              fitted_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+            """
+        )
+        raw.execute(
+            "INSERT INTO bbox_clusterer_state VALUES (1, 3, 1, 0, 3, 2, 0.3, 0.01, datetime('now'))"
+        )
+    storage.init_db(db)
+    with storage.connect(db) as conn:
+        assert storage.get_bbox_clusterer_state(conn)["model_version"] is None
+        assert storage.bbox_cluster_model_version(conn) is None
+        storage.upsert_asset(conn, asset_id="a", original_file_name="a.jpg",
+                             original_url="/a/a", thumbnail_url="/t/a")
+        cur = conn.execute(
+            "INSERT INTO detections (asset_id, label, score, x, y, w, h) VALUES ('a', 'flower', 0.9, 0, 0, 0.5, 0.5)"
+        )
+        conn.execute(
+            "INSERT INTO bbox_embeddings (detection_id, model_version, dim, vector) VALUES (?, 'teacher:bioclip-2', 16, ?)",
+            (int(cur.lastrowid), _unit([1.0])),
+        )
+        assert storage.bbox_cluster_model_version(conn) == "teacher:bioclip-2"
+
+
+def test_refit_runs_in_child_process(tmp_path, monkeypatch):
+    """POST /api/bbox-clusters/refit spawns bbox_cluster_worker as a child
+    process (not a uvicorn thread) and the job registry picks up its
+    result. Too few boxes to cluster → the n<min_cluster_size early return,
+    which still writes the fit state."""
+    import asyncio
+    import sys
+
+    db = tmp_path / "state.db"
+    monkeypatch.setenv("DB_PATH", str(db))
+    for mod in ("app", "storage"):
+        sys.modules.pop(mod, None)
+    import app
+    import storage as st
+
+    st.init_db(db)
+    resp = asyncio.run(app.start_bbox_clustering_refit(None))
+    with app._bbox_clustering_jobs_lock:
+        assert app._bbox_clustering_jobs[resp["job_id"]]["status"] == "running"
+    for t in list(__import__("threading").enumerate()):
+        if t.name.startswith("bbox-cluster-refit-"):
+            t.join(timeout=60)
+    status = asyncio.run(app.bbox_clustering_status())
+    assert status["running"] is False
+    assert status["latest_job"]["status"] == "done", status["latest_job"]
+    assert status["latest_job"]["n_clusters"] == 0
+    assert status["fitted"] is True
+    assert not list(tmp_path.glob("bbox_refit_*.json"))

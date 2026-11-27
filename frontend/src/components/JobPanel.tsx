@@ -2,14 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import {
   pollPersonBackfillJob,
   previewKingdomAlbum,
-  previewClusterAlbum,
   previewPersonBackfill,
   previewPurgeMissing,
   purgeMissing,
   startPersonBackfill,
   startKingdomAlbum,
-  startClusterAlbumSync,
-  startSyncAllClusterAlbums,
   stopPersonBackfill,
 } from '../api/endpoints';
 import type { PersonBackfillJobSnapshot } from '../api/endpoints';
@@ -17,7 +14,7 @@ import type { JobSnapshot, PurgeMissingPreview, PurgeMissingResult } from '../ap
 
 // Compact human label for the optional membership filter. Mirrors
 // the ImmichSync component's PEOPLE_LABELS so the legacy JobPanel
-// (driven by ClusterAlbumBar's per-cluster pill, purge-missing, etc.)
+// (purge-missing, person-backfill, etc.)
 // shows the same scope the new Run-page UI uses. Returns '' when no
 // filter is set, so existing call sites that don't carry the field
 // render unchanged.
@@ -61,7 +58,7 @@ interface JobConfig {
   extractProgress: (snap: JobSnapshot) => { added: number; total: number };
 }
 
-function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'idle'>, JobConfig> {
+function buildConfigs(): Record<Exclude<JobKind, 'idle'>, JobConfig> {
   return {
     plants: {
       title: () => 'Tag as Plants album',
@@ -98,44 +95,6 @@ function buildConfigs(clusterId: number | undefined): Record<Exclude<JobKind, 'i
       preview: () => previewKingdomAlbum('Plantae'),
       start: () => startKingdomAlbum('Plantae', {}),
       extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
-    },
-    cluster: {
-      title: () => `Sync cluster #${clusterId ?? '?'} as album`,
-      confirmText: n => `Sync every photo in cluster #${clusterId} (${n.toLocaleString()}) as an Immich album?`,
-      runningText: (added, total) => `Adding ${added.toLocaleString()} / ${total.toLocaleString()} photos…`,
-      doneSubject: () => 'photos added to cluster album',
-      hasPreview: true,
-      hasAlbumLink: true,
-      registryKey: 'cluster_album_jobs',
-      preview: () => {
-        if (clusterId == null) return Promise.resolve({ n_assets: 0 });
-        return previewClusterAlbum(clusterId);
-      },
-      start: () => {
-        if (clusterId == null) return Promise.reject(new Error('no cluster id'));
-        return startClusterAlbumSync(clusterId);
-      },
-      extractProgress: snap => ({ added: (snap.n_added as number | undefined) ?? 0, total: (snap.n_assets as number | undefined) ?? 0 }),
-    },
-    'sync-all': {
-      title: () => 'Sync all clusters as albums',
-      confirmText: () => 'Create one Immich album per cluster and add every photo?',
-      // Progress tracks clusters (the unit of work the user clicked on),
-      // not photos — one cluster can hold 10k+ photos which made the
-      // photo-count bar look frozen at 0% until the very last cluster.
-      // Junk-drawer clusters (no species-rank scores) are filtered out
-      // server-side, so n_clusters here is the post-filter count.
-      runningText: (done, total) => `Syncing cluster ${done.toLocaleString()} of ${total.toLocaleString()}…`,
-      doneSubject: () => 'clusters synced',
-      hasPreview: false,
-      hasAlbumLink: false,
-      registryKey: 'cluster_album_jobs',
-      preview: () => Promise.reject(new Error('no preview')),
-      start: () => startSyncAllClusterAlbums(),
-      extractProgress: snap => ({
-        added: (snap.clusters_done as number | undefined) ?? 0,
-        total: (snap.n_clusters as number | undefined) ?? 0,
-      }),
     },
     'purge-missing': {
       title: () => 'Purge assets deleted from Immich',
@@ -207,7 +166,7 @@ export function JobPanel() {
   const activeCfg =
     job.kind === 'idle'
       ? null
-      : buildConfigs(job.payload.clusterId)[job.kind];
+      : buildConfigs()[job.kind];
   const sseRegistryKey: JobRegistryKey | null =
     activeCfg && !activeCfg.isSync && !activeCfg.poll
       ? activeCfg.registryKey
@@ -228,7 +187,7 @@ export function JobPanel() {
   const jobRunKey =
     job.kind === 'idle'
       ? ''
-      : `${job.kind}:${job.state}:${job.jobId ?? ''}:${job.payload.clusterId ?? ''}:${job.payload.kingdom ?? ''}`;
+      : `${job.kind}:${job.state}:${job.jobId ?? ''}:${job.payload.kingdom ?? ''}`;
 
   // When the panel enters the confirm state, kick off the preview (if any).
   // Guarded by a signature ref: JOB_PREVIEW_OK replaces the job object
@@ -240,7 +199,7 @@ export function JobPanel() {
     if (job.kind === 'idle') return;
     const activeJob = job;
     if (activeJob.state !== 'confirm') return;
-    const cfg = buildConfigs(activeJob.payload.clusterId)[activeJob.kind];
+    const cfg = buildConfigs()[activeJob.kind];
     if (!cfg.hasPreview) return;
     const sig = `${activeJob.kind}:${JSON.stringify(activeJob.payload)}`;
     if (previewedForRef.current === sig) return;
@@ -271,7 +230,7 @@ export function JobPanel() {
     if (job.kind === 'idle') return;
     const activeJob = job;
     if (activeJob.state !== 'running' || !activeJob.jobId) return;
-    const cfg = buildConfigs(activeJob.payload.clusterId)[activeJob.kind];
+    const cfg = buildConfigs()[activeJob.kind];
     // Sync jobs complete in start() — nothing to poll.
     if (cfg.isSync) return;
     const jobId = activeJob.jobId;
@@ -324,7 +283,7 @@ export function JobPanel() {
       };
     }
 
-    // ---- SSE branch (plants / kingdom / cluster / sync-all) -----------
+    // ---- SSE branch (plants / fungi / kingdom) ------------------------
     // Handled by the streamJob-driven effect below — no imperative
     // loop needed.
     return undefined;
@@ -382,7 +341,7 @@ export function JobPanel() {
   if (job.kind === 'idle') return null;
   const active = job;
 
-  const cfg = buildConfigs(active.payload.clusterId)[active.kind];
+  const cfg = buildConfigs()[active.kind];
 
   const start = async () => {
     try {
@@ -486,9 +445,7 @@ export function JobPanel() {
               {/* Show the membership scope next to the running text when
                   the server stored one. For ImmichSync-driven jobs the
                   scope is already visible in its inline progress, so
-                  this is mostly cosmetic — but it does help when the
-                  legacy ClusterAlbumBar triggers a per-cluster sync
-                  with a non-default people_filter. */}
+                  this is mostly cosmetic. */}
               {streamJob && peopleLabel(streamJob.people_filter) && (
                 <small className="text-fg-1 ml-2">
                   ({peopleLabel(streamJob.people_filter)})

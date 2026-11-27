@@ -206,35 +206,10 @@ export const startKingdomAlbum = (
 ) =>
   fetchJson<JobStart>('/api/album/kingdom', { method: 'POST', body: { kingdom, ...p } });
 
-// ---- Cluster album jobs (per-cluster + sync-all) -----------------------
+// ---- Cluster album cleanup (sync was removed) -------------------------
 
-export const previewClusterAlbum = (
-  cluster_id: number,
-  people_filter?: 0 | 1 | null,
-) =>
-  fetchJson<JobPreview>(`/api/album/cluster/${cluster_id}/preview`, {
-    query: { people_filter: people_filter ?? undefined },
-  });
-
-export const startClusterAlbumSync = (
-  cluster_id: number,
-  p: { force_recreate?: boolean; people_filter?: 0 | 1 | null } = {},
-) =>
-  fetchJson<JobStart>(`/api/album/cluster/${cluster_id}/sync`, {
-    method: 'POST',
-    body: p,
-  });
-
-export const startSyncAllClusterAlbums = (
-  p: { force_recreate?: boolean; people_filter?: 0 | 1 | null } = {},
-) =>
-  fetchJson<JobStart>('/api/album/cluster/sync-all', {
-    method: 'POST',
-    body: p,
-  });
-
-// Always deletes the Immich album too (cluster sync is beta, policy
-// is "never leave orphans"). If the Immich album is already gone
+// Always deletes the Immich album too (policy is "never leave
+// orphans"). If the Immich album is already gone
 // (404), `remote_deleted=false` is returned and treated as success.
 export const deleteClusterAlbum = (cluster_id: number) =>
   fetchJson<{ deleted: boolean; remote_deleted: boolean }>(
@@ -251,16 +226,6 @@ export const removeClusterAlbums = (p: BulkClusterRemoveParams) =>
     method: 'POST',
     body: p,
   });
-
-// Undo the last bulk-remove by re-inserting the snapshot the frontend
-// captured before the call. The Immich albums themselves are NOT
-// recreated (those were DELETEd server-side); only the local
-// mapping comes back. The user has to re-sync for actual albums.
-export const undoBulkRemoveClusterAlbums = (rows: ClusterAlbumMapping[]) =>
-  fetchJson<{ restored: number; skipped: number }>(
-    '/api/album/cluster/undo-remove',
-    { method: 'POST', body: { rows } },
-  );
 
 // Multi-select batch action (UX-17). Sets plantae_override on every
 // asset_id in one round-trip; value=null clears the override.

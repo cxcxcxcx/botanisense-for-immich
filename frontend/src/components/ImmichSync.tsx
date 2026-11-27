@@ -1,6 +1,7 @@
-// "Sync to IMMICH" section on the Run page. Four actions (Sync
-// clusters all / Sync Plantae / Sync Fungi / Remove synced clusters)
-// each openable from a button. Defaults (people_filter per action +
+// "Sync to IMMICH" section on the Run page. Three actions (Sync
+// Plantae / Sync Fungi / Remove synced clusters — the last only while
+// cluster albums from an older version remain) each openable from a
+// button. Defaults (people_filter per action +
 // min_score per kingdom) are persisted server-side via
 // GET/PUT /api/settings/sync-defaults and pre-fill the per-action
 // confirm modals.
@@ -11,8 +12,8 @@
 //
 // Progress is shown inline under each button so multiple actions can
 // run concurrently without a shared JobPanel competing for the same
-// DOM. The legacy JobPanel still serves the per-cluster pill sync
-// (cluster kind) and the unrelated purge / person-backfill flows.
+// DOM. The legacy JobPanel still serves the unrelated purge /
+// person-backfill flows.
 
 import { useCallback, useEffect, useState } from 'react';
 import {
@@ -20,7 +21,6 @@ import {
   putSyncDefaults,
   previewKingdomAlbum,
   listClusterAlbums,
-  startSyncAllClusterAlbums,
   startKingdomAlbum,
   removeClusterAlbums,
 } from '../api/endpoints';
@@ -30,8 +30,6 @@ import { useEventStream } from '../hooks/useEventStream';
 import type { EventSnapshot, JobSnapshot } from '../api/types';
 import { useToasts } from './ToastProvider';
 import { Modal } from './Modal';
-import { undoBulkRemoveClusterAlbums } from '../api/endpoints';
-import type { ClusterAlbumMapping } from '../api/types';
 
 // ---------- people-filter chip group ---------------------------------------
 // Per the mock: each rule row has a 3-button segmented control
@@ -74,7 +72,7 @@ function PeopleFilterChips({
 }
 
 // ---------- per-action progress slot --------------------------------------
-// Each of the four buttons can be in one of these states:
+// Each of the three buttons can be in one of these states:
 //   idle  — no job has run yet / last job settled
 //   running — a job_id is in flight; the inline progress bar shows
 //   done  — terminal success; render the album link inline
@@ -100,10 +98,9 @@ function emptySlot(): ActionSlot {
 // Per-action identifier. Each maps to a registry key in the SSE
 // snapshot so we can read the live progress without an extra REST
 // poll loop.
-type ActionKey = 'sync-all' | 'plantae' | 'fungi' | 'remove';
+type ActionKey = 'plantae' | 'fungi' | 'remove';
 
-function registryFor(action: ActionKey): 'cluster_album_jobs' | 'kingdom_jobs' | null {
-  if (action === 'sync-all') return 'cluster_album_jobs';
+function registryFor(action: ActionKey): 'kingdom_jobs' | null {
   // Plantae and Fungi both run through the kingdom job registry; the
   // old dedicated plants registry was removed in the merge.
   if (action === 'plantae' || action === 'fungi') return 'kingdom_jobs';
@@ -114,19 +111,7 @@ function registryFor(action: ActionKey): 'cluster_album_jobs' | 'kingdom_jobs' |
 // straight through. For the bulk remove action we don't get a
 // job_id, so the slot stays synchronous.
 
-function progressFromSnap(
-  action: ActionKey,
-  snap: JobSnapshot,
-): { added: number; total: number } {
-  if (action === 'sync-all') {
-    // Cluster-level progress (matches JobPanel's extractProgress). The
-    // server filters junk-drawer clusters out before computing totals,
-    // so n_clusters here is the post-filter count.
-    return {
-      added: (snap.clusters_done as number | undefined) ?? 0,
-      total: (snap.n_clusters as number | undefined) ?? 0,
-    };
-  }
+function progressFromSnap(snap: JobSnapshot): { added: number; total: number } {
   return {
     added: (snap.n_added as number | undefined) ?? 0,
     total: (snap.n_assets as number | undefined) ?? 0,
@@ -140,7 +125,7 @@ export function ImmichSync() {
   const stored = useSyncDefaults();
   const push = useToasts();
 
-  // Live SSE snapshot — used to drive progress for the three async
+  // Live SSE snapshot — used to drive progress for the two async
   // actions. We only pull the registries we care about; the rest of the
   // payload is irrelevant to this component.
   const { data: snap } = useEventStream<EventSnapshot>('/api/events');
@@ -192,7 +177,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     if (stored && !defaultsDirty) setDraft(stored);
   }, [stored, defaultsDirty]);
 
-  const updateSlot = (slot: 'plants' | 'fungi' | 'clusters' | 'sync_all', patch: Partial<{ people_filter: PeopleFilter; min_score: number }>) => {
+  const updateSlot = (slot: 'plants' | 'fungi', patch: Partial<{ people_filter: PeopleFilter; min_score: number }>) => {
     setDraft(d => {
       if (!d) return d;
       const next: SyncDefaults = {
@@ -222,28 +207,27 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
 
   // ---- per-action slots ------------------------------------------------
   const [slots, setSlots] = useState<Record<ActionKey, ActionSlot>>({
-    'sync-all': emptySlot(),
     plantae: emptySlot(),
     fungi: emptySlot(),
     remove: emptySlot(),
   });
 
   // Drive each async slot's progress from the SSE snapshot. We can't
-  // do this with useEffect-per-slot because three subscriptions would
+  // do this with useEffect-per-slot because one subscription per slot would
   // each re-render the whole component; instead walk the slots here.
   useEffect(() => {
     if (!snap) return;
     setSlots(prev => {
       let changed = false;
       const next = { ...prev };
-      (['sync-all', 'plantae', 'fungi'] as ActionKey[]).forEach(action => {
+      (['plantae', 'fungi'] as ActionKey[]).forEach(action => {
         const slot = next[action];
         if (slot.status !== 'running' || !slot.jobId) return;
         const reg = registryFor(action);
         if (!reg) return;
         const serverJob = snap[reg]?.[slot.jobId];
         if (!serverJob) return;
-        const { added, total } = progressFromSnap(action, serverJob);
+        const { added, total } = progressFromSnap(serverJob);
         if (serverJob.status === 'done') {
           next[action] = {
             ...slot,
@@ -273,7 +257,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
   }, [snap]);
 
   // ---- confirm modals --------------------------------------------------
-  // A single modal re-used for the four actions; `modalFor` selects
+  // A single modal re-used for the three actions; `modalFor` selects
   // which action the modal is currently showing. Keeps the JSX small
   // and lets the per-action preview logic live in one place.
   const [modalFor, setModalFor] = useState<ActionKey | null>(null);
@@ -299,19 +283,18 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     refreshSyncedCount();
   }, []);
 
-  // Reload after a sync-all or remove settles (slot status flip).
+  // Reload after a remove settles (slot status flip).
   useEffect(() => {
-    if (slots['sync-all'].status === 'done' || slots.remove.status === 'done') {
+    if (slots.remove.status === 'done') {
       refreshSyncedCount();
     }
-  }, [slots['sync-all'].status, slots.remove.status]);
+  }, [slots.remove.status]);
 
   const openModal = (action: ActionKey) => {
     if (!draft) return;
     // Pull the per-action default. Branch on action explicitly so the
-    // TypeScript narrowing sees only the matching shape — SyncDefaults
-    // distinguishes kingdom slots (with min_score) from cluster slots
-    // (without).
+    // TypeScript narrowing sees only the matching shape. Remove has no
+    // membership or score options.
     let defaultPeople: PeopleFilter = null;
     let defaultScore = 0.6;
     if (action === 'plantae') {
@@ -320,10 +303,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     } else if (action === 'fungi') {
       defaultPeople = (draft.fungi.people_filter ?? null) as PeopleFilter;
       defaultScore = draft.fungi.min_score ?? 0.6;
-    } else if (action === 'sync-all') {
-      defaultPeople = (draft.sync_all.people_filter ?? null) as PeopleFilter;
-    } else {
-      defaultPeople = (draft.clusters.people_filter ?? null) as PeopleFilter;
     }
     setOverridePeople(defaultPeople);
     setOverrideScore(defaultScore);
@@ -344,10 +323,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     setPreviewing(true);
     try {
       let n = 0;
-      if (action === 'sync-all') {
-        const r = await previewSyncAllClusters(pf);
-        n = r.n_assets;
-      } else if (action === 'plantae') {
+      if (action === 'plantae') {
         const r = await previewKingdomAlbum('Plantae', score, pf);
         n = r.n_assets;
       } else if (action === 'fungi') {
@@ -386,19 +362,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
     const action = modalFor;
     closeModal();
     try {
-      if (action === 'sync-all') {
-        const r = await startSyncAllClusterAlbums({
-          force_recreate: overrideForce,
-          people_filter: overridePeople,
-        });
-        setSlots(s => ({ ...s, 'sync-all': {
-          ...emptySlot(),
-          jobId: r.job_id,
-          status: 'running',
-          total: r.n_assets ?? 0,
-        }}));
-        push({ kind: 'info', message: `Syncing all clusters (${(r.n_assets ?? 0).toLocaleString()} photos)` }, 2500);
-      } else if (action === 'plantae') {
+      if (action === 'plantae') {
         const r = await startKingdomAlbum('Plantae', {
           min_score: overrideScore,
           force_recreate: overrideForce,
@@ -426,23 +390,8 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         push({ kind: 'info', message: `Syncing Fungi photos` }, 2000);
       } else if (action === 'remove') {
         setSlots(s => ({ ...s, remove: { ...s.remove, status: 'running' } }));
-        // Cluster sync is beta; policy is "never leave orphans" — the
-        // Immich albums are always DELETEd alongside the local mapping.
-        // You can always re-sync to recreate them with the same
-        // `#BotaniSense` hashtag in the title.
-        //
-        // UX-14: capture the mappings BEFORE remove so we can offer
-        // an Undo in the success toast. The undo path restores the
-        // local mapping only — the Immich albums are gone — so the
-        // user has to re-sync for actual albums.
-        let snapshot: ClusterAlbumMapping[] = [];
-        try {
-          const before = await listClusterAlbums();
-          snapshot = before.albums;
-        } catch {
-          // non-fatal — undo just won't be offered if we couldn't
-          // read the pre-remove state.
-        }
+        // Policy is "never leave orphans" — the Immich albums are
+        // always DELETEd alongside the local mapping.
         const r = await removeClusterAlbums({ cluster_ids: null });
         setSlots(s => ({ ...s, remove: {
           ...emptySlot(),
@@ -458,29 +407,6 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
             kind: 'error',
             message: `Removed ${r.removed} (${r.errors.length} failed)`,
           }, 4000);
-        } else if (r.removed > 0 && snapshot.length > 0) {
-          push({
-            kind: 'success',
-            message: `Removed ${r.removed} cluster album mapping${r.removed === 1 ? '' : 's'}.`,
-            action: {
-              label: 'Undo',
-              onClick: async () => {
-                try {
-                  const res = await undoBulkRemoveClusterAlbums(snapshot);
-                  push({
-                    kind: 'info',
-                    message: `Restored ${res.restored} mapping${res.restored === 1 ? '' : 's'} (re-sync to recreate albums)`,
-                  }, 3000);
-                  refreshSyncedCount();
-                } catch (e) {
-                  push({
-                    kind: 'error',
-                    message: e instanceof Error ? e.message : String(e),
-                  }, 4000);
-                }
-              },
-            },
-          }, 8000);
         } else {
           push({ kind: 'success', message: `Removed ${r.removed} cluster album(s)` }, 3000);
         }
@@ -576,9 +502,9 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
         <button type="button" className={buttonCls} onClick={() => openModal('fungi')} disabled={!draft}>
           Sync Fungi photos
         </button>
-        {/* Cluster → album sync was removed from the UI (cluster IDs
-            aren't stable across refits, so synced albums drifted). Keep
-            the cleanup button while legacy cluster albums still exist. */}
+        {/* Cluster → album sync was removed (its album names and members
+            came from different clusterings). Keep the cleanup button
+            while cluster albums from an older version still exist. */}
         {!!syncedClusterCount && (
           <button
             type="button"
@@ -593,7 +519,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
       </div>
 
       {/* Inline progress rows — one per async action. Remove shows
-          its result inline too (synchronous), so we render all four. */}
+          its result inline too (synchronous). */}
       <ActionProgress
         label={slots.plantae.status === 'done' ? '✓ Plantae synced' : 'Plantae'}
         slot={slots.plantae}
@@ -639,8 +565,7 @@ const [defaultsOpen, setDefaultsOpen] = useState(true);
 // ---------- SlotRow: one rule in the Defaults panel ----------------------
 // Per the mock: each rule is laid out as two stacked rows.
 //   • Top row: rule label on the left, "score ≥" threshold on the right.
-//     Only the Plantae / Fungi rules have a score; clusters / sync-all
-//     just have the people filter.
+//     Only rules with showScore render the score input.
 //   • Bottom row: full-width segmented chip group (Any / Without people
 //     / With people).
 
@@ -704,7 +629,7 @@ function ActionProgress({ label, slot }: { label: string; slot: ActionSlot }) {
 }
 
 // ---------- ConfirmModal: per-action confirm dialog ---------------------
-// Shown when the user clicks any of the four action buttons. Pre-fills
+// Shown when the user clicks any of the action buttons. Pre-fills
 // from the persisted defaults; user can tweak for this single run.
 
 function ConfirmModal(props: {
@@ -731,7 +656,6 @@ function ConfirmModal(props: {
   } = props;
 
   const titles: Record<ActionKey, string> = {
-    'sync-all': 'Sync clusters (all)',
     plantae: 'Sync Plantae photos',
     fungi: 'Sync Fungi photos',
     remove: 'Remove synced clusters',
@@ -751,9 +675,9 @@ function ConfirmModal(props: {
                 : `Delete ${syncedClusterCount} cluster album${syncedClusterCount === 1 ? '' : 's'} from Immich and drop the local mapping${syncedClusterCount === 1 ? '' : 's'}.`}
             </p>
             <p className="m-0 text-fg-1 text-[0.8rem]">
-              Beta behavior: cluster sync always deletes the matching
-              Immich album (no orphan option). You can re-sync to recreate
-              the albums with the <code>#BotaniSense</code> hashtag.
+              These albums were created by an older version's cluster
+              sync, which has been removed. The matching Immich albums
+              are always deleted (no orphan option).
             </p>
           </>
         ) : (
@@ -816,26 +740,7 @@ function ConfirmModal(props: {
   );
 }
 
-// previewSyncAllClusters — wraps /api/album/cluster/sync-all's
-// preview. The backend endpoint for sync-all currently doesn't have a
-// dedicated preview; we use the per-cluster count sum via the existing
-// list_cluster_albums + count_assets_in_cluster round-trips. To keep
-// this component dependency-light we just call listClusterAlbums for
-// the cluster count badge and skip the deeper preview for sync-all —
-// the user will see the actual numbers in the JobPanel anyway.
-//
-// Implemented here rather than in endpoints.ts to keep the change
-// small; if sync-all preview is needed in another caller, promote it.
-async function previewSyncAllClusters(_pf: PeopleFilter): Promise<{ n_assets: number }> {
-  // The sync-all endpoint has no preview; we approximate by reading
-  // list_cluster_albums and summing the stored n_assets. That's not
-  // exact (it reflects the LAST sync, not the current picker's
-  // people_filter), but it's a reasonable "before" picture. The
-  // worker reports the real number as it goes.
-  const r = await listClusterAlbums();
-  const n = r.albums.reduce((s, a) => s + (a.n_assets ?? 0), 0);
-  return { n_assets: n };
-}
+
 // One-line "where the server points" indicator with the edit path for
 // an already-configured install. Reads the config cached in the
 // reducer (fetched at App mount, refreshed after the form saves).

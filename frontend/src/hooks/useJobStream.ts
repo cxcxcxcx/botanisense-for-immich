@@ -7,7 +7,6 @@ import { useEventStream } from './useEventStream';
 import type { EventSnapshot, JobSnapshot } from '../api/types';
 
 export type JobRegistryKey =
-  | 'cluster_album_jobs'
   | 'kingdom_jobs'
   | 'clustering_jobs'
   | 'knn_build_jobs'

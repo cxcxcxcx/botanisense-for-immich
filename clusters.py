@@ -1038,16 +1038,7 @@ def refit_bbox_clusters(
          centroid sim >= 0.89 (pure visual) / >= 0.85 (taxon-compatible).
     """
     if model_version is None:
-        mv_row = conn.execute(
-            """
-            SELECT model_version, COUNT(*) AS n
-            FROM bbox_embeddings
-            GROUP BY model_version
-            ORDER BY n DESC
-            LIMIT 1
-            """
-        ).fetchone()
-        model_version = str(mv_row["model_version"]) if mv_row is not None else None
+        model_version = storage.dominant_bbox_model_version(conn)
 
     # Each point is ("box", detection_id, asset_id) or ("photo", asset_id, asset_id).
     entries: list[tuple[str, int | str, str]] = []
@@ -1138,6 +1129,7 @@ def refit_bbox_clusters(
             min_samples=ms,
             min_score=min_score,
             min_area=min_area,
+            model_version=model_version,
         )
         return {
             "n_boxes_at_fit": n,
@@ -1222,6 +1214,7 @@ def refit_bbox_clusters(
         min_samples=ms,
         min_score=min_score,
         min_area=min_area,
+        model_version=model_version,
     )
     names = storage.compute_bbox_cluster_names(conn)
     storage.save_bbox_cluster_names(conn, names)
@@ -1257,7 +1250,9 @@ def bbox_cluster_centroids(conn: sqlite3.Connection) -> tuple[list[int], "np.nda
         SELECT bc.cluster_id, b.vector, b.dim
         FROM bbox_clusters bc
         JOIN bbox_embeddings b ON b.detection_id = bc.detection_id
-        """
+        WHERE b.model_version = ?
+        """,
+        (storage.bbox_cluster_model_version(conn),),
     ).fetchall()
     photo_rows = conn.execute(
         """

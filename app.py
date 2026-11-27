@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -1589,35 +1590,38 @@ class BboxClusteringRefitParams(BaseModel):
     min_assets_per_cluster: int = clusters.BBOX_CLUSTER_MIN_ASSETS
 
 
-def _bbox_clustering_refit_worker(job_id: str, params: BboxClusteringRefitParams) -> None:
+def _bbox_clustering_refit_worker(job_id: str, proc: subprocess.Popen, result_path: Path) -> None:
+    """Daemon thread: wait for the refit child (bbox_cluster_worker), then
+    fold its result file into the job registry. The refit itself runs in
+    that child so its FAISS/HDBSCAN working set dies with the process
+    instead of staying resident in uvicorn."""
+    rc = proc.wait()
     try:
-        with storage.connect(DB_PATH) as conn:
-            res = clusters.refit_bbox_clusters(
-                conn,
-                min_cluster_size=params.min_cluster_size,
-                min_samples=params.min_samples,
-                min_score=params.min_score,
-                min_area=params.min_area,
-                min_assets_per_cluster=params.min_assets_per_cluster,
-            )
+        out = json.loads(result_path.read_text())
+    except (OSError, ValueError):
+        out = {"ok": False, "error": f"refit worker exited {rc} without a result"}
+    finally:
+        result_path.unlink(missing_ok=True)
+    if rc == 0 and out.get("ok"):
         _invalidate_bbox_clusters_cache()
-        with _bbox_clustering_jobs_lock:
-            j = _bbox_clustering_jobs.get(job_id)
-            if j is not None:
-                j["status"] = "done"
-                j["n_clusters"] = res["n_clusters"]
-                j["n_boxes"] = res["n_boxes_at_fit"]
-                j["n_clustered"] = res["n_clustered"]
-                j["n_noise"] = res["n_noise"]
-                j["finished_at"] = time.monotonic()
-    except Exception as e:
-        _log.exception("[bbox-clusters] refit failed")
-        with _bbox_clustering_jobs_lock:
-            j = _bbox_clustering_jobs.get(job_id)
-            if j is not None:
-                j["status"] = "error"
-                j["error"] = f"{type(e).__name__}: {e}"
-                j["finished_at"] = time.monotonic()
+    elif out.get("ok"):
+        out = {"ok": False, "error": f"refit worker exited {rc}"}
+    with _bbox_clustering_jobs_lock:
+        j = _bbox_clustering_jobs.get(job_id)
+        if j is None:
+            return
+        j["finished_at"] = time.monotonic()
+        if out.get("ok"):
+            res = out["result"]
+            j["status"] = "done"
+            j["n_clusters"] = res["n_clusters"]
+            j["n_boxes"] = res["n_boxes_at_fit"]
+            j["n_clustered"] = res["n_clustered"]
+            j["n_noise"] = res["n_noise"]
+        else:
+            _log.error("[bbox-clusters] refit failed: %s", out.get("error"))
+            j["status"] = "error"
+            j["error"] = out.get("error")
 
 
 @app.get("/api/bbox-clusters")
@@ -1689,6 +1693,24 @@ async def start_bbox_clustering_refit(params: BboxClusteringRefitParams | None =
         if any(j.get("status") == "running" for j in _bbox_clustering_jobs.values()):
             raise HTTPException(status_code=409, detail="box clustering refit already running")
         job_id = uuid.uuid4().hex
+        result_path = Path(DB_PATH).parent / f"bbox_refit_{job_id}.json"
+        # Spawn under the lock (as /api/run does) so two clicks can't both
+        # register; Popen is a few-ms fork/exec.
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "bbox_cluster_worker"],
+            cwd=Path(__file__).parent,
+            env={
+                **os.environ,
+                "BBOX_CLUSTER_WORKER_ARGS": json.dumps({
+                    "db_path": DB_PATH,
+                    "result_path": str(result_path),
+                    "params": p.model_dump(),
+                }),
+                "MKL_DYNAMIC": "FALSE",
+                "MKL_NUM_THREADS": str(min(8, os.cpu_count() or 8)),
+                "OMP_NUM_THREADS": str(min(8, os.cpu_count() or 8)),
+            },
+        )
         _bbox_clustering_jobs[job_id] = {
             "status": "running",
             "started_at": time.monotonic(),
@@ -1699,9 +1721,10 @@ async def start_bbox_clustering_refit(params: BboxClusteringRefitParams | None =
             "n_noise": None,
             "error": None,
         }
+    _log.info("[bbox-clusters] refit child started pid=%d", proc.pid)
     threading.Thread(
         target=_bbox_clustering_refit_worker,
-        args=(job_id, p),
+        args=(job_id, proc, result_path),
         daemon=True,
         name=f"bbox-cluster-refit-{job_id[:8]}",
     ).start()
@@ -2053,7 +2076,6 @@ async def logs(tail: int = Query(default=200, ge=1, le=5000)) -> dict:
 # Payload shape (one JSON object per `data:` line):
 #   {
 #     "pipeline":           {status, stage, chunk_idx, ...},   # pipeline.get_state()
-#     "cluster_album_jobs": {job_id: {...}, ...},
 #     "kingdom_jobs":       {job_id: {...}, ...},
 #     "clustering_jobs":    {job_id: {...}, ...},
 #     "knn_build_jobs":     {job_id: {...}, ...},
@@ -2151,9 +2173,6 @@ def _build_event_snapshot() -> dict:
             pipeline_state = last if last is not None else get_state()
     return {
         "pipeline": pipeline_state,
-        "cluster_album_jobs": _snapshot_jobs(
-            _cluster_album_jobs, _cluster_album_jobs_lock
-        ),
         "kingdom_jobs": _snapshot_jobs(_kingdom_jobs, _kingdom_jobs_lock),
         "clustering_jobs": _snapshot_jobs(
             _clustering_jobs, _clustering_jobs_lock
@@ -3460,20 +3479,15 @@ def run_knn_reclassify_sync(asset_ids: list[str], k: int, force: bool = False) -
 
 
 # ============================================================
-# Per-cluster album sync + kingdom generalization
+# Cluster album cleanup + kingdom albums + clustering refit
 # ============================================================
 #
-# This block adds three features on top of the Plants-album flow:
-#
-# 1. **Per-cluster album sync.** The server maintains a cluster_id ->
-#    Immich album mapping (`cluster_albums` table). A click on
-#    "Sync this cluster as album" creates (or reuses) the album and
-#    bulk-adds the cluster's assets. The mapping survives refits
-#    because cluster_ids are now stable (clusters.refit_with_remap).
+# 1. **Cluster album cleanup.** Only remove/list remain for albums an
+#    older version synced; see the block comment further down.
 #
 # 2. **Clustering refit.** A "Force refit" endpoint kicks off a full
-#    HDBSCAN refit + Hungarian remap in a background thread, so the UI
-#    doesn't block. Status endpoint reports last-refit time + growth %.
+#    refit in the background, so the UI doesn't block. Status endpoint
+#    reports last-refit time + growth %.
 #
 # 3. **Kingdom generalization.** "Tag a kingdom as an album" works for
 #    any kingdom (Plantae, Fungi, Animalia, ...). This used to be a
@@ -3482,17 +3496,7 @@ def run_knn_reclassify_sync(asset_ids: list[str], k: int, force: bool = False) -
 #    the Plantae button now calls the kingdom endpoints.
 #
 # Pattern: same `job_id` (uuid4 hex) + `_jobs_lock` + TTL prune machinery
-# across the job registries in this file. Different dict keys because
-# the payloads are different (cluster_id vs. kingdom vs. min_score).
-
-class ClusterAlbumSyncParams(BaseModel):
-    force_recreate: bool = False
-    # Membership filter — None = any, 0 = without people, 1 = with
-    # people. Applied via storage.get_assets_in_cluster(...,
-    # people_filter=...) so an unscanned asset counts as "without
-    # people" until the person stage runs.
-    people_filter: int | None = None
-
+# across the job registries in this file.
 
 class KingdomAlbumParams(BaseModel):
     kingdom: str = "Plantae"     # "Plantae" | "Fungi" | ...
@@ -3506,10 +3510,6 @@ class ClusteringRefitParams(BaseModel):
 
 
 # In-memory job registries. Same TTL + prune contract throughout.
-_cluster_album_jobs_lock = threading.Lock()
-_cluster_album_jobs: dict[str, dict] = {}
-_CLUSTER_ALBUM_JOB_TTL_S = 300.0
-
 _kingdom_jobs_lock = threading.Lock()
 _kingdom_jobs: dict[str, dict] = {}
 _KINGDOM_JOB_TTL_S = 300.0
@@ -3530,493 +3530,17 @@ def _prune_locked(registry: dict, ttl_s: float) -> None:
         registry.pop(jid, None)
 
 
-# ---------- cluster album worker + endpoints ----------------------------
-
-
-def _cluster_album_worker(
-    job_id: str,
-    cluster_id: int,
-    force_recreate: bool,
-    people_filter: int | None = None,
-) -> None:
-    """Body of the per-cluster album sync job. Mirrors the Plants worker
-    but: (a) reads assets via `cluster_albums`, (b) names the album
-    "Cluster {id} ({cluster_name})", (c) persists the mapping via
-    `set_cluster_album` instead of `set_album_meta`.
-
-    `people_filter` narrows the asset set BEFORE bulk-add (any /
-    without people / with people). Same NULL-as-without-people semantics
-    as the kingdom picker so unscanned assets don't drop silently.
-    """
-    import time as _time
-    chunk_size = 1000
-    try:
-        with storage.connect(DB_PATH) as conn:
-            asset_ids = storage.get_assets_in_cluster(
-                conn, cluster_id, people_filter=people_filter
-            )
-            saved = storage.get_cluster_album(conn, cluster_id)
-            # Look up cluster name for the album title (best-effort; fall
-            # back to "Cluster {id}" if names haven't been computed yet).
-            cluster_name = None
-            row = conn.execute(
-                "SELECT name FROM cluster_names WHERE cluster_id = ?",
-                (cluster_id,),
-            ).fetchone()
-            if row:
-                cluster_name = row["name"]
-
-        album_title = (
-            f"Cluster {cluster_id} ({cluster_name}) #BotaniSense"
-            if cluster_name
-            else f"Cluster {cluster_id} (BioCLIP) #BotaniSense"
-        )
-
-        with _cluster_album_jobs_lock:
-            _cluster_album_jobs[job_id]["n_assets"] = len(asset_ids)
-            _cluster_album_jobs[job_id]["n_chunks"] = max(
-                1, (len(asset_ids) + chunk_size - 1) // chunk_size
-            )
-            _cluster_album_jobs[job_id]["people_filter"] = people_filter
-
-        client = _immich_client()
-        try:
-            reused = False
-            album_id = saved["album_id"] if (saved and not force_recreate) else None
-            if album_id:
-                try:
-                    client.get_album(album_id)
-                    reused = True
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code != 404:
-                        raise
-                    album_id = None
-
-            if not album_id:
-                if not force_recreate:
-                    existing = client.find_album_by_name(album_title)
-                    if existing:
-                        album_id = existing["id"]
-                        reused = True
-                if not album_id:
-                    album = client.create_album(
-                        name=album_title,
-                        description=(
-                            f"Photos in cluster {cluster_id} "
-                            f"({cluster_name or 'unlabeled'}) — "
-                            f"assigned by HDBSCAN over BioCLIP-2 embeddings."
-                        ),
-                    )
-                    album_id = album["id"]
-                    reused = False
-
-            with _cluster_album_jobs_lock:
-                _cluster_album_jobs[job_id]["album_id"] = album_id
-                _cluster_album_jobs[job_id]["reused_existing"] = reused
-                _cluster_album_jobs[job_id]["album_url"] = (
-                    f"{immich_base_url()}/albums/{album_id}"
-                )
-
-            added_total = 0
-            t0 = _time.monotonic()
-            for start in range(0, len(asset_ids), chunk_size):
-                chunk = asset_ids[start : start + chunk_size]
-                client.add_assets_to_album(album_id=album_id, asset_ids=chunk)
-                added_total += len(chunk)
-                with _cluster_album_jobs_lock:
-                    j = _cluster_album_jobs[job_id]
-                    j["n_added"] = added_total
-                    j["chunks_done"] += 1
-                    j["last_chunk_secs"] = _time.monotonic() - t0
-                _time.sleep(0.01)
-        finally:
-            client.close()
-
-        with storage.connect(DB_PATH) as conn:
-            storage.set_cluster_album(
-                conn,
-                cluster_id=cluster_id,
-                album_id=album_id,
-                album_url=f"{immich_base_url()}/albums/{album_id}",
-                n_assets=len(asset_ids),
-                reused=reused,
-            )
-
-        with _cluster_album_jobs_lock:
-            j = _cluster_album_jobs[job_id]
-            j["status"] = "done"
-            j["finished_at"] = _time.monotonic()
-            j["n_added"] = added_total
-    except Exception as e:
-        with _cluster_album_jobs_lock:
-            j = _cluster_album_jobs.get(job_id)
-            if j is not None:
-                j["status"] = "error"
-                j["error"] = f"{type(e).__name__}: {e}"
-                j["finished_at"] = time.monotonic()
-
-
-@app.get("/api/album/cluster/{cluster_id}/preview")
-async def cluster_album_preview(
-    cluster_id: int,
-    people_filter: int | None = None,
-) -> dict:
-    """Count-only preview for the per-cluster sync button. Lets the UI
-    show 'Tag N photos as cluster album' in its confirm panel without
-    spawning a background job (so the user can cancel without any work
-    happening).
-
-    `people_filter` (None / 0 / 1) narrows the count to the chosen
-    membership scope so the per-action confirm modal shows the real
-    number that the click will produce.
-    """
-    with storage.connect(DB_PATH) as conn:
-        n = storage.count_assets_in_cluster(
-            conn, cluster_id, people_filter=people_filter
-        )
-        saved = storage.get_cluster_album(conn, cluster_id)
-    return {
-        "cluster_id": cluster_id,
-        "people_filter": people_filter,
-        "n_assets": n,
-        "saved_album_id": saved["album_id"] if saved else None,
-    }
-
-
-@app.post("/api/album/cluster/{cluster_id}/sync")
-async def start_cluster_album_sync(
-    cluster_id: int, params: ClusterAlbumSyncParams
-) -> dict:
-    """Start a background job to create/reuse the Immich album for a
-    cluster and bulk-add its assets. Same album reuse + chunked-add
-    flow as the kingdom worker, keyed by cluster_id. Returns immediately with a `job_id`; the UI polls
-    /api/album/cluster/job/{job_id} for progress."""
-    with storage.connect(DB_PATH) as conn:
-        n = storage.count_assets_in_cluster(
-            conn, cluster_id, people_filter=params.people_filter
-        )
-        saved = storage.get_cluster_album(conn, cluster_id)
-
-    if n == 0:
-        raise HTTPException(
-            status_code=400,
-            detail=f"cluster {cluster_id} has no assets",
-        )
-
-    job_id = uuid.uuid4().hex
-    with _cluster_album_jobs_lock:
-        _prune_locked(_cluster_album_jobs, _CLUSTER_ALBUM_JOB_TTL_S)
-        _cluster_album_jobs[job_id] = {
-            "status": "running",
-            "cluster_id": cluster_id,
-            "force_recreate": params.force_recreate,
-            "people_filter": params.people_filter,
-            "n_assets": n,
-            "n_chunks": max(1, (n + 999) // 1000),
-            "chunks_done": 0,
-            "n_added": 0,
-            "album_id": saved["album_id"] if saved else None,
-            "reused_existing": None,
-            "album_url": None,
-            "started_at": time.monotonic(),
-            "finished_at": None,
-            "error": None,
-        }
-    threading.Thread(
-        target=_cluster_album_worker,
-        args=(job_id, cluster_id, params.force_recreate, params.people_filter),
-        daemon=True,
-        name=f"cluster-album-{cluster_id}-{job_id[:8]}",
-    ).start()
-
-    return {
-        "job_id": job_id,
-        "cluster_id": cluster_id,
-        "people_filter": params.people_filter,
-        "n_assets": n,
-        "n_chunks": max(1, (n + 999) // 1000),
-        "reused_existing": None,
-        "saved_album_id": saved["album_id"] if saved else None,
-    }
-
-
-@app.get("/api/album/cluster/job/{job_id}")
-async def cluster_album_job_status(job_id: str) -> dict:
-    """Live progress for a cluster-album sync job. 404 if unknown/aged out."""
-    with _cluster_album_jobs_lock:
-        j = _cluster_album_jobs.get(job_id)
-        if j is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"cluster album job {job_id} not found (or expired)",
-            )
-        snap = dict(j)
-    snap.pop("finished_at", None)
-    return snap
-
-
-# ---- sync-all-clusters --------------------------------------------------
-
-
-def _cluster_album_sync_all_worker(
-    job_id: str,
-    force_recreate: bool,
-    people_filter: int | None = None,
-) -> None:
-    """Body of the bulk 'sync every cluster as an album' job. Iterates
-    over every cluster in `cluster_summary()` and runs the same flow as
-    `_cluster_album_worker` for each, persisting the cluster→album
-    mapping as we go so the UI shows partial progress.
-
-    Progress is tracked at the cluster level (clusters_done / n_clusters)
-    and asset level (photos_added / n_assets_total). The UI shows both
-    in the progress bar text so the user knows the bulk run is moving.
-
-    `people_filter` narrows each cluster's asset list before bulk-add.
-    A cluster that becomes empty after the filter is SKIPPED (not
-    synced as an empty album) so the Run page "Sync clusters (all)"
-    button doesn't produce phantom albums for filtered-out clusters.
-
-    "Junk drawer" clusters — those with no species-rank taxon_scores,
-    i.e. HDBSCAN's cluster-of-last-resort that captured scattered
-    kingdom-only points — are filtered out before the totals are
-    computed. Without this filter a single cluster with 50%+ of all
-    photos would dominate the sync and produce one giant album of
-    unlabeled photos, exactly what `n_assets_total=19784 / n_clusters=1`
-    was showing before this change. Skipped clusters count toward
-    neither the denominator nor `clusters_done`.
-    """
-    import time as _time
-    chunk_size = 1000
-    try:
-        # 1. Snapshot every cluster upfront so we know total work and
-        # can show a deterministic progress bar. Filtering out clusters
-        # with zero assets (shouldn't happen, but defensive) and clusters
-        # without species-rank predictions (junk-drawer clusters that
-        # would otherwise dominate the sync — see docstring above).
-        with storage.connect(DB_PATH) as conn:
-            cluster_rows = conn.execute(
-                "SELECT cluster_id, COUNT(*) AS n FROM assets "
-                "WHERE cluster_id IS NOT NULL GROUP BY cluster_id "
-                "ORDER BY cluster_id ASC"
-            ).fetchall()
-            clusters = [
-                (int(r["cluster_id"]), int(r["n"]))
-                for r in cluster_rows
-                if r["n"] > 0
-                and storage.cluster_has_species_predictions(
-                    conn, int(r["cluster_id"])
-                )
-            ]
-            skipped = len(cluster_rows) - len(clusters)
-            # Pre-fetch cluster names (used for album titles).
-            name_rows = conn.execute(
-                "SELECT cluster_id, name FROM cluster_names"
-            ).fetchall()
-            names = {int(r["cluster_id"]): r["name"] for r in name_rows}
-
-        n_assets_total = sum(n for _, n in clusters)
-        with _cluster_album_jobs_lock:
-            _cluster_album_jobs[job_id]["n_clusters"] = len(clusters)
-            _cluster_album_jobs[job_id]["n_clusters_skipped"] = skipped
-            _cluster_album_jobs[job_id]["n_assets_total"] = n_assets_total
-            _cluster_album_jobs[job_id]["clusters_done"] = 0
-            _cluster_album_jobs[job_id]["photos_added"] = 0
-            _cluster_album_jobs[job_id]["people_filter"] = people_filter
-        if skipped:
-            _log.info(
-                f"[cluster-sync-all] skipping {skipped} junk-drawer "
-                f"cluster(s) with no species-rank scores; "
-                f"{len(clusters)} cluster(s) will be synced"
-            )
-
-        client = _immich_client()
-        try:
-            photos_added_total = 0
-            t0 = _time.monotonic()
-            for idx, (cluster_id, n_assets) in enumerate(clusters):
-                cluster_name = names.get(cluster_id)
-                album_title = (
-                    f"Cluster {cluster_id} ({cluster_name}) #BotaniSense"
-                    if cluster_name
-                    else f"Cluster {cluster_id} (BioCLIP) #BotaniSense"
-                )
-
-                # Per-cluster album: same reuse-or-create logic as the
-                # single-cluster worker. The picker applies the same
-                # people_filter for every cluster so the user gets a
-                # uniform membership scope across the bulk run.
-                with storage.connect(DB_PATH) as conn:
-                    asset_ids = storage.get_assets_in_cluster(
-                        conn, cluster_id, people_filter=people_filter
-                    )
-                    # Skip clusters that became empty after the filter
-                    # — creating an empty Immich album adds noise
-                    # without contributing to the requested scope.
-                    if not asset_ids:
-                        with _cluster_album_jobs_lock:
-                            _cluster_album_jobs[job_id]["clusters_done"] = idx + 1
-                            _cluster_album_jobs[job_id]["current_cluster_id"] = cluster_id
-                        continue
-                    saved = storage.get_cluster_album(conn, cluster_id)
-
-                reused = False
-                album_id = (
-                    saved["album_id"] if (saved and not force_recreate) else None
-                )
-                if album_id:
-                    try:
-                        client.get_album(album_id)
-                        reused = True
-                    except httpx.HTTPStatusError as e:
-                        if e.response.status_code != 404:
-                            raise
-                        album_id = None
-
-                if not album_id:
-                    if not force_recreate:
-                        existing = client.find_album_by_name(album_title)
-                        if existing:
-                            album_id = existing["id"]
-                            reused = True
-                    if not album_id:
-                        album = client.create_album(
-                            name=album_title,
-                            description=(
-                                f"Photos in cluster {cluster_id} "
-                                f"({cluster_name or 'unlabeled'}) — "
-                                f"assigned by HDBSCAN over BioCLIP-2 embeddings."
-                            ),
-                        )
-                        album_id = album["id"]
-                        reused = False
-
-                # Bulk-add in chunks. We don't poll between chunks here
-                # because the OUTER loop is what the UI tracks; only
-                # sleep briefly between clusters so the UI can paint.
-                cluster_added = 0
-                for start in range(0, len(asset_ids), chunk_size):
-                    chunk = asset_ids[start : start + chunk_size]
-                    client.add_assets_to_album(album_id=album_id, asset_ids=chunk)
-                    cluster_added += len(chunk)
-                    with _cluster_album_jobs_lock:
-                        _cluster_album_jobs[job_id]["photos_added"] = (
-                            photos_added_total + cluster_added
-                        )
-                    _time.sleep(0.005)
-
-                photos_added_total += cluster_added
-                with storage.connect(DB_PATH) as conn:
-                    storage.set_cluster_album(
-                        conn,
-                        cluster_id=cluster_id,
-                        album_id=album_id,
-                        album_url=f"{immich_base_url()}/albums/{album_id}",
-                        n_assets=len(asset_ids),
-                        reused=reused,
-                    )
-                with _cluster_album_jobs_lock:
-                    j = _cluster_album_jobs[job_id]
-                    j["clusters_done"] = idx + 1
-                    j["current_cluster_id"] = cluster_id
-                    j["last_chunk_secs"] = _time.monotonic() - t0
-                _time.sleep(0.02)
-        finally:
-            client.close()
-
-        with _cluster_album_jobs_lock:
-            j = _cluster_album_jobs[job_id]
-            j["status"] = "done"
-            j["finished_at"] = _time.monotonic()
-            j["photos_added"] = photos_added_total
-    except Exception as e:
-        with _cluster_album_jobs_lock:
-            j = _cluster_album_jobs.get(job_id)
-            if j is not None:
-                j["status"] = "error"
-                j["error"] = f"{type(e).__name__}: {e}"
-                j["finished_at"] = time.monotonic()
-
-
-@app.post("/api/album/cluster/sync-all")
-async def sync_all_cluster_albums(params: ClusterAlbumSyncParams) -> dict:
-    """Bulk 'sync every cluster as an Immich album'. Same per-cluster
-    reuse-or-create logic as the single-cluster endpoint, applied to
-    every cluster in the DB. Returns a `job_id`; poll
-    /api/album/cluster/job/{job_id} for progress (cluster-level +
-    asset-level). Useful when you want to tag every visible cluster
-    without clicking each pill individually.
-
-    `people_filter` (optional, from the Sync-to-IMMICH defaults) is
-    applied per-cluster inside the worker — clusters that have no assets
-    matching the filter are skipped to avoid empty albums. The preview
-    numbers below reflect the unfiltered counts so the confirm modal
-    can show the "before" picture; the worker reports the actual
-    filtered counts as it goes.
-    """
-    with storage.connect(DB_PATH) as conn:
-        # Quick cluster-count preview so the UI can show "Sync N
-        # clusters (M total photos)?" in its confirm panel. Junk-drawer
-        # clusters (no species-rank scores) are filtered out so the
-        # preview matches what the worker will actually do.
-        rows = conn.execute(
-            "SELECT cluster_id, COUNT(*) AS n FROM assets "
-            "WHERE cluster_id IS NOT NULL GROUP BY cluster_id"
-        ).fetchall()
-        clusters = [
-            (int(r["cluster_id"]), int(r["n"]))
-            for r in rows
-            if r["n"] > 0
-            and storage.cluster_has_species_predictions(
-                conn, int(r["cluster_id"])
-            )
-        ]
-        n_assets_total = sum(n for _, n in clusters)
-
-    if not clusters:
-        raise HTTPException(
-            status_code=400,
-            detail="no clusters with assets to sync",
-        )
-
-    job_id = uuid.uuid4().hex
-    with _cluster_album_jobs_lock:
-        _prune_locked(_cluster_album_jobs, _CLUSTER_ALBUM_JOB_TTL_S)
-        _cluster_album_jobs[job_id] = {
-            "status": "running",
-            "scope": "all",
-            "force_recreate": params.force_recreate,
-            "people_filter": params.people_filter,
-            "n_clusters": len(clusters),
-            "n_assets_total": n_assets_total,
-            "clusters_done": 0,
-            "photos_added": 0,
-            "current_cluster_id": None,
-            "started_at": time.monotonic(),
-            "finished_at": None,
-            "error": None,
-        }
-    threading.Thread(
-        target=_cluster_album_sync_all_worker,
-        args=(job_id, params.force_recreate, params.people_filter),
-        daemon=True,
-        name=f"cluster-album-all-{job_id[:8]}",
-    ).start()
-
-    return {
-        "job_id": job_id,
-        "scope": "all",
-        "people_filter": params.people_filter,
-        "n_clusters": len(clusters),
-        "n_assets_total": n_assets_total,
-    }
+# ---------- cluster album cleanup ------------------------------------
+# Cluster->album sync was removed (album titles came from the legacy
+# cluster_names table while members came from the box clusters, so the
+# albums it wrote were wrong). The remove/list endpoints stay so users
+# can delete albums an older version created.
 
 
 @app.delete("/api/album/cluster/{cluster_id}")
 async def delete_cluster_album(cluster_id: int) -> dict:
     """Drop the cluster→album mapping AND DELETE the album in Immich
-    (idempotent: 404 is treated as already-gone). The user-facing
-    'cluster sync' feature is marked beta, and the policy is "never
+    (idempotent: 404 is treated as already-gone). Policy is "never
     leave orphans": when you untrack a cluster album locally, the
     matching Immich album goes with it. Returns `{deleted, remote_deleted}`.
     """
@@ -4052,21 +3576,9 @@ class ClusterAlbumsRemoveParams(BaseModel):
     error.
 
     Note: Immich albums are ALWAYS deleted alongside the local
-    mapping (the `delete_in_immich` toggle was removed when the
-    cluster-sync feature went beta — policy is "never leave orphans").
+    mapping — policy is "never leave orphans".
     """
     cluster_ids: list[int] | None = None
-
-
-class ClusterAlbumsUndoRemoveParams(BaseModel):
-    """Body for POST /api/album/cluster/undo-remove. The frontend
-    captures the full ClusterAlbumMapping rows before bulk-remove and
-    POSTs them back here within the undo TTL window (default 30s).
-    The endpoint re-inserts the cluster_albums rows but does NOT
-    recreate the Immich albums (those were deleted server-side) —
-    the user has to re-sync to get a fresh album with the same name.
-    """
-    rows: list[dict]
 
 
 @app.post("/api/album/cluster/remove")
@@ -4146,47 +3658,6 @@ async def bulk_remove_cluster_albums(
         "remote_deleted": remote_deleted,
         "errors": errors,
     }
-
-
-@app.post("/api/album/cluster/undo-remove")
-async def undo_bulk_remove_cluster_albums(
-    params: ClusterAlbumsUndoRemoveParams,
-) -> dict:
-    """Recreate the cluster_albums rows from a snapshot captured before
-    a bulk-remove. The Immich albums themselves are NOT restored —
-    they were DELETEd on the Immich side during the bulk-remove and
-    only the local mapping comes back. Re-sync to recreate the actual
-    albums.
-
-    Idempotent: re-inserting an existing cluster_id via INSERT OR
-    REPLACE overwrites it (so the user can Undo twice without
-    duplicating rows).
-    """
-    inserted = 0
-    skipped = 0
-    with storage.connect(DB_PATH) as conn:
-        for row in params.rows:
-            try:
-                cid = int(row["cluster_id"])
-                album_id = row.get("album_id") or ""
-                album_url = row.get("album_url") or ""
-                if not album_id or not album_url:
-                    skipped += 1
-                    continue
-                storage.insert_cluster_album(conn, {
-                    "cluster_id": cid,
-                    "album_id": album_id,
-                    "album_url": album_url,
-                    "n_assets": int(row.get("n_assets", 0)),
-                    "reused_existing": int(row.get("reused_existing", 0)),
-                    "created_at": row.get("created_at"),
-                    "last_synced_at": row.get("last_synced_at"),
-                })
-                inserted += 1
-            except Exception as e:  # noqa: BLE001 — per-row failures don't abort
-                _log.warning("undo-remove row %s failed: %s", row, e)
-                skipped += 1
-    return {"restored": inserted, "skipped": skipped}
 
 
 @app.get("/api/album/cluster")
@@ -4506,13 +3977,9 @@ async def kingdom_album_status(kingdom: str = Query(default="Plantae")) -> dict:
 #   {
 #     "plants":   {"people_filter": None|0|1, "min_score": float},
 #     "fungi":    {"people_filter": None|0|1, "min_score": float},
-#     "clusters": {"people_filter": None|0|1},
-#     "sync_all": {"people_filter": None|0|1},
 #   }
-# `clusters` is the per-cluster card button; `sync_all` is the
-# bulk "Sync every cluster" button. They could diverge in the future
-# (e.g., sync_all might want a different default scope), so we keep
-# them separate slots.
+# Stored rows from older versions may still carry `clusters` /
+# `sync_all` slots (cluster sync was removed); normalize drops them.
 _SYNC_DEFAULTS_KEY = "sync_defaults"
 
 
@@ -4522,8 +3989,6 @@ class SyncDefaultsPayload(BaseModel):
     the others; we merge into the existing row on the server."""
     plants: dict | None = None
     fungi: dict | None = None
-    clusters: dict | None = None
-    sync_all: dict | None = None
 
 
 def _sync_defaults_seeded() -> dict:
@@ -4537,12 +4002,6 @@ def _sync_defaults_seeded() -> dict:
         "fungi": {
             "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
             "min_score": FUNGI_MIN_SCORE_DEFAULT,
-        },
-        "clusters": {
-            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
-        },
-        "sync_all": {
-            "people_filter": SYNC_PEOPLE_FILTER_DEFAULT,
         },
     }
 

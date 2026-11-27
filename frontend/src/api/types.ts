@@ -589,14 +589,9 @@ export interface SyncDefaultsSlot {
   people_filter: 0 | 1 | null;
   min_score?: number;
 }
-export interface SyncDefaultsClustersSlot {
-  people_filter: 0 | 1 | null;
-}
 export interface SyncDefaults {
   plants: SyncDefaultsSlot;
   fungi: SyncDefaultsSlot;
-  clusters: SyncDefaultsClustersSlot;
-  sync_all: SyncDefaultsClustersSlot;
 }
 export interface SyncDefaultsResponse {
   defaults: SyncDefaults;
@@ -610,8 +605,7 @@ export interface SyncDefaultsResponse {
 // /api/album/cluster/remove. `cluster_ids=null` means "all
 // currently synced clusters" — the default Run-page action.
 //
-// `delete_in_immich` was removed: cluster sync is beta, and the
-// policy is "never leave orphans" — the Immich album always goes
+// Policy is "never leave orphans" — the Immich album always goes
 // with the local mapping.
 export interface BulkClusterRemoveParams {
   cluster_ids: number[] | null;
@@ -633,7 +627,6 @@ export interface BulkClusterRemoveResponse {
 // 1Hz, BackfillExifModal 1Hz).
 export interface EventSnapshot {
   pipeline: PipelineStatus;
-  cluster_album_jobs: Record<string, JobSnapshot>;
   kingdom_jobs: Record<string, JobSnapshot>;
   clustering_jobs: Record<string, JobSnapshot>;
   knn_build_jobs: Record<string, JobSnapshot>;

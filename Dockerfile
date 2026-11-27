@@ -64,7 +64,7 @@ COPY pyproject.toml ./
 RUN uv pip install --system --no-cache -r pyproject.toml
 
 COPY --from=frontend /build/dist frontend/dist
-COPY app.py pipeline.py pipeline_worker.py storage.py clusters.py \
+COPY app.py pipeline.py pipeline_worker.py bbox_cluster_worker.py storage.py clusters.py \
      map_clusters.py location_guess.py \
      knn.py knn_io.py immich_client.py run.py face.py \
      mobile_engine.py coreml_engine.py yolo_obj6.py yolo_rtmdet.py ./

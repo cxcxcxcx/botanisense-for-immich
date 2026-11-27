@@ -1,8 +1,8 @@
 """Regression tests for the bulk-remove cluster→album behavior.
 
 Pins: `POST /api/album/cluster/remove` always DELETEs the matching
-Immich album alongside dropping the local mapping. The toggle was
-removed when cluster sync went beta (policy: "never leave orphans").
+Immich album alongside dropping the local mapping. Policy: "never leave orphans". Cluster sync itself was removed; these
+endpoints remain so albums an older version created can be cleaned up.
 The endpoint takes no `delete_in_immich` parameter — the caller
 cannot opt out.
 
@@ -34,7 +34,6 @@ def db_path(tmp_path, monkeypatch):
     import app  # noqa: E402
     storage.init_db(p)
     yield p
-    app._cluster_album_jobs.clear()
 
 
 def _seed_asset(conn, aid: str, cluster_id: int) -> None:
@@ -47,20 +46,20 @@ def _seed_asset(conn, aid: str, cluster_id: int) -> None:
 
 
 def _seed_synced_cluster(db_path, cluster_id: int, album_id: str, n_assets: int = 3) -> None:
-    """Seed an asset row + a cluster_albums mapping. Mirrors what
-    _cluster_album_worker leaves behind after a successful sync."""
+    """Seed an asset row + a cluster_albums mapping, as left behind by
+    the (removed) cluster sync of an older version."""
     import storage  # noqa
     with storage.connect(db_path) as conn:
         for i in range(n_assets):
             _seed_asset(conn, f"asset-{cluster_id}-{i:04d}", cluster_id)
-        storage.set_cluster_album(
-            conn,
-            cluster_id=cluster_id,
-            album_id=album_id,
-            album_url=f"http://x/albums/{album_id}",
-            n_assets=n_assets,
-            reused=False,
+        conn.execute(
+            "INSERT INTO cluster_albums "
+            "(cluster_id, album_id, album_url, n_assets, reused_existing, "
+            " created_at, last_synced_at) "
+            "VALUES (?, ?, ?, ?, 0, datetime('now'), datetime('now'))",
+            (cluster_id, album_id, f"http://x/albums/{album_id}", n_assets),
         )
+        conn.commit()
 
 
 class _FakeImmichClient:
@@ -156,18 +155,3 @@ def test_single_delete_always_deletes_in_immich(db_path):
     sig = app.delete_cluster_album.__annotations__
     assert "delete_in_immich" not in sig, sig
 
-
-# ---------- title hashtag -------------------------------------------------
-
-
-def test_album_title_includes_botanisense_hashtag():
-    """All cluster album titles must end with `#BotaniSense` so users
-    can find them via Immich's global search."""
-    import app
-    from immich_client import ImmichClient  # noqa: F401  (import check)
-    import inspect
-
-    src = inspect.getsource(app._cluster_album_worker)
-    assert "#BotaniSense" in src, "single-cluster worker missing hashtag"
-    src = inspect.getsource(app._cluster_album_sync_all_worker)
-    assert "#BotaniSense" in src, "bulk sync-all worker missing hashtag"
